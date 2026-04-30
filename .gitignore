@@ -1,0 +1,11 @@
+# Compiled binaries
+2_compile/bin/
+2_compile/compile.log
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+.vscode/
