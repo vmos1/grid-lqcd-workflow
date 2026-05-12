@@ -35,7 +35,8 @@ export RUNS_DIR="$BASE_DIR/runs"
 
 # ── Compilers ─────────────────────────────────────────────────────────────────
 export MPICXX=/opt/homebrew/bin/mpicxx
-export OMPI_CXX=/opt/homebrew/bin/g++-15
+_gcc_ver=$(ls /opt/homebrew/bin/g++-* 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -1)
+export OMPI_CXX="/opt/homebrew/bin/g++-${_gcc_ver}"
 
 # ── Homebrew dependency prefixes (used by build_grid_homebrew.sh only) ────────
 export GMP=/opt/homebrew/opt/gmp

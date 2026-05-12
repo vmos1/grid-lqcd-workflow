@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!-- Minimal smoke-test version of ip_hmc_mobius.xml.
+     1 trajectory, 4 MD steps — fast enough to verify the binary works. -->
+<grid>
+  <HMC>
+    <StartTrajectory>0</StartTrajectory>
+    <Trajectories>2</Trajectories>
+    <MetropolisTest>true</MetropolisTest>
+    <NoMetropolisUntil>1</NoMetropolisUntil>
+    <StartingType>ColdStart</StartingType>
+    <PerformRandomShift>false</PerformRandomShift>
+    <MD>
+      <name>Force Gradient</name>
+      <MDsteps>4</MDsteps>
+      <trajL>1.0</trajL>
+    </MD>
+  </HMC>
+  <Checkpointer>
+    <config_prefix>./ckpoint_lat</config_prefix>
+    <rng_prefix>./ckpoint_rng</rng_prefix>
+    <saveInterval>50</saveInterval>
+    <saveSmeared>false</saveSmeared>
+    <smeared_prefix>./ckpoint_lat_smr</smeared_prefix>
+    <format>IEEE64BIG</format>
+  </Checkpointer>
+  <RandomNumberGenerator>
+    <serial_seeds>21 32 73 64 45</serial_seeds>
+    <parallel_seeds>63 79 81 99 10</parallel_seeds>
+  </RandomNumberGenerator>
+  <Action>
+    <gauge_beta>10.00</gauge_beta>
+    <Mobius>
+        <Ls>4</Ls>
+        <mass>0.1</mass>
+        <M5>1.8</M5>
+        <b>1.5</b>
+        <c>0.5</c>
+        <StoppingCondition>1e-10</StoppingCondition>
+        <MaxCGIterations>30000</MaxCGIterations>
+        <ApplySmearing>false</ApplySmearing>
+    </Mobius>
+  </Action>
+</grid>

@@ -1,6 +1,6 @@
 # grid-lqcd-workflow
 
-Scripts to build, compile, and run [Grid](https://github.com/paboyle/Grid) lattice QCD
+Scripts to build, test, and run [Grid](https://github.com/paboyle/Grid) lattice QCD
 on macOS Apple Silicon. Supports two Grid forks via a single `GRID_PROFILE` variable:
 
 | Profile | Repo | Description |
@@ -16,16 +16,21 @@ on macOS Apple Silicon. Supports two Grid forks via a single `GRID_PROFILE` vari
 grid_qcd/                              ← top-level working directory
 ├── grid-lqcd-workflow/                ← this repo
 │   ├── config.sh                      ← set GRID_PROFILE here
-│   ├── 1_build_grid/
-│   │   ├── build_grid_homebrew.sh     ← build Grid using Homebrew deps (recommended for macOS)
+│   ├── 1_build_grid/                  ← build the Grid library
+│   │   ├── build_grid_homebrew.sh     ← recommended for macOS
 │   │   └── build_grid_fromscratch.sh  ← build Grid + all deps from source
-│   ├── 2_compile/
-│   │   ├── build_exec.sh              ← compile production/ programs or custom .cc files
-│   │   ├── Makefile
-│   │   └── src/                       ← place custom .cc files here
-│   └── 3_run/
-│       ├── run_exec.sh                ← run executables with MPI
-│       └── inputs/                    ← XML parameter files
+│   ├── 2_test_grid/                   ← verify the Grid build
+│   │   ├── test_grid.sh               ← correctness tests
+│   │   └── benchmark_grid.sh          ← performance benchmarks
+│   ├── 3_examples/                    ← self-contained physics examples
+│   │   └── dweofa_mobius/             ← Domain Wall EOFA Mobius HMC
+│   │       ├── src/                   ← source code
+│   │       ├── bin/                   ← compiled binary (git-ignored)
+│   │       ├── inputs/                ← XML parameter files
+│   │       ├── build.sh               ← compile the binary
+│   │       └── run_test.sh            ← smoke test (3 trajectories, ~1 min)
+│   └── common/
+│       └── run_exec.sh                ← general MPI runner with timestamped output
 │
 ├── Grid-TXQCD/                        ← txqcd source (cloned by build script)
 ├── Grid-mainline/                     ← mainline source (cloned by build script)
@@ -34,7 +39,7 @@ grid_qcd/                              ← top-level working directory
 ├── install-txqcd/                     ← txqcd installed library + executables
 ├── install-mainline/                  ← mainline installed library + executables
 ├── deps/                              ← from-scratch dependency builds (shared)
-└── runs/                              ← simulation output directories
+└── runs/                              ← timestamped simulation output
 ```
 
 Grid source, build, install, and run output all live *outside* the workflow repo —
@@ -57,10 +62,16 @@ Both profiles can be built and installed simultaneously — switching is instant
 
 ## Prerequisites
 
+> **Platform note:** these instructions cover macOS Apple Silicon only. Linux support is not yet documented.
+
 - macOS with Apple Silicon
 - [Homebrew](https://brew.sh)
+- GCC and the OpenMP runtime — install once when setting up a new machine:
+  ```bash
+  brew install gcc libomp
+  ```
 
-All other dependencies are installed by the build script.
+All Grid-specific dependencies (`open-mpi`, `gmp`, `mpfr`, `fftw`, etc.) are installed automatically by the build script.
 
 ---
 
@@ -86,60 +97,78 @@ precise control over dependency versions.
 
 ---
 
-## Step 2 — Compile executables
+## Step 2 — Test the Grid build
 
-### Build all production/ programs (txqcd profile only)
-
-```bash
-./2_compile/build_exec.sh
-```
-
-### Compile a custom .cc file
+### Correctness tests
 
 ```bash
-# Place your file in 2_compile/src/, then:
-./2_compile/build_exec.sh myprogram.cc
-# → produces 2_compile/bin/myprogram
+./2_test_grid/test_grid.sh
 ```
 
-Changing your `.cc` file only requires re-running step 2 — Grid does not need to be rebuilt.
+Runs 7 correctness tests from the Grid build tree. All should pass on macOS.
+Takes ~10 seconds.
+
+### Performance benchmarks
+
+```bash
+./2_test_grid/benchmark_grid.sh
+```
+
+Runs DWF, Wilson, SU(3), and memory bandwidth benchmarks.
 
 ---
 
-## Step 3 — Run
+## Step 3 — Run an example
+
+Each example under `3_examples/` is self-contained: build it, then run the smoke test.
+
+### Domain Wall EOFA Mobius
 
 ```bash
-./3_run/run_exec.sh <executable> [param_file] [grid] [mpi] [nproc]
+# Compile
+./3_examples/dweofa_mobius/build.sh
+
+# Smoke test: 4^4 lattice, Ls=4, 3 trajectories (~1 min)
+./3_examples/dweofa_mobius/run_test.sh
+
+# Full production run via the general runner
+./common/run_exec.sh dweofa_mobius_HSDM_v3 '' 4.4.4.4 1.1.1.1 1
+```
+
+The production XML (`inputs/ip_hmc_mobius.xml`) uses Ls=16 and 10 trajectories.
+Pass it with `--ParameterFile`:
+
+```bash
+mpirun -np 1 3_examples/dweofa_mobius/bin/dweofa_mobius_HSDM_v3 \
+    --grid 16.16.16.32 --mpi 1.1.1.1 \
+    --ParameterFile 3_examples/dweofa_mobius/inputs/ip_hmc_mobius.xml
+```
+
+---
+
+## General runner
+
+`common/run_exec.sh` runs any built executable with MPI and creates an auto-numbered,
+timestamped output directory under `../runs/`:
+
+```bash
+./common/run_exec.sh <executable> [param_file] [grid] [mpi] [nproc]
 ```
 
 | Argument | Description | Default |
 |---|---|---|
 | `executable` | binary name | required |
-| `param_file` | file from `inputs/` (optional, pass `''` to skip) | — |
+| `param_file` | XML file from an `inputs/` directory (pass `''` to skip) | — |
 | `grid` | lattice geometry | `4.4.4.8` |
 | `mpi` | MPI decomposition | `1.1.1.1` |
 | `nproc` | number of MPI ranks | `1` |
 
-Each run creates an auto-numbered, timestamped directory under `../runs/`:
+Each run creates:
 
 ```
-runs/run_001_20260424_150852/
-├── TXQCD_Wilson_small    ← copy of the executable
-├── ip_hmc_mobius.xml     ← copy of the parameter file (if used)
-└── run.log               ← all output
-```
-
-### Examples
-
-```bash
-# Run a TXQCD HMC on a 4^4 lattice, 1 MPI rank
-./3_run/run_exec.sh TXQCD_Wilson_small '' 4.4.4.4 1.1.1.1 1
-
-# Run with a parameter file
-./3_run/run_exec.sh TXQCD_Wilson_small ip_hmc_mobius.xml 4.4.4.4 1.1.1.1 1
-
-# Run a production config generator on 8^3×16, 4 ranks
-./3_run/run_exec.sh gen_txqcd_cfgs '' 8.8.8.16 2.2.1.1 4
+runs/run_001_20260512_122525/
+├── dweofa_mobius_HSDM_v3   ← copy of the executable
+└── run.log                  ← all output
 ```
 
 ---
@@ -158,4 +187,4 @@ All settings are in [`config.sh`](config.sh):
 | `DEPS_DIR` | Path to from-scratch dependency builds |
 | `RUNS_DIR` | Path to simulation output directories |
 | `MPICXX` | MPI C++ compiler wrapper |
-| `OMPI_CXX` | Underlying C++ compiler used by MPI wrapper |
+| `OMPI_CXX` | Underlying C++ compiler used by MPI wrapper (auto-detected) |

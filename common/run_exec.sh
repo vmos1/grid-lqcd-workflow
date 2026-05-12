@@ -47,20 +47,27 @@ NPROC="${5:-1}"
 # ── Find executable ───────────────────────────────────────────────────────────
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 EXEC_PATH=""
-for candidate in \
-    "$REPO_DIR/2_compile/bin/$EXEC_NAME" \
-    "$GRID_INSTALL/bin/$EXEC_NAME" \
-    "$GRID_SRC/production/$EXEC_NAME" \
-    "$GRID_SRC/HMC/$EXEC_NAME"; do
-    if [ -f "$candidate" ]; then
-        EXEC_PATH="$candidate"
-        break
-    fi
+
+# Search 3_examples/*/bin/ first, then installed and in-source locations
+for examples_bin in "$REPO_DIR"/3_examples/*/bin/"$EXEC_NAME"; do
+    [ -f "$examples_bin" ] && EXEC_PATH="$examples_bin" && break
 done
 
 if [ -z "$EXEC_PATH" ]; then
+    for candidate in \
+        "$GRID_INSTALL/bin/$EXEC_NAME" \
+        "$GRID_SRC/production/$EXEC_NAME" \
+        "$GRID_SRC/HMC/$EXEC_NAME"; do
+        if [ -f "$candidate" ]; then
+            EXEC_PATH="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$EXEC_PATH" ]; then
     echo "Error: '$EXEC_NAME' not found in any of:"
-    echo "  2_compile/bin/  install-${GRID_PROFILE}/bin/  production/  HMC/"
+    echo "  3_examples/*/bin/  install-${GRID_PROFILE}/bin/  production/  HMC/"
     exit 1
 fi
 
