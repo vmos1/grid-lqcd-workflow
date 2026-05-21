@@ -1,6 +1,13 @@
-# Compiled binaries
-2_compile/bin/
-2_compile/compile.log
+# Compiled binaries and build artefacts
+3_examples/*/bin/*
+!3_examples/*/bin/.gitignore
+build.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
 # macOS
 .DS_Store
