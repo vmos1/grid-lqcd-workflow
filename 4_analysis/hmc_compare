@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""hmc_compare — side-by-side comparison of two HMC runs.
+
+Loads observables from two run directories (or two CSV files), applies
+burn-in cuts, computes means and autocorrelation times, and reports a
+consistency check (pull in units of combined sigma).
+
+Usage
+-----
+  # From run directories (parses hmc_traj*.log files):
+  hmc_compare runs/mobius_eofa/hmc  runs/mobius_rhmc/hmc  --label1 EOFA  --label2 RHMC
+
+  # From pre-extracted CSV files:
+  hmc_compare obs_eofa.csv  obs_rhmc.csv  --label1 EOFA  --label2 RHMC
+
+  # Legacy log directory with explicit pattern:
+  hmc_compare /path/to/logs /path/to/logs \\
+      --pattern1 'mobius-eofa-*.log' --pattern2 'mobius-rhmc-*.log'
+
+  # Override automatic burn-in detection:
+  hmc_compare runs/eofa/hmc runs/rhmc/hmc --burnin 100
+"""
+
+import argparse
+import math
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from hmc import load_run, gamma_method, suggest_burnin
+
+
+# ── data loading ──────────────────────────────────────────────────────────────
+
+def _load(path, pattern):
+    """Load a DataFrame from a directory (logs) or a CSV file."""
+    import pandas as pd
+    p = Path(path)
+    if p.is_dir():
+        return load_run(p, pattern=pattern)
+    else:
+        return pd.read_csv(p)
+
+
+def _analyse(df, burnin=None):
+    """Return a dict of per-observable statistics after applying burn-in."""
+    if burnin is None:
+        burnin = suggest_burnin(df)
+    df_eq = df[df['traj'] >= burnin] if burnin else df
+
+    metro       = df_eq['accepted'].dropna()
+    accept_rate = float(metro.mean()) if len(metro) else float('nan')
+
+    result = {
+        'N_total'    : len(df),
+        'burnin'     : burnin,
+        'N_eq'       : len(df_eq),
+        'accept_rate': accept_rate,
+    }
+
+    for obs in ['plaquette', 'polyakov_abs', 'polyakov_re', 'dH', 'exp_dH']:
+        data = df_eq[obs].dropna().values if obs in df_eq.columns else []
+        if len(data) < 4:
+            continue
+        r = gamma_method(data)
+        result[obs]             = r['mean']
+        result[obs + '_err']    = r['sigma']
+        result[obs + '_tau']    = r['tau_int']
+        result[obs + '_tauerr'] = r['tau_int_err']
+        result[obs + '_window'] = r['window']
+
+    return result
+
+
+# ── formatting helpers ────────────────────────────────────────────────────────
+
+def _fmt_mean_err(val, err):
+    """Format mean(err) with matching decimal places."""
+    if math.isnan(val):
+        return '       N/A'
+    # Set decimal places from the magnitude of the error
+    if err > 0:
+        dp = max(0, -int(math.floor(math.log10(err))) + 1)
+    else:
+        dp = 6
+    return f'{val:.{dp}f}({err:.{max(0,dp-1)}e})'
+
+
+# ── main output ───────────────────────────────────────────────────────────────
+
+def print_comparison(r1, r2, label1, label2, physics_info=''):
+    W = 68
+    print()
+    print('=' * W)
+    if physics_info:
+        print(f'  {physics_info}')
+    print(f'  {"Observable":<28}  {label1:>16}  {label2:>16}')
+    print('-' * W)
+
+    # ── run metadata ──────────────────────────────────────────────────────────
+    def meta(label, key, fmt='d'):
+        v1 = r1.get(key, float('nan'))
+        v2 = r2.get(key, float('nan'))
+        if fmt == 'd':
+            s1 = f'{int(v1):>16d}' if not math.isnan(v1) else f'{"N/A":>16}'
+            s2 = f'{int(v2):>16d}' if not math.isnan(v2) else f'{"N/A":>16}'
+        elif fmt == '%':
+            s1 = f'{v1:>15.1%}' if not math.isnan(v1) else f'{"N/A":>15}'
+            s2 = f'{v2:>15.1%}' if not math.isnan(v2) else f'{"N/A":>15}'
+        else:
+            s1 = f'{v1:>16{fmt}}'
+            s2 = f'{v2:>16{fmt}}'
+        print(f'  {label:<28}  {s1}  {s2}')
+
+    meta('Trajectories (total)', 'N_total')
+    meta('Burn-in trajectory',   'burnin')
+    meta('Trajectories (eq.)',   'N_eq')
+    meta('Accept rate',          'accept_rate', '%')
+
+    # ── observable means ──────────────────────────────────────────────────────
+    print('-' * W)
+    print(f'  {"Observable mean (err)":28}  {label1:>16}  {label2:>16}')
+    print('-' * W)
+
+    obs_labels = [
+        ('plaquette',    'Plaquette'),
+        ('polyakov_abs', 'Polyakov |P|'),
+        ('polyakov_re',  'Polyakov Re(P)'),
+        ('dH',           '<dH>'),
+        ('exp_dH',       '<exp(-dH)>'),
+    ]
+    for key, label in obs_labels:
+        if key not in r1 and key not in r2:
+            continue
+        v1, e1 = r1.get(key, float('nan')), r1.get(key+'_err', float('nan'))
+        v2, e2 = r2.get(key, float('nan')), r2.get(key+'_err', float('nan'))
+        s1 = f'{_fmt_mean_err(v1,e1):>16}'
+        s2 = f'{_fmt_mean_err(v2,e2):>16}'
+        print(f'  {label:<28}  {s1}  {s2}')
+
+    # ── autocorrelation times ─────────────────────────────────────────────────
+    print('-' * W)
+    print(f'  {"tau_int (+/- err)":28}  {label1:>16}  {label2:>16}')
+    print('-' * W)
+
+    for key, label in obs_labels:
+        t1 = r1.get(key+'_tau',    float('nan'))
+        s1 = r1.get(key+'_tauerr', float('nan'))
+        t2 = r2.get(key+'_tau',    float('nan'))
+        s2 = r2.get(key+'_tauerr', float('nan'))
+        if math.isnan(t1) and math.isnan(t2):
+            continue
+        c1 = f'{t1:.2f}+/-{s1:.2f}' if not math.isnan(t1) else 'N/A'
+        c2 = f'{t2:.2f}+/-{s2:.2f}' if not math.isnan(t2) else 'N/A'
+        print(f'  {label:<28}  {c1:>16}  {c2:>16}')
+
+    # ── consistency (pull) ────────────────────────────────────────────────────
+    print('-' * W)
+    print(f'  Consistency: (mean1 - mean2) / combined sigma')
+    print('-' * W)
+
+    for key, label in obs_labels:
+        v1, e1 = r1.get(key, float('nan')), r1.get(key+'_err', float('nan'))
+        v2, e2 = r2.get(key, float('nan')), r2.get(key+'_err', float('nan'))
+        if math.isnan(v1) or math.isnan(v2):
+            continue
+        diff  = v1 - v2
+        sigma = math.sqrt(e1**2 + e2**2) if (e1 > 0 or e2 > 0) else float('nan')
+        pull  = diff / sigma if sigma > 0 else float('nan')
+        flag  = '  *** tension' if abs(pull) > 2 else ''
+        ps    = f'{pull:+.2f}σ' if not math.isnan(pull) else 'N/A'
+        print(f'  {label:<28}  diff={diff:+.5f}  pull={ps}{flag}')
+
+    print('=' * W)
+    print(f'  Note: <exp(-dH)> = 1 exactly by detailed balance — deviation')
+    print(f'  indicates integrator step-size error or short statistics.')
+    print('=' * W)
+    print()
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='hmc_compare',
+        description='Side-by-side comparison of two HMC runs.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split('Usage')[1] if 'Usage' in __doc__ else '',
+    )
+    parser.add_argument('run1', help='First run: directory with logs or CSV file')
+    parser.add_argument('run2', help='Second run: directory with logs or CSV file')
+    parser.add_argument('--label1',   default='Run 1',        help='Label for run 1')
+    parser.add_argument('--label2',   default='Run 2',        help='Label for run 2')
+    parser.add_argument('--burnin',   type=int, default=None,
+                        help='Apply same burn-in to both runs (default: auto per run)')
+    parser.add_argument('--burnin1',  type=int, default=None,
+                        help='Burn-in for run 1 (overrides --burnin)')
+    parser.add_argument('--burnin2',  type=int, default=None,
+                        help='Burn-in for run 2 (overrides --burnin)')
+    parser.add_argument('--pattern',  default='hmc_traj*.log',
+                        help="Log glob for both runs (default: 'hmc_traj*.log')")
+    parser.add_argument('--pattern1', default=None,
+                        help='Log glob for run 1 (overrides --pattern)')
+    parser.add_argument('--pattern2', default=None,
+                        help='Log glob for run 2 (overrides --pattern)')
+    parser.add_argument('--info',     default='',
+                        help='Physics info line printed in header (e.g. "beta=5.4 Ls=8")')
+    args = parser.parse_args()
+
+    p1 = args.pattern1 or args.pattern
+    p2 = args.pattern2 or args.pattern
+    b1 = args.burnin1  if args.burnin1 is not None else args.burnin
+    b2 = args.burnin2  if args.burnin2 is not None else args.burnin
+
+    df1 = _load(args.run1, p1)
+    df2 = _load(args.run2, p2)
+
+    r1 = _analyse(df1, burnin=b1)
+    r2 = _analyse(df2, burnin=b2)
+
+    print_comparison(r1, r2, args.label1, args.label2, physics_info=args.info)
+
+
+if __name__ == '__main__':
+    main()
