@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""hmc_extend — prepare input.xml for a continuation run.
+
+Finds the last complete checkpoint in the run directory, archives the current
+input.xml, and writes a new input.xml ready for the next job submission.
+
+Usage
+-----
+  hmc_extend <run_dir> --trajectories N [--dry-run]
+
+  run_dir         Directory containing input.xml and ckpoint_lat.* files
+  --trajectories  Number of trajectories for the next job (required)
+  --dry-run       Show what would change without writing any files
+
+Examples
+--------
+  # Prepare EOFA run for 150 more trajectories, then submit:
+  hmc_extend runs/mobius_eofa/hmc --trajectories 150
+  sbatch jobs/run-eofa.sbatch
+
+  # Preview only:
+  hmc_extend runs/mobius_eofa/hmc --trajectories 150 --dry-run
+
+Notes
+-----
+- StartTrajectory is set from the last existing ckpoint_lat.N, NOT from the
+  previous input.xml — so this is safe even if the job was killed early.
+- NoMetropolisUntil is always set to 0 for continuation runs.
+- StartingType is set to CheckpointStart.
+- The old input.xml is archived as input_traj{START:04d}.xml before any
+  changes are made. If the archive already exists it is left untouched.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+
+# ── XML tag helpers ───────────────────────────────────────────────────────────
+
+def _get_tag(xml, tag):
+    """Return the value of the first occurrence of <tag>value</tag>."""
+    m = re.search(rf'<{tag}>([^<]*)</{tag}>', xml)
+    if not m:
+        raise ValueError(f"Tag <{tag}> not found in XML")
+    return m.group(1).strip()
+
+
+def _set_tag(xml, tag, value):
+    """Replace the value of the first occurrence of <tag>...</tag>."""
+    new_xml, n = re.subn(
+        rf'(<{tag}>)[^<]*(</{tag}>)',
+        rf'\g<1>{value}\g<2>',
+        xml, count=1,
+    )
+    if n == 0:
+        raise ValueError(f"Tag <{tag}> not found in XML — cannot update")
+    return new_xml
+
+
+# ── checkpoint discovery ──────────────────────────────────────────────────────
+
+def _last_checkpoint(run_dir):
+    """Return the trajectory number of the last complete checkpoint pair."""
+    lats  = list(run_dir.glob('ckpoint_lat.*'))
+    valid = []
+    for f in lats:
+        try:
+            n = int(f.suffix[1:])   # suffix is e.g. '.210'
+        except ValueError:
+            continue
+        # Both lat and rng must exist for the checkpoint to be complete
+        if (run_dir / f'ckpoint_rng.{n}').exists():
+            valid.append(n)
+    if not valid:
+        raise FileNotFoundError(f"No complete checkpoint pairs found in {run_dir}")
+    return max(valid)
+
+
+# ── main logic ────────────────────────────────────────────────────────────────
+
+def extend(run_dir, trajectories, dry_run=False):
+    run_dir  = Path(run_dir).resolve()
+    xml_path = run_dir / 'input.xml'
+
+    if not xml_path.exists():
+        sys.exit(f"ERROR: {xml_path} not found.")
+
+    xml = xml_path.read_text()
+
+    # Current StartTrajectory (for archive filename only)
+    old_start = int(_get_tag(xml, 'StartTrajectory'))
+
+    # Last complete checkpoint — this is authoritative for StartTrajectory
+    last_ckpt = _last_checkpoint(run_dir)
+
+    if last_ckpt != old_start and old_start != 0:
+        print(f"WARNING: input.xml has StartTrajectory={old_start} but last "
+              f"complete checkpoint is {last_ckpt}.")
+        print(f"         Restarting from checkpoint {last_ckpt} (the safe choice).")
+
+    archive_name = run_dir / f'input_traj{old_start:04d}.xml'
+
+    # Build new XML
+    new_xml = xml
+    new_xml = _set_tag(new_xml, 'StartTrajectory',    str(last_ckpt))
+    new_xml = _set_tag(new_xml, 'Trajectories',       str(trajectories))
+    new_xml = _set_tag(new_xml, 'NoMetropolisUntil',  '0')
+    new_xml = _set_tag(new_xml, 'StartingType',       'CheckpointStart')
+
+    # Update comment line if present
+    new_xml = re.sub(
+        r'<!--.*?-->',
+        f'<!-- continuation from trajectory {last_ckpt}, {trajectories} trajectories -->',
+        new_xml, count=1, flags=re.DOTALL,
+    )
+
+    # ── report ────────────────────────────────────────────────────────────────
+    print(f"\nRun directory  : {run_dir}")
+    print(f"Last checkpoint: {last_ckpt}  "
+          f"(ckpoint_lat.{last_ckpt} + ckpoint_rng.{last_ckpt})")
+    print(f"Archive        : {archive_name.name}"
+          + (" (already exists, will skip)" if archive_name.exists() else ""))
+    print(f"\ninput.xml changes:")
+    print(f"  StartTrajectory   : {old_start}  →  {last_ckpt}")
+    print(f"  Trajectories      : {_get_tag(xml,'Trajectories')}  →  {trajectories}")
+    print(f"  NoMetropolisUntil : {_get_tag(xml,'NoMetropolisUntil')}  →  0")
+    print(f"  StartingType      : {_get_tag(xml,'StartingType')}  →  CheckpointStart")
+    print(f"\nNext job will run trajectories {last_ckpt} → "
+          f"{last_ckpt + trajectories}")
+
+    if dry_run:
+        print("\n(dry-run: no files written)")
+        return
+
+    # ── write ─────────────────────────────────────────────────────────────────
+    if not archive_name.exists():
+        archive_name.write_text(xml)
+        print(f"\nArchived : {archive_name.name}")
+    else:
+        print(f"\nSkipped  : {archive_name.name} already exists")
+
+    xml_path.write_text(new_xml)
+    print(f"Updated  : input.xml")
+    print(f"\nReady — submit with:  sbatch jobs/run-<algorithm>.sbatch")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='hmc_extend',
+        description='Prepare input.xml for a continuation run.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split('Usage')[1],
+    )
+    parser.add_argument('run_dir',
+                        help='Run directory containing input.xml and ckpoint_lat.* files')
+    parser.add_argument('--trajectories', type=int, required=True,
+                        help='Number of trajectories for the next job')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would change without writing any files')
+    args = parser.parse_args()
+
+    extend(args.run_dir, args.trajectories, dry_run=args.dry_run)
+
+
+if __name__ == '__main__':
+    main()

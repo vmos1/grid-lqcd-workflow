@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!-- Shared input for 2-flavor Möbius DWF comparison test.
+     4^3 x 8 lattice, 200 trajectories, cold start.
+     Same physics params as the 1-flavor test for cross-comparison.
+     Use --ParameterFile for both dw2f_cg_mobius and dw2f_eofa_mobius. -->
+<grid>
+  <HMC>
+    <StartTrajectory>0</StartTrajectory>
+    <Trajectories>200</Trajectories>
+    <MetropolisTest>true</MetropolisTest>
+    <NoMetropolisUntil>10</NoMetropolisUntil>
+    <StartingType>ColdStart</StartingType>
+    <PerformRandomShift>false</PerformRandomShift>
+    <MD>
+      <name>MinimumNorm2</name>
+      <MDsteps>8</MDsteps>
+      <trajL>1.0</trajL>
+    </MD>
+  </HMC>
+  <Checkpointer>
+    <config_prefix>./ckpoint_lat</config_prefix>
+    <rng_prefix>./ckpoint_rng</rng_prefix>
+    <saveInterval>10</saveInterval>
+    <saveSmeared>false</saveSmeared>
+    <smeared_prefix>./ckpoint_lat_smr</smeared_prefix>
+    <format>IEEE64BIG</format>
+  </Checkpointer>
+  <RandomNumberGenerator>
+    <serial_seeds>21 32 73 64 45</serial_seeds>
+    <parallel_seeds>63 79 81 99 10</parallel_seeds>
+  </RandomNumberGenerator>
+  <Action>
+    <gauge_beta>5.4</gauge_beta>
+    <Mobius>
+      <Ls>8</Ls>
+      <mass>0.1</mass>
+      <M5>1.8</M5>
+      <b>1.5</b>
+      <c>0.5</c>
+      <StoppingCondition>1e-10</StoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+      <ApplySmearing>false</ApplySmearing>
+    </Mobius>
+  </Action>
+</grid>
