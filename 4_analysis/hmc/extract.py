@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pandas as pd
 
-_RE_TRAJ  = re.compile(r'-- # Trajectory = (\d+)')
+_RE_TRAJ  = re.compile(r'(\d+\.?\d*) s.*-- # Trajectory = (\d+)')
 _RE_DH    = re.compile(r'\bdH = ([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)')
 _RE_PLAQ  = re.compile(r'Plaquette: \[ (\d+) \] ([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)')
 _RE_PLOOP = re.compile(r'Polyakov Loop: \[ (\d+) \] \(([^,]+),([^)]+)\)')
@@ -33,11 +33,17 @@ def _parse_file(path):
     pending_dH = None
     current_label = None  # label of the record currently being built
 
+    # timestamps[N] = elapsed seconds at start of trajectory N
+    traj_timestamps = {}
+
     with open(path) as fh:
         for line in fh:
 
-            if _RE_TRAJ.search(line):
-                # New trajectory starting: reset transient state.
+            m = _RE_TRAJ.search(line)
+            if m:
+                t_sec = float(m.group(1))
+                traj_n = int(m.group(2))
+                traj_timestamps[traj_n] = t_sec
                 pending_dH = None
                 current_label = None
                 continue
@@ -82,6 +88,14 @@ def _parse_file(path):
                 current_label = None
                 continue
 
+    # Compute time per trajectory: label N+1 was produced by trajectory N,
+    # which ran from traj_timestamps[N] to traj_timestamps[N+1].
+    sorted_trajs = sorted(traj_timestamps)
+    for i, n in enumerate(sorted_trajs[:-1]):
+        label = n + 1   # config produced by trajectory n
+        if label in records:
+            records[label]['traj_time_s'] = traj_timestamps[sorted_trajs[i+1]] - traj_timestamps[n]
+
     return list(records.values())
 
 
@@ -105,7 +119,7 @@ def load_run(run_dir, pattern='hmc_traj*.log'):
     -------
     pd.DataFrame
         Columns: traj, dH, exp_dH, plaquette, polyakov_re, polyakov_im,
-                 polyakov_abs, accepted
+                 polyakov_abs, accepted, traj_time_s
         Sorted by traj, one row per config label.
     """
     run_dir = Path(run_dir)
