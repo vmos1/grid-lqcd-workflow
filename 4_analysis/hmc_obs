@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""hmc_obs — command-line interface for HMC observable analysis.
+
+Usage
+-----
+  hmc_obs extract  <run_dir>  [-o obs.csv] [--pattern '*.log']
+  hmc_obs autocorr <obs.csv>  <column>    [--burnin N] [--S 1.5]
+  hmc_obs summary  <run_dir>              [--burnin N]
+
+Examples
+--------
+  # Parse logs in the current run directory, save to CSV:
+  hmc_obs extract runs/mobius_eofa/hmc -o runs/mobius_eofa/obs.csv
+
+  # Autocorrelation time for the plaquette, discarding first 50 trajectories:
+  hmc_obs autocorr runs/mobius_eofa/obs.csv plaquette --burnin 50
+
+  # Full summary (extract + burn-in suggestion + tau_int for all observables):
+  hmc_obs summary runs/mobius_eofa/hmc
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Allow running as a script from any working directory.
+sys.path.insert(0, str(Path(__file__).parent))
+from hmc import load_run, save_csv, gamma_method, suggest_burnin
+
+
+# ── subcommand handlers ───────────────────────────────────────────────────────
+
+def cmd_extract(args):
+    df = load_run(args.run_dir, pattern=args.pattern)
+    print(df.to_string(index=False))
+    if args.output:
+        save_csv(df, args.output)
+        print(f"\nSaved to {args.output}", file=sys.stderr)
+
+
+def cmd_autocorr(args):
+    import pandas as pd
+    df = pd.read_csv(args.csv)
+    if args.burnin:
+        df = df[df['traj'] >= args.burnin]
+    col = args.column
+    if col not in df.columns:
+        sys.exit(f"Column '{col}' not found. Available: {list(df.columns)}")
+    data = df[col].dropna().values
+    if len(data) < 4:
+        sys.exit(f"Not enough data in column '{col}' after burn-in cut.")
+    r = gamma_method(data, S=args.S)
+    print(f"Observable  : {col}")
+    print(f"N (after burnin={args.burnin}) : {len(data)}")
+    print(f"Mean        : {r['mean']:.10g}")
+    print(f"Sigma       : {r['sigma']:.4g}")
+    print(f"tau_int     : {r['tau_int']:.4f}  +/-  {r['tau_int_err']:.4f}")
+    print(f"Window W    : {r['window']}")
+
+
+def cmd_summary(args):
+    df = load_run(args.run_dir, pattern=args.pattern)
+    n_total = len(df)
+    traj_min, traj_max = int(df['traj'].min()), int(df['traj'].max())
+    print(f"{'='*55}")
+    print(f"  Run directory : {args.run_dir}")
+    print(f"  Trajectories  : {traj_min} – {traj_max}  (N={n_total})")
+
+    # Accept / reject (excludes no-Metropolis warmup rows where accepted=NaN)
+    metro = df['accepted'].dropna()
+    if len(metro):
+        rate = metro.mean()
+        print(f"  Accept rate   : {metro.sum():.0f}/{len(metro)} = {rate:.1%}")
+
+    # Burn-in suggestion
+    burnin = args.burnin
+    if burnin is None:
+        burnin = suggest_burnin(df)
+    if burnin is not None:
+        print(f"  Burn-in       : trajectory {burnin}  (auto)" if args.burnin is None
+              else f"  Burn-in       : trajectory {burnin}  (manual)")
+    else:
+        print("  Burn-in       : could not determine (series too short?)")
+
+    df_eq = df[df['traj'] >= burnin] if burnin else df
+    print(f"  N after burnin: {len(df_eq)}")
+    print(f"{'='*55}")
+
+    observables = [c for c in ['plaquette', 'polyakov_abs', 'polyakov_re', 'dH']
+                   if c in df_eq.columns]
+    for obs in observables:
+        data = df_eq[obs].dropna().values
+        if len(data) < 4:
+            continue
+        r = gamma_method(data)
+        print(f"\n  {obs}")
+        print(f"    mean    = {r['mean']:.10g}  +/-  {r['sigma']:.4g}")
+        print(f"    tau_int = {r['tau_int']:.4f}  +/-  {r['tau_int_err']:.4f}"
+              f"  (window={r['window']})")
+    print()
+
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog='hmc_obs',
+        description='HMC observable extraction and autocorrelation analysis.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest='command')
+    sub.required = True    # compatible with Python 3.6
+
+    # extract
+    p = sub.add_parser('extract', help='Parse HMC logs → DataFrame (print + optional CSV)')
+    p.add_argument('run_dir', help='Directory containing hmc_traj*.log files')
+    p.add_argument('-o', '--output', metavar='FILE', help='Write CSV to this path')
+    p.add_argument('--pattern', default='hmc_traj*.log',
+                   help="Log file glob (default: 'hmc_traj*.log')")
+    p.set_defaults(func=cmd_extract)
+
+    # autocorr
+    p = sub.add_parser('autocorr',
+                       help='Integrated autocorrelation time via Gamma/UW method')
+    p.add_argument('csv',    help='CSV file produced by extract')
+    p.add_argument('column', help='Observable column (e.g. plaquette, polyakov_abs)')
+    p.add_argument('--burnin', type=int, default=0,
+                   help='Discard trajectories before this number (default: 0)')
+    p.add_argument('--S', type=float, default=1.5,
+                   help='Madras-Sokal window parameter (default: 1.5)')
+    p.set_defaults(func=cmd_autocorr)
+
+    # summary
+    p = sub.add_parser('summary',
+                       help='Full report: extract + burn-in + tau_int for all observables')
+    p.add_argument('run_dir', help='Directory containing hmc_traj*.log files')
+    p.add_argument('--burnin', type=int, default=None,
+                   help='Manual burn-in trajectory (default: auto-detect)')
+    p.add_argument('--pattern', default='hmc_traj*.log',
+                   help="Log file glob (default: 'hmc_traj*.log')")
+    p.set_defaults(func=cmd_summary)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()

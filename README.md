@@ -1,12 +1,17 @@
 # grid-lqcd-workflow
 
-Scripts to build, test, and run [Grid](https://github.com/paboyle/Grid) lattice QCD
-on macOS Apple Silicon. Supports two Grid forks via a single `GRID_PROFILE` variable:
+Scripts to build, test, run, and analyse [Grid](https://github.com/paboyle/Grid) lattice QCD.
+Supports two Grid forks and two platforms via a shared workflow structure.
 
 | Profile | Repo | Description |
 |---|---|---|
 | `txqcd` | [mlwagman/Grid-TXQCD](https://github.com/mlwagman/Grid-TXQCD) | TXQCD physics extensions |
 | `mainline` | [paboyle/Grid](https://github.com/paboyle/Grid) | Upstream Grid |
+
+| Platform | Status |
+|---|---|
+| macOS Apple Silicon | CPU build via Homebrew |
+| lq (Fermilab, AlmaLinux 8, NVIDIA A100) | GPU build via NVHPC/CUDA |
 
 ---
 
@@ -15,176 +20,175 @@ on macOS Apple Silicon. Supports two Grid forks via a single `GRID_PROFILE` vari
 ```
 grid_qcd/                              ← top-level working directory
 ├── grid-lqcd-workflow/                ← this repo
-│   ├── config.sh                      ← set GRID_PROFILE here
-│   ├── 1_build_grid/                  ← build the Grid library
-│   │   ├── build_grid_homebrew.sh     ← recommended for macOS
-│   │   └── build_grid_fromscratch.sh  ← build Grid + all deps from source
-│   ├── 2_test_grid/                   ← verify the Grid build
-│   │   ├── test_grid.sh               ← correctness tests
-│   │   └── benchmark_grid.sh          ← performance benchmarks
+│   ├── config.sh                      ← profile and path configuration
+│   ├── 1_build_grid/                  ← build scripts
+│   │   ├── build_grid_homebrew.sh     ← macOS: Grid + Homebrew deps
+│   │   ├── build_grid_lq.sh           ← lq: GPU build via NVHPC/CUDA
+│   │   └── build_grid_fromscratch.sh  ← all deps from source
+│   ├── 2_test_grid/                   ← correctness tests and benchmarks
+│   │   ├── test_grid.sh               ← runs Test_* binaries
+│   │   └── benchmark_grid.sh          ← runs Benchmark_* binaries
 │   ├── 3_examples/                    ← self-contained physics examples
-│   │   └── dweofa_mobius/             ← Domain Wall EOFA Mobius HMC
-│   │       ├── src/                   ← source code
-│   │       ├── bin/                   ← compiled binary (git-ignored)
-│   │       ├── inputs/                ← XML parameter files
-│   │       ├── build.sh               ← compile the binary
-│   │       └── run_test.sh            ← smoke test (3 trajectories, ~1 min)
+│   │   ├── mobius_dwf_test/           ← Möbius DWF: EOFA vs RHMC comparison
+│   │   │   ├── src/                   ← dweofa_mobius.cc, dwrhmc_mobius.cc
+│   │   │   ├── bin/                   ← compiled binaries (git-ignored)
+│   │   │   ├── inputs/                ← ip_hmc_test.xml (shared input)
+│   │   │   └── build.sh               ← compile both binaries
+│   │   └── dweofa_mobius/             ← standalone EOFA reference implementation
+│   ├── 4_analysis/                    ← HMC observable analysis toolkit
+│   │   ├── hmc/                       ← Python package
+│   │   │   ├── extract.py             ← parse Grid logs → DataFrame
+│   │   │   ├── autocorr.py            ← integrated autocorrelation (Gamma/UW)
+│   │   │   └── equilibrate.py         ← burn-in detection
+│   │   ├── hmc_obs                    ← CLI: extract / autocorr / summary
+│   │   ├── requirements.txt
+│   │   └── README.md
 │   └── common/
-│       └── run_exec.sh                ← general MPI runner with timestamped output
+│       └── run_exec.sh                ← general MPI runner (macOS)
 │
 ├── Grid-TXQCD/                        ← txqcd source (cloned by build script)
 ├── Grid-mainline/                     ← mainline source (cloned by build script)
-├── build-txqcd/                       ← txqcd build artifacts
-├── build-mainline/                    ← mainline build artifacts
-├── install-txqcd/                     ← txqcd installed library + executables
-├── install-mainline/                  ← mainline installed library + executables
-├── deps/                              ← from-scratch dependency builds (shared)
-└── runs/                              ← timestamped simulation output
+├── build-txqcd-gpu/                   ← txqcd GPU build tree (lq)
+├── build-grid-gpu/                    ← mainline GPU build tree (lq)
+├── install-txqcd-gpu/                 ← txqcd install: headers, lib, bin (lq)
+├── install-grid-gpu/                  ← mainline install: headers, lib, bin (lq)
+├── deps/                              ← from-scratch dependency builds
+└── runs/                              ← HMC simulation output
+    └── <ensemble>/
+        ├── hmc/                       ← configs, logs, input.xml
+        └── meas/                      ← measurement output
 ```
-
-Grid source, build, install, and run output all live *outside* the workflow repo —
-`git pull` on Grid never touches your files, and vice versa.
 
 ---
 
 ## Switching profiles
 
-Edit `config.sh` and change one line:
+Edit `config.sh`:
 
 ```bash
 export GRID_PROFILE="txqcd"     # or "mainline"
 ```
 
-All paths (`GRID_SRC`, `GRID_BUILD`, `GRID_INSTALL`) update automatically.
-Both profiles can be built and installed simultaneously — switching is instant.
-
----
-
-## Prerequisites
-
-> **Platform note:** these instructions cover macOS Apple Silicon only. Linux support is not yet documented.
-
-- macOS with Apple Silicon
-- [Homebrew](https://brew.sh)
-- GCC and the OpenMP runtime — install once when setting up a new machine:
-  ```bash
-  brew install gcc libomp
-  ```
-
-All Grid-specific dependencies (`open-mpi`, `gmp`, `mpfr`, `fftw`, etc.) are installed automatically by the build script.
+All paths update automatically. Both profiles can coexist.
 
 ---
 
 ## Step 1 — Build Grid
 
-### Recommended: Homebrew (faster, macOS-optimised)
+### macOS (Homebrew)
 
 ```bash
 ./1_build_grid/build_grid_homebrew.sh
 ```
 
-### Alternative: build all dependencies from source
+### lq (GPU, NVHPC/CUDA)
 
 ```bash
-./1_build_grid/build_grid_fromscratch.sh
+MACHINE=lq ./1_build_grid/build_grid_lq.sh
 ```
 
-The from-scratch script builds GMP, MPFR, HDF5, OpenSSL, FFTW, and LIME from source
-into `../deps/local/` before building Grid. Use this for HPC systems or when you need
-precise control over dependency versions.
+Loads required modules, configures with `--enable-unified=yes --enable-simd=GPU`,
+and installs to `../install-${GRID_PROFILE}-gpu/`.
 
-**When to re-run:** after `git pull` on the Grid source repo.
+**When to re-run:** after `git pull` on the Grid source, or after changing
+compiler flags. Re-run `build.sh` in any `3_examples/` directory afterwards
+to relink against the fresh install.
 
 ---
 
-## Step 2 — Test the Grid build
+## Step 2 — Test the build
 
-### Correctness tests
+Tests and benchmarks run from `2_test_grid/` on macOS. On lq, submit via the
+SLURM scripts in `$HOME/projects/grid_qcd/jobs/` (not in this repo —
+cluster-specific paths and account names).
 
 ```bash
+# macOS
 ./2_test_grid/test_grid.sh
-```
-
-Runs 7 correctness tests from the Grid build tree. All should pass on macOS.
-Takes ~10 seconds.
-
-### Performance benchmarks
-
-```bash
 ./2_test_grid/benchmark_grid.sh
+
+# lq
+sbatch $HOME/projects/grid_qcd/jobs/test-txqcd.sbatch
+sbatch $HOME/projects/grid_qcd/jobs/benchmark-txqcd.sbatch
 ```
 
-Runs DWF, Wilson, SU(3), and memory bandwidth benchmarks.
+**Known failures on lq GPU builds** (not regressions):
+- `Test_general_stencil` — requires nvlink hugepages (not configured on lq)
+- `Test_innerproduct_norm` — single-precision GPU rounding vs CPU reference
 
 ---
 
-## Step 3 — Run an example
+## Step 3 — Run an example: Möbius DWF EOFA vs RHMC
 
-Each example under `3_examples/` is self-contained: build it, then run the smoke test.
-
-### Domain Wall EOFA Mobius
-
-```bash
-# Compile
-./3_examples/dweofa_mobius/build.sh
-
-# Smoke test: 4^4 lattice, Ls=4, 3 trajectories (~1 min)
-./3_examples/dweofa_mobius/run_test.sh
-
-# Full production run via the general runner
-./common/run_exec.sh dweofa_mobius_HSDM_v3 '' 4.4.4.4 1.1.1.1 1
-```
-
-The production XML (`inputs/ip_hmc_mobius.xml`) uses Ls=16 and 10 trajectories.
-Pass it with `--ParameterFile`:
+Compiles and runs two 1-flavour Möbius DWF HMC algorithms against the same
+input for direct comparison.
 
 ```bash
-mpirun -np 1 3_examples/dweofa_mobius/bin/dweofa_mobius_HSDM_v3 \
-    --grid 16.16.16.32 --mpi 1.1.1.1 \
-    --ParameterFile 3_examples/dweofa_mobius/inputs/ip_hmc_mobius.xml
+# Compile both binaries against the TXQCD install
+source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
+./3_examples/mobius_dwf_test/build.sh
+
+# Set up a run directory with input.xml, then submit (lq)
+mkdir -p $BASE_DIR/runs/mobius_eofa/hmc
+cp 3_examples/mobius_dwf_test/inputs/ip_hmc_test.xml \
+   $BASE_DIR/runs/mobius_eofa/hmc/input.xml
+sbatch $HOME/projects/grid_qcd/jobs/run-eofa.sbatch
+sbatch $HOME/projects/grid_qcd/jobs/run-rhmc.sbatch
 ```
+
+Each job writes to its run directory:
+
+```
+runs/mobius_eofa/hmc/
+  input.xml                  active input (edit StartTrajectory to extend)
+  input_traj{N}.xml          archived on continuation
+  run_info_traj{N}.txt       provenance: date, job ID, node, XML params
+  hmc_traj{START}-{END}.log  Grid physics output
+  slurm-<jobid>.log          job wrapper output
+  ckpoint_lat.{N}            gauge configs (every 10 trajectories)
+  ckpoint_rng.{N}            RNG state
+```
+
+**Extending a run:** update `StartTrajectory` in `input.xml` and resubmit.
+The script auto-archives the old `input.xml` and names the new log correctly.
+
+**RHMC note:** `OFRp.hi` in `dwrhmc_mobius.cc` must exceed the largest
+eigenvalue of M†M. Measured λ_max ≈ 87 on a 4³×8 lattice; currently set to
+100. Check and adjust for larger lattices.
 
 ---
 
-## General runner
-
-`common/run_exec.sh` runs any built executable with MPI and creates an auto-numbered,
-timestamped output directory under `../runs/`:
+## Step 4 — Analyse
 
 ```bash
-./common/run_exec.sh <executable> [param_file] [grid] [mpi] [nproc]
+module load mambaforge/23.1.0-4
+conda activate /lustre2/nplqcd/vayyar/conda-envs/hmc-analysis
+cd 4_analysis
+
+# Full summary: accept rate, auto burn-in, tau_int for all observables
+python hmc_obs summary $BASE_DIR/runs/mobius_eofa/hmc
+
+# Save observables to CSV, then compute autocorrelation time
+python hmc_obs extract $BASE_DIR/runs/mobius_eofa/hmc -o obs_eofa.csv
+python hmc_obs autocorr obs_eofa.csv plaquette --burnin 50
 ```
 
-| Argument | Description | Default |
-|---|---|---|
-| `executable` | binary name | required |
-| `param_file` | XML file from an `inputs/` directory (pass `''` to skip) | — |
-| `grid` | lattice geometry | `4.4.4.8` |
-| `mpi` | MPI decomposition | `1.1.1.1` |
-| `nproc` | number of MPI ranks | `1` |
-
-Each run creates:
-
-```
-runs/run_001_20260512_122525/
-├── dweofa_mobius_HSDM_v3   ← copy of the executable
-└── run.log                  ← all output
-```
+See [`4_analysis/README.md`](4_analysis/README.md) for the Python module API
+and details of the Gamma/UW autocorrelation method.
 
 ---
 
-## Configuration reference
-
-All settings are in [`config.sh`](config.sh):
+## Configuration reference (`config.sh`)
 
 | Variable | Description |
 |---|---|
 | `GRID_PROFILE` | Active profile: `txqcd` or `mainline` |
-| `GRID_REPO` | Git URL of the Grid fork (set automatically by profile) |
-| `GRID_SRC` | Path to Grid source directory |
-| `GRID_BUILD` | Path to out-of-tree build directory |
-| `GRID_INSTALL` | Path to installed library and executables |
-| `DEPS_DIR` | Path to from-scratch dependency builds |
-| `RUNS_DIR` | Path to simulation output directories |
-| `MPICXX` | MPI C++ compiler wrapper |
-| `OMPI_CXX` | Underlying C++ compiler used by MPI wrapper (auto-detected) |
+| `GRID_SRC` | Grid source directory |
+| `GRID_BUILD` | Out-of-tree build directory |
+| `GRID_INSTALL` | Installed library and executables |
+| `DEPS_DIR` | From-scratch dependency builds (shared) |
+| `RUNS_DIR` | Simulation output root |
+| `MPICXX` | MPI C++ compiler (macOS) |
+
+Set `MACHINE=lq` before sourcing to activate lq-specific overrides (modules,
+CUDA paths, GPU architecture `sm_80`, `-gpu` path suffixes).
