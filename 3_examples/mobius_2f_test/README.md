@@ -114,3 +114,7 @@ The 2f-EOFA run needs to catch up to the 2f-CG run due to slower per-trajectory 
 2-flavor dynamics thermalize faster than 1-flavor (~traj 30-40 vs ~traj 100)
 because two fermion flavors drive stronger gauge field evolution. τ_int for the
 plaquette is correspondingly lower (~1.8 vs ~3.7 for 1-flavor on the same lattice).
+
+## Results
+
+See [RESULTS.md](RESULTS.md) for the comparison outcome on a 4³×8 test lattice.
