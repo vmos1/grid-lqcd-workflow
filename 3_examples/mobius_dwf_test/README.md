@@ -122,3 +122,7 @@ df_eofa = pd.concat([
   then rebuild.
 - **High acceptance rate (~99%)** — expected on this small lattice with MDsteps=8.
   Not a bug; for production, tune MDsteps to get ~75% acceptance.
+
+## Results
+
+See [RESULTS.md](RESULTS.md) for the comparison outcome on a 4³×8 test lattice.
