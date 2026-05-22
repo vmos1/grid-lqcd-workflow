@@ -16,6 +16,24 @@
 | Cluster | lq (Fermilab), NVIDIA A100 GPU |
 | Date | May 2026 |
 
+## Statistical definitions
+
+- **Burn-in:** trajectories discarded before the chain has thermalized; detected
+  automatically as the point where the rolling mean of the plaquette stabilizes.
+- **N_eq:** number of equilibrated trajectories after burn-in.
+- **σ (error on mean):** statistical error on the observable mean, accounting for
+  autocorrelations: σ = sqrt(2 τ_int × Var / N_eq).
+- **τ_int (integrated autocorrelation time):** number of trajectories between
+  statistically independent samples, estimated via the Gamma/UW method
+  (Wolff, Comput. Phys. Commun. 156, 2004). Effective independent samples
+  N_eff ≈ N_eq / (2 τ_int).
+- **Pull:** consistency test between two means —
+  pull = (mean_A − mean_B) / sqrt(σ_A² + σ_B²).
+  |pull| < 2σ indicates statistical agreement; larger values suggest either
+  the algorithms sample different distributions (a bug) or insufficient statistics.
+- **⟨exp(−dH)⟩:** expectation value of the Metropolis weight. Equals 1 exactly
+  by detailed balance; deviations indicate integrator step-size errors or short statistics.
+
 ## Observable comparison
 
 Post burn-in statistics: 2f-CG N_eq ≈ 596 (burn-in traj 65), 2f-EOFA N_eq ≈ 308 (burn-in traj 43).
