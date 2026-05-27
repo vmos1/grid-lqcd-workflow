@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<!-- 2+1 flavor Wilson Clover HMC input — 4^3 x 8 test lattice, cold start.
+     Light sector: 2 degenerate flavors, exact CG.
+     Heavy sector: 1 flavor, RHMC rational approximation.
+     Tune HeavyRHMC lo/hi by measuring eigenvalue bounds from a short run. -->
+<grid>
+  <HMC>
+    <StartTrajectory>0</StartTrajectory>
+    <Trajectories>200</Trajectories>
+    <MetropolisTest>true</MetropolisTest>
+    <NoMetropolisUntil>10</NoMetropolisUntil>
+    <StartingType>ColdStart</StartingType>
+    <PerformRandomShift>false</PerformRandomShift>
+    <MD>
+      <name>MinimumNorm2</name>
+      <MDsteps>8</MDsteps>
+      <trajL>1.0</trajL>
+    </MD>
+  </HMC>
+  <Checkpointer>
+    <config_prefix>./ckpoint_lat</config_prefix>
+    <rng_prefix>./ckpoint_rng</rng_prefix>
+    <saveInterval>10</saveInterval>
+    <saveSmeared>false</saveSmeared>
+    <smeared_prefix>./ckpoint_lat_smr</smeared_prefix>
+    <format>IEEE64BIG</format>
+  </Checkpointer>
+  <RandomNumberGenerator>
+    <serial_seeds>21 32 73 64 45</serial_seeds>
+    <parallel_seeds>63 79 81 99 10</parallel_seeds>
+  </RandomNumberGenerator>
+  <Action>
+    <gauge_beta>5.4</gauge_beta>
+    <ApplySmearing>false</ApplySmearing>
+    <Light>
+      <!-- mass ~ m_ud; csw_r=csw_t=1.0 (tree-level); tune for non-perturbative improvement -->
+      <mass>0.05</mass>
+      <csw_r>1.0</csw_r>
+      <csw_t>1.0</csw_t>
+      <StoppingCondition>1e-10</StoppingCondition>
+      <MDStoppingCondition>1e-8</MDStoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+    </Light>
+    <Heavy>
+      <!-- mass ~ m_s; csw same as light (same lattice spacing) -->
+      <mass>0.2</mass>
+      <csw_r>1.0</csw_r>
+      <csw_t>1.0</csw_t>
+      <StoppingCondition>1e-10</StoppingCondition>
+      <MDStoppingCondition>1e-8</MDStoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+    </Heavy>
+    <HeavyRHMC>
+      <!-- Rational approx for [det(M_h)/det(M_PV)]^{1/2}.
+           lo < lambda_min of (M_h^dag M_h)_eo, hi > lambda_max.
+           For mass=0.2 on 4^3x8: lo~0.01 (conservative), hi~30-50.
+           Increase degree if the rational approx error exceeds tolerance. -->
+      <lo>0.005</lo>
+      <hi>50.0</hi>
+      <degree>14</degree>
+      <MaxIter>10000</MaxIter>
+      <tolerance>1e-8</tolerance>
+      <mdtolerance>1e-6</mdtolerance>
+      <precision>50</precision>
+      <BoundsCheckFreq>20</BoundsCheckFreq>
+    </HeavyRHMC>
+  </Action>
+  <StoutSmearing>
+    <!-- Used only when ApplySmearing=true above -->
+    <rho>0.1</rho>
+    <Nsmear>3</Nsmear>
+  </StoutSmearing>
+</grid>
