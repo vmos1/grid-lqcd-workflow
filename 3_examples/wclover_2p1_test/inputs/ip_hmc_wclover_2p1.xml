@@ -56,7 +56,7 @@
            For mass=0.2 on 4^3x8: lo~0.01 (conservative), hi~30-50.
            Increase degree if the rational approx error exceeds tolerance. -->
       <lo>0.005</lo>
-      <hi>50.0</hi>
+      <hi>100.0</hi>
       <degree>14</degree>
       <MaxIter>10000</MaxIter>
       <tolerance>1e-8</tolerance>
