@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Compile 2+1 flavor Wilson Clover HMC against the lq mainline Grid install.
+# Compile 2+1 flavor Wilson Clover HMC binaries.
+#
+#   wclover_2p1_rhmc  — non-EO (full-lattice CG), builds against install-grid-gpu
+#   wclover_2p1_eo    — EO-preconditioned (Schur + LogDet), builds against install-txqcd-gpu
+#                       (QCDLogDetCloverEOAction and TwoFlavourSchurCloverAction are
+#                       TXQCD-fork additions not yet in mainline Grid)
+#
 # Run after: source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
 
 set -euo pipefail
 
-GRID_CONFIG=${GRID_CONFIG:-/lustre2/nplqcd/vayyar/grid_qcd/install-grid-gpu/bin/grid-config}
-
-if [ ! -x "${GRID_CONFIG}" ]; then
-    echo "ERROR: grid-config not found at ${GRID_CONFIG}"
-    echo "Set GRID_CONFIG or source env.sh first."
-    exit 1
-fi
-
-echo "-- Using: ${GRID_CONFIG}"
-echo "-- Prefix: $(${GRID_CONFIG} --prefix)"
+BASE=/lustre2/nplqcd/vayyar/grid_qcd
+GRID_CONFIG_MAIN=${GRID_CONFIG_MAIN:-${BASE}/install-grid-gpu/bin/grid-config}
+GRID_CONFIG_TXQCD=${GRID_CONFIG_TXQCD:-${BASE}/install-txqcd-gpu/bin/grid-config}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC=${SCRIPT_DIR}/src
@@ -21,14 +20,20 @@ BIN=${SCRIPT_DIR}/bin
 mkdir -p ${BIN}
 
 compile() {
-    local src=$1 exe=$2
-    echo "==> Compiling ${exe}..."
-    $(${GRID_CONFIG} --cxx) \
-        $(${GRID_CONFIG} --cxxflags) \
+    local gc=$1 src=$2 exe=$3
+    if [ ! -x "${gc}" ]; then
+        echo "ERROR: grid-config not found at ${gc}"
+        exit 1
+    fi
+    echo "==> Compiling ${exe} ($(${gc} --prefix))..."
+    $(${gc} --cxx) \
+        $(${gc} --cxxflags) \
         ${SRC}/${src} -o ${BIN}/${exe} \
-        $(${GRID_CONFIG} --ldflags) \
-        $(${GRID_CONFIG} --libs)
+        $(${gc} --ldflags) \
+        $(${gc} --libs)
     echo "-- Done: ${BIN}/${exe}"
 }
 
-compile wclover_2p1_rhmc.cc wclover_2p1_rhmc
+compile ${GRID_CONFIG_MAIN}  wclover_2p1_rhmc.cc wclover_2p1_rhmc
+compile ${GRID_CONFIG_TXQCD} wclover_2p1_eo.cc   wclover_2p1_eo
+compile ${GRID_CONFIG_MAIN}  wclover_hasenbusch_tune.cc wclover_hasenbusch_tune
