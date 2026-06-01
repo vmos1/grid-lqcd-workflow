@@ -28,6 +28,8 @@ def suggest_burnin(df, observable='plaquette', window=20, tolerance=0.02):
         Trajectory label of the suggested burn-in point, or None if the series
         appears always stable (or too short to judge).
     """
+    if observable not in df.columns:
+        return None
     col = df[observable].dropna()
     if len(col) < window * 2:
         return None

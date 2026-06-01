@@ -1,0 +1,91 @@
+<?xml version="1.0"?>
+<!--
+  Hasenbusch mass tuning run.
+  Full lattice (48^3 x 96), 5 trajectories, flat 2-level integrator.
+  Adjust m_H1..m_H4 iteratively until FORCES lines show equal PF0..PF4 forces.
+
+  Initial masses: geometric spacing in kappa between m_light and m_PV=1.0.
+    m_light = -0.2416  kappa = 0.1330
+    m_H1    = -0.021   kappa = 0.1257
+    m_H2    =  0.212   kappa = 0.1187
+    m_H3    =  0.459   kappa = 0.1121
+    m_H4    =  0.721   kappa = 0.1059
+    m_PV    =  1.000   kappa = 0.1000  (hardcoded in source)
+
+  Run via:
+    bin/wclover_hasenbusch_tune --ParameterFile inputs/ip_hmc_hasenbusch_tune.xml \
+        --grid 48.48.48.96 --mpi 1.1.1.1
+
+  Or use tune_hasenbusch.sh for automated iteration.
+-->
+<grid>
+  <HMC>
+    <StartTrajectory>0</StartTrajectory>
+    <Trajectories>5</Trajectories>
+    <MetropolisTest>true</MetropolisTest>
+    <NoMetropolisUntil>0</NoMetropolisUntil>
+    <StartingType>ColdStart</StartingType>
+    <PerformRandomShift>false</PerformRandomShift>
+    <MD>
+      <name>MinimumNorm2</name>
+      <MDsteps>8</MDsteps>
+      <trajL>1.0</trajL>
+    </MD>
+  </HMC>
+  <Checkpointer>
+    <config_prefix>./ckpoint_lat</config_prefix>
+    <rng_prefix>./ckpoint_rng</rng_prefix>
+    <saveInterval>1000</saveInterval>
+    <saveSmeared>false</saveSmeared>
+    <smeared_prefix>./ckpoint_lat_smr</smeared_prefix>
+    <format>IEEE64BIG</format>
+  </Checkpointer>
+  <RandomNumberGenerator>
+    <serial_seeds>21 32 73 64 45</serial_seeds>
+    <parallel_seeds>63 79 81 99 10</parallel_seeds>
+  </RandomNumberGenerator>
+  <Action>
+    <gauge_beta>6.3</gauge_beta>
+    <ApplySmearing>false</ApplySmearing>
+    <Light>
+      <mass>-0.2416</mass>
+      <csw_r>1.0</csw_r>
+      <csw_t>1.0</csw_t>
+      <StoppingCondition>1e-8</StoppingCondition>
+      <MDStoppingCondition>1e-6</MDStoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+    </Light>
+    <Hasenbusch>
+      <!-- Geometric spacing in kappa. Adjust these masses until
+           FORCES PF0=PF1=PF2=PF3=PF4 (balance metric < 1.5). -->
+      <m_H1>-0.021</m_H1>
+      <m_H2>0.212</m_H2>
+      <m_H3>0.459</m_H3>
+      <m_H4>0.721</m_H4>
+    </Hasenbusch>
+    <Strange>
+      <mass>-0.2050</mass>
+      <csw_r>1.0</csw_r>
+      <csw_t>1.0</csw_t>
+      <StoppingCondition>1e-8</StoppingCondition>
+      <MDStoppingCondition>1e-6</MDStoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+    </Strange>
+    <StrangeRHMC>
+      <!-- Bounds for eigenvalues of M_s^dag M_s (full lattice).
+           Verify lo < lambda_min before production runs. -->
+      <lo>0.005</lo>
+      <hi>100.0</hi>
+      <degree>14</degree>
+      <MaxIter>10000</MaxIter>
+      <tolerance>1e-8</tolerance>
+      <mdtolerance>1e-6</mdtolerance>
+      <precision>50</precision>
+      <BoundsCheckFreq>20</BoundsCheckFreq>
+    </StrangeRHMC>
+  </Action>
+  <StoutSmearing>
+    <rho>0.1</rho>
+    <Nsmear>3</Nsmear>
+  </StoutSmearing>
+</grid>

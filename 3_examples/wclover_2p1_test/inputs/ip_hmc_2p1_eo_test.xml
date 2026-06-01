@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!-- 2+1 flavor Wilson Clover HMC — EO-preconditioned version.
+     Same physics as ip_hmc_test.xml but using:
+       Light: QCDLogDetCloverEOAction + TwoFlavourSchurCloverActionMP (MP CG)
+       Strange: QCDLogDetCloverEOAction + OneFlavourSchurCloverRationalActionMP
+     This should be ~20-50x faster per trajectory than the non-EO version. -->
+<grid>
+  <HMC>
+    <StartTrajectory>0</StartTrajectory>
+    <Trajectories>8</Trajectories>
+    <MetropolisTest>true</MetropolisTest>
+    <NoMetropolisUntil>10</NoMetropolisUntil>
+    <StartingType>ColdStart</StartingType>
+    <PerformRandomShift>false</PerformRandomShift>
+    <MD>
+      <name>MinimumNorm2</name>
+      <MDsteps>8</MDsteps>
+      <trajL>1.0</trajL>
+    </MD>
+  </HMC>
+  <Checkpointer>
+    <config_prefix>./ckpoint_lat</config_prefix>
+    <rng_prefix>./ckpoint_rng</rng_prefix>
+    <saveInterval>10</saveInterval>
+    <saveSmeared>false</saveSmeared>
+    <smeared_prefix>./ckpoint_lat_smr</smeared_prefix>
+    <format>IEEE64BIG</format>
+  </Checkpointer>
+  <RandomNumberGenerator>
+    <serial_seeds>21 32 73 64 45</serial_seeds>
+    <parallel_seeds>63 79 81 99 10</parallel_seeds>
+  </RandomNumberGenerator>
+  <Action>
+    <gauge_beta>5.4</gauge_beta>
+    <ApplySmearing>false</ApplySmearing>
+    <Light>
+      <!-- 2 degenerate light flavors; csw=1.0 tree-level -->
+      <!-- StoppingCondition: action CG (tight DP, accept/reject) -->
+      <!-- MDStoppingCondition: MD force CG inner tolerance (mixed-prec) -->
+      <mass>0.05</mass>
+      <csw_r>1.0</csw_r>
+      <csw_t>1.0</csw_t>
+      <StoppingCondition>1e-10</StoppingCondition>
+      <MDStoppingCondition>1e-8</MDStoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+    </Light>
+    <Strange>
+      <!-- 1 strange flavor; same csw as light (same lattice spacing) -->
+      <mass>0.2</mass>
+      <csw_r>1.0</csw_r>
+      <csw_t>1.0</csw_t>
+      <StoppingCondition>1e-10</StoppingCondition>
+      <MDStoppingCondition>1e-8</MDStoppingCondition>
+      <MaxCGIterations>30000</MaxCGIterations>
+    </Strange>
+    <StrangeRHMC>
+      <!-- Rational approx for [det(M_s)/det(M_PV)]^{1/2} on odd sublattice.
+           lo/hi bound the eigenvalues of the EO Schur complement (Mpc†Mpc).
+           For mass=0.2 on 4^3x8 these are tighter than the full-operator
+           bounds in ip_hmc_test.xml. Verify with a short run if changing mass. -->
+      <lo>0.005</lo>
+      <hi>100.0</hi>
+      <degree>14</degree>
+      <MaxIter>10000</MaxIter>
+      <tolerance>1e-8</tolerance>
+      <mdtolerance>1e-6</mdtolerance>
+      <precision>50</precision>
+      <BoundsCheckFreq>20</BoundsCheckFreq>
+    </StrangeRHMC>
+  </Action>
+  <StoutSmearing>
+    <!-- Used only when ApplySmearing=true above -->
+    <rho>0.1</rho>
+    <Nsmear>3</Nsmear>
+  </StoutSmearing>
+</grid>
