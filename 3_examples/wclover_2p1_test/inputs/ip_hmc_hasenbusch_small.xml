@@ -1,34 +1,26 @@
 <?xml version="1.0"?>
 <!--
-  Hasenbusch mass tuning run.
-  Full lattice (48^3 x 96), 5 trajectories, flat 2-level integrator.
-  Adjust m_H1..m_H4 iteratively until FORCES lines show equal PF0..PF4 forces.
+  Hasenbusch correctness test — small lattice (8^3 x 16), cold start.
+  Single GPU, single rank. Used to verify FORCES output and code sanity.
 
-  Initial masses: geometric spacing in kappa between m_light and m_PV=1.0.
-    m_light = -0.2416  kappa = 0.1330
-    m_H1    = -0.021   kappa = 0.1257
-    m_H2    =  0.212   kappa = 0.1187
-    m_H3    =  0.459   kappa = 0.1121
-    m_H4    =  0.721   kappa = 0.1059
-    m_PV    =  1.000   kappa = 0.1000  (hardcoded in source)
+  MDsteps=20 (step size 0.05) for better acceptance from cold start.
+  NoMetropolisUntil=5 to let gauge field settle before Metropolis kicks in.
 
   Run via:
-    bin/wclover_hasenbusch_tune_no_eo --ParameterFile inputs/ip_hmc_hasenbusch_tune.xml \
-        --grid 48.48.48.96 --mpi 1.1.1.1
-
-  Or use tune_hasenbusch.sh for automated iteration.
+    bin/wclover_hasenbusch_tune_no_eo --ParameterFile inputs/ip_hmc_hasenbusch_small.xml \
+        --grid 8.8.8.16 --mpi 1.1.1.1
 -->
 <grid>
   <HMC>
     <StartTrajectory>0</StartTrajectory>
-    <Trajectories>5</Trajectories>
+    <Trajectories>10</Trajectories>
     <MetropolisTest>true</MetropolisTest>
-    <NoMetropolisUntil>0</NoMetropolisUntil>
+    <NoMetropolisUntil>5</NoMetropolisUntil>
     <StartingType>ColdStart</StartingType>
     <PerformRandomShift>false</PerformRandomShift>
     <MD>
       <name>MinimumNorm2</name>
-      <MDsteps>8</MDsteps>
+      <MDsteps>20</MDsteps>
       <trajL>1.0</trajL>
     </MD>
   </HMC>
@@ -52,12 +44,10 @@
       <csw_r>1.0</csw_r>
       <csw_t>1.0</csw_t>
       <StoppingCondition>1e-8</StoppingCondition>
-      <MDStoppingCondition>1e-6</MDStoppingCondition>
+      <MDStoppingCondition>1e-4</MDStoppingCondition>
       <MaxCGIterations>30000</MaxCGIterations>
     </Light>
     <Hasenbusch>
-      <!-- Geometric spacing in kappa. Adjust these masses until
-           FORCES PF0=PF1=PF2=PF3=PF4 (balance metric < 1.5). -->
       <m_H1>-0.021</m_H1>
       <m_H2>0.212</m_H2>
       <m_H3>0.459</m_H3>
@@ -68,12 +58,10 @@
       <csw_r>1.0</csw_r>
       <csw_t>1.0</csw_t>
       <StoppingCondition>1e-8</StoppingCondition>
-      <MDStoppingCondition>1e-6</MDStoppingCondition>
+      <MDStoppingCondition>1e-4</MDStoppingCondition>
       <MaxCGIterations>30000</MaxCGIterations>
     </Strange>
     <StrangeRHMC>
-      <!-- Bounds for eigenvalues of M_s^dag M_s (full lattice).
-           Verify lo < lambda_min before production runs. -->
       <lo>0.005</lo>
       <hi>100.0</hi>
       <degree>14</degree>

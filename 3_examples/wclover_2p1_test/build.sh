@@ -36,4 +36,4 @@ compile() {
 
 compile ${GRID_CONFIG_MAIN}  wclover_2p1_rhmc.cc wclover_2p1_rhmc
 compile ${GRID_CONFIG_TXQCD} wclover_2p1_eo.cc   wclover_2p1_eo
-compile ${GRID_CONFIG_MAIN}  wclover_hasenbusch_tune.cc wclover_hasenbusch_tune
+compile ${GRID_CONFIG_MAIN}  wclover_hasenbusch_tune_no_eo.cc wclover_hasenbusch_tune_no_eo

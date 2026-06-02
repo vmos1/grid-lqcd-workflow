@@ -16,7 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE=/lustre2/nplqcd/vayyar/grid_qcd
-BIN=${SCRIPT_DIR}/bin/wclover_hasenbusch_tune
+BIN=${SCRIPT_DIR}/bin/wclover_hasenbusch_tune_no_eo
 TEMPLATE=${SCRIPT_DIR}/inputs/ip_hmc_hasenbusch_tune.xml
 WORKDIR=${BASE}/runs/hasenbusch_tune
 mkdir -p "${WORKDIR}"

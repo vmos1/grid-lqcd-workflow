@@ -29,13 +29,20 @@ grid_qcd/                              ← top-level working directory
 │   │   ├── test_grid.sh               ← runs Test_* binaries
 │   │   └── benchmark_grid.sh          ← runs Benchmark_* binaries
 │   ├── 3_examples/                    ← self-contained physics examples
-│   │   ├── mobius_dwf_test/           ← Möbius DWF: EOFA vs RHMC comparison
-│   │   │   ├── src/                   ← dweofa_mobius.cc, dwrhmc_mobius.cc
-│   │   │   ├── bin/                   ← compiled binaries (git-ignored)
-│   │   │   ├── inputs/                ← ip_hmc_test.xml (shared input)
-│   │   │   └── build.sh               ← compile both binaries
-│   │   └── dweofa_mobius/             ← standalone EOFA reference implementation
+│   │   ├── mobius_dwf_test/           ← 1f Möbius DWF: EOFA vs RHMC (TXQCD build)
+│   │   ├── mobius_2f_test/            ← 2f Möbius DWF: exact CG vs EOFA (mainline build)
+│   │   └── wclover_2p1_test/          ← 2+1f Wilson-clover HMC (TXQCD build)
+│   │       ├── src/                   ← wclover_2p1_eo.cc, wclover_2p1_rhmc.cc,
+│   │       │                              wclover_hasenbusch_tune_no_eo.cc
+│   │       ├── bin/                   ← compiled binaries (git-ignored)
+│   │       ├── inputs/                ← XML inputs for each binary
+│   │       └── build.sh               ← compile all binaries
 │   ├── 4_analysis/                    ← HMC observable analysis toolkit
+│   ├── 5_studies/                     ← ongoing physics studies (pre-production tuning)
+│   │   └── hasenbusch_tune/           ← Hasenbusch mass tuning for cl21_48_96_b6p3
+│   │       ├── src/                   ← gen_qcd_hasenbusch_tune.cc (TXQCD build)
+│   │       ├── bin/                   ← compiled binary (git-ignored)
+│   │       └── build.sh               ← compile against TXQCD install
 │   │   ├── hmc/                       ← Python package
 │   │   │   ├── extract.py             ← parse Grid logs → DataFrame
 │   │   │   ├── autocorr.py            ← integrated autocorrelation (Gamma/UW)
@@ -175,6 +182,33 @@ python hmc_obs autocorr obs_eofa.csv plaquette --burnin 50
 
 See [`4_analysis/README.md`](4_analysis/README.md) for the Python module API
 and details of the Gamma/UW autocorrelation method.
+
+---
+
+## Step 5 — Physics studies
+
+`5_studies/` contains pre-production tuning workflows — short jobs run to
+determine optimal parameters before committing to a production ensemble.
+
+### Hasenbusch mass tuning (`5_studies/hasenbusch_tune/`)
+
+Tunes the 4 intermediate masses for Hasenbusch preconditioning of the
+`cl21_48_96_b6p3_m0p2416_m0p2050` 2+1f Wilson-clover ensemble.
+
+Requires the TXQCD build (`install-txqcd-gpu`) for EO clover actions.
+See `hasenbusch.md` in `$HOME/projects/grid_qcd/` for the full tuning guide.
+
+```bash
+source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
+cd 5_studies/hasenbusch_tune
+bash build.sh
+
+# Run with Chroma baseline masses (from cfg_2000 metadata):
+export MASS_LIGHT=-0.2416 MASS_STRANGE=-0.2050 CSW=1.20537 BETA=6.3 LATT=48.48.48.96 U0=1.0
+export HASEN_LADDER="-0.2416,-0.2400,-0.2320,-0.2180,-0.1870"
+export IMPORT_CFG=/lustre2/nplqcd/cfgs/.../cfg_2000.lime N_TRAJ=5
+# submit via $HOME/projects/grid_qcd/jobs/tune-hasenbusch.sbatch
+```
 
 ---
 
