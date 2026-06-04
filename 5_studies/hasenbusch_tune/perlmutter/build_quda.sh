@@ -12,7 +12,7 @@
 #
 # Prereqs:
 #   1. YOUR Grid-TXQCD build is done — <GRID_TXQCD>/build/grid-config exists:
-#        cd $GRID_TXQCD && source sourceme.sh
+#        cd $GRID_TXQCD && source <workflow>/machines/perlmutter.sh
 #        mkdir build && cd build && ../systems/Perlmutter/config-command && make -j 32
 #      Pin Grid-TXQCD to the commit our binary targets (see PERLMUTTER_PORTING.md).
 #   2. A prebuilt QUDA you can read:  $QUDA_PREFIX/{include, lib/libquda.*}.
@@ -22,13 +22,13 @@
 #      otherwise point QMP_PREFIX at an install that ships libqmp.
 #
 # Usage:
-#   source $GRID_TXQCD/sourceme.sh        # SAME modules used to build Grid-TXQCD
+#   source <workflow>/machines/perlmutter.sh   # SAME modules used to build Grid-TXQCD
 #   QUDA_PREFIX=/path/to/quda-install bash build.sh
 
 set -e
 
 # ── EDIT THESE (or pass as env) for your Perlmutter layout ───────────────────
-GRID_TXQCD=${GRID_TXQCD:-$PSCRATCH/Grid-TXQCD}                 # your own checkout+build
+GRID_TXQCD=${GRID_TXQCD:-/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/Grid-TXQCD}  # your own checkout+build
 GRID_CONFIG=${GRID_CONFIG:-${GRID_TXQCD}/build/grid-config}    # from your Grid build
 TXQCD_PROD=${TXQCD_PROD:-${GRID_TXQCD}/production}             # for params.h
 

@@ -12,6 +12,7 @@ Supports two Grid forks and two platforms via a shared workflow structure.
 |---|---|
 | macOS Apple Silicon | CPU build via Homebrew |
 | lq (Fermilab, AlmaLinux 8, NVIDIA A100) | GPU build via NVHPC/CUDA |
+| Perlmutter (NERSC, A100) | GPU build via Cray PE / CUDA 12.9 |
 
 ---
 
@@ -21,6 +22,10 @@ Supports two Grid forks and two platforms via a shared workflow structure.
 grid_qcd/                              ← top-level working directory
 ├── grid-lqcd-workflow/                ← this repo
 │   ├── config.sh                      ← profile and path configuration
+│   ├── machines/                      ← machine-specific environment (sourced by config.sh)
+│   │   ├── perlmutter.sh             ← NERSC Perlmutter (Cray PE, CUDA 12.9)
+│   │   ├── lq.sh                     ← lq cluster (NVHPC, CUDA 12.2)
+│   │   └── macos.sh                  ← macOS (Homebrew)
 │   ├── 1_build_grid/                  ← build scripts
 │   │   ├── build_grid_homebrew.sh     ← macOS: Grid + Homebrew deps
 │   │   ├── build_grid_lq.sh           ← lq: GPU build via NVHPC/CUDA
@@ -40,9 +45,13 @@ grid_qcd/                              ← top-level working directory
 │   ├── 4_analysis/                    ← HMC observable analysis toolkit
 │   ├── 5_studies/                     ← ongoing physics studies (pre-production tuning)
 │   │   └── hasenbusch_tune/           ← Hasenbusch mass tuning for cl21_48_96_b6p3
-│   │       ├── src/                   ← gen_qcd_hasenbusch_tune.cc (TXQCD build)
+│   │       ├── src/                   ← gen_qcd_hasenbusch_tune.cc
 │   │       ├── bin/                   ← compiled binary (git-ignored)
-│   │       └── build.sh               ← compile against TXQCD install
+│   │       ├── lq/
+│   │       │   └── build.sh           ← compile on lq
+│   │       └── perlmutter/
+│   │           ├── build_puregrid.sh  ← compile pure-Grid (no QUDA)
+│   │           └── build_quda.sh      ← compile with QUDA (Phase 2)
 │   │   ├── hmc/                       ← Python package
 │   │   │   ├── extract.py             ← parse Grid logs → DataFrame
 │   │   │   ├── autocorr.py            ← integrated autocorrelation (Gamma/UW)
@@ -132,7 +141,6 @@ input for direct comparison.
 
 ```bash
 # Compile both binaries against the TXQCD install
-source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
 ./3_examples/mobius_dwf_test/build.sh
 
 # Set up a run directory with input.xml, then submit (lq)
@@ -199,16 +207,14 @@ Requires the TXQCD build (`install-txqcd-gpu`) for EO clover actions.
 See `hasenbusch.md` in `$HOME/projects/grid_qcd/` for the full tuning guide.
 
 ```bash
-source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
-cd 5_studies/hasenbusch_tune
-bash build.sh
+# lq
+cd 5_studies/hasenbusch_tune && bash lq/build.sh
 
-# Run with Chroma baseline masses (from cfg_2000 metadata):
-export MASS_LIGHT=-0.2416 MASS_STRANGE=-0.2050 CSW=1.20537 BETA=6.3 LATT=48.48.48.96 U0=1.0
-export HASEN_LADDER="-0.2416,-0.2400,-0.2320,-0.2180,-0.1870"
-export IMPORT_CFG=/lustre2/nplqcd/cfgs/.../cfg_2000.lime N_TRAJ=5
-# submit via $HOME/projects/grid_qcd/jobs/tune-hasenbusch.sbatch
+# Perlmutter (pure-Grid, no QUDA)
+cd 5_studies/hasenbusch_tune && bash perlmutter/build_puregrid.sh
 ```
+
+Submit via the machine-specific sbatch scripts in `submit_scripts/hasenbusch_tune/`.
 
 ---
 
@@ -224,5 +230,12 @@ export IMPORT_CFG=/lustre2/nplqcd/cfgs/.../cfg_2000.lime N_TRAJ=5
 | `RUNS_DIR` | Simulation output root |
 | `MPICXX` | MPI C++ compiler (macOS) |
 
-Set `MACHINE=lq` before sourcing to activate lq-specific overrides (modules,
-CUDA paths, GPU architecture `sm_80`, `-gpu` path suffixes).
+Machine-specific environment is loaded from `machines/<machine>.sh`. The machine
+is auto-detected (`$NERSC_HOST` for Perlmutter, `/lustre2/nplqcd` for lq, `uname`
+for macOS), or forced explicitly:
+
+```bash
+MACHINE=lq source config.sh
+```
+
+Adding a new machine: create `machines/<name>.sh` and add a detection rule in `config.sh`.

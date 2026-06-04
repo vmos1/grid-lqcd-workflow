@@ -37,7 +37,6 @@ This matches the EOFA convention where each 1-flavor action contributes det(M_ph
 Built against `install-grid-gpu` (mainline Grid) — both classes exist in mainline Grid.
 
 ```bash
-source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
 cd 3_examples/mobius_2f_test
 bash build.sh
 ```
