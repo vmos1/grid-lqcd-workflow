@@ -19,7 +19,6 @@ the implementations are correct.
 ## Build
 
 ```bash
-source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
 cd 3_examples/mobius_dwf_test
 bash build.sh          # compiles against install-txqcd-gpu by default
 ```

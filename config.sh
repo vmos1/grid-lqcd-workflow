@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Central configuration — edit GRID_PROFILE to switch between Grid forks.
-# Sourced automatically by all build/compile/run scripts.
+# Sourced by all build/compile/run scripts.
+#
+# Machine env is loaded from machines/<machine>.sh.
+# Auto-detected via $NERSC_HOST, /lustre2/nplqcd, or uname; or force with:
+#   MACHINE=perlmutter source config.sh
 
 WORKFLOW_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(dirname "$WORKFLOW_DIR")"
+export WORKFLOW_DIR BASE_DIR
 
-# ── Profile ───────────────────────────────────────────────────────────────────
+# ── Grid profile ──────────────────────────────────────────────────────────────
 # "txqcd"    → mlwagman/Grid-TXQCD (TXQCD physics extensions)
 # "mainline" → paboyle/Grid        (upstream Grid)
 export GRID_PROFILE="txqcd"
@@ -27,42 +32,30 @@ case "$GRID_PROFILE" in
         ;;
 esac
 
-# ── Paths (all derived from profile — change GRID_PROFILE, everything follows) ─
+# ── Paths (derived from profile; machine file may override GRID_BUILD) ────────
 export GRID_BUILD="$BASE_DIR/build-$GRID_PROFILE"
 export GRID_INSTALL="$BASE_DIR/install-$GRID_PROFILE"
-export DEPS_DIR="$BASE_DIR/deps"        # from-scratch dep builds (shared between profiles)
+export DEPS_DIR="$BASE_DIR/deps"
 export RUNS_DIR="$BASE_DIR/runs"
 
-# ── Compilers ─────────────────────────────────────────────────────────────────
-export MPICXX=/opt/homebrew/bin/mpicxx
-_gcc_ver=$(ls /opt/homebrew/bin/g++-* 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -1)
-export OMPI_CXX="/opt/homebrew/bin/g++-${_gcc_ver}"
+# ── Machine auto-detection ────────────────────────────────────────────────────
+if [ -z "${MACHINE:-}" ]; then
+    if [ "${NERSC_HOST:-}" = "perlmutter" ]; then
+        MACHINE=perlmutter
+    elif [ -d /lustre2/nplqcd ]; then
+        MACHINE=lq
+    elif [ "$(uname)" = Darwin ]; then
+        MACHINE=macos
+    fi
+fi
 
-# ── Homebrew dependency prefixes (used by build_grid_homebrew.sh only) ────────
-export GMP=/opt/homebrew/opt/gmp
-export MPFR=/opt/homebrew/opt/mpfr
-export OPENSSL=/opt/homebrew/opt/openssl@3
-export FFTW=/opt/homebrew/opt/fftw
-
-# ── Machine: lq (AlmaLinux 8, NVIDIA A100 GPUs, module system) ────────────────
-# Set MACHINE=lq before sourcing this file (build_grid_lq.sh does this automatically).
-if [ "${MACHINE:-}" = "lq" ]; then
-    # Modules to load
-    export LQ_MODULES="cmake gompi/2023a ucx_cuda/1.14.1_cuda_12.2.1 ucc_cuda/1.2.0_cuda_12.2.1 gcc/12.3.0"
-
-    # NVHPC 23.7 / CUDA 12.2
-    export NVHPC_ROOT=/srv/software/el8/x86_64/hpc/nvhpc/Linux_x86_64/23.7
-    export CUDA_HOME=${NVHPC_ROOT}/cuda/12.2
-    export NVIDIALIB=${NVHPC_ROOT}/math_libs/lib64
-    export NVIDIAINCLUDE=${NVHPC_ROOT}/math_libs/include
-
-    # Shared group dependencies (read-only — pre-built for this cluster)
-    export CLIME_ROOT=/lustre2/nplqcd/dwf/c-lime/install
-    export HDF5_ROOT=/srv/software/el8/x86_64/eb/HDF5/1.14.2-gompi-2023a
-
-    # GPU target: A100 = sm_80. Change for other GPU generations.
-    export CUDA_ARCH=sm_80
-
-    # Build dir gets a -gpu suffix to distinguish from any future CPU builds
-    export GRID_BUILD="${BASE_DIR}/build-${GRID_PROFILE}-gpu"
+# ── Source machine-specific environment ───────────────────────────────────────
+if [ -n "${MACHINE:-}" ]; then
+    _mf="$WORKFLOW_DIR/machines/${MACHINE}.sh"
+    if [ -f "$_mf" ]; then
+        source "$_mf"
+    else
+        echo "Warning: MACHINE='$MACHINE' set but machines/${MACHINE}.sh not found." >&2
+    fi
+    unset _mf
 fi

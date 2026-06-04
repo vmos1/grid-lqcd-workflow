@@ -8,16 +8,17 @@
 # #ifdef GRID_HAVE_QUDA guards drop the QUDA strange-force path.
 #
 # Prereq: Grid-TXQCD built WITH LIME (see ../../1_build_grid/PERLMUTTER_BUILD_NOTES.md).
-# Usage:  bash build_puregrid.sh        (sources sourceme.sh itself)
+# Usage:  bash build_puregrid.sh        (sources workflow config.sh → machines/perlmutter.sh)
 
 # Resolve paths relative to THIS script (works from anywhere).
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 HB=$(cd "$HERE/.." && pwd)
 
-GRID_TXQCD=${GRID_TXQCD:-/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/Grid-TXQCD}
-source "$GRID_TXQCD/sourceme.sh"          # modules (cudatoolkit/12.9 ...) + MPFR lib path
+WORKFLOW=$(cd "$HERE/../../.." && pwd)
+source "$WORKFLOW/config.sh"              # modules + MPFR lib path (via machines/perlmutter.sh)
 set -e
 
+GRID_TXQCD=${GRID_TXQCD:-$GRID_SRC}      # GRID_SRC set by config.sh
 GRID_CONFIG=${GRID_CONFIG:-$GRID_TXQCD/build/grid-config}
 TXQCD_PROD=${TXQCD_PROD:-$GRID_TXQCD/production}     # for params.h
 GRID_BUILD=${GRID_BUILD:-$GRID_TXQCD/build}          # for libGrid.a + generated Config.h
