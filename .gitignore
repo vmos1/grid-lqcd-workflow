@@ -4,6 +4,10 @@
 build.log
 *.log
 
+# Job output and submit scripts (live outside the repo)
+*.out
+*.sbatch
+
 # Python
 __pycache__/
 *.pyc
