@@ -6,7 +6,7 @@
 #                       (QCDLogDetCloverEOAction and TwoFlavourSchurCloverAction are
 #                       TXQCD-fork additions not yet in mainline Grid)
 #
-# Run after: source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
+# Run after: source /lustre2/nplqcd/vayyar/grid_qcd/grid-lqcd-workflow/config.sh
 
 set -euo pipefail
 

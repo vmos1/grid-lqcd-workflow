@@ -89,6 +89,22 @@ All paths update automatically. Both profiles can coexist.
 
 ---
 
+## Environment
+
+Sourcing `config.sh` loads the full environment for the detected machine — modules,
+compiler, and CUDA/MPI/HDF5 paths (from `machines/<machine>.sh`). The machine is
+auto-detected (`$NERSC_HOST` / `/lustre2/nplqcd` / `uname`), or force it with `MACHINE=<name>`:
+
+```bash
+source config.sh
+```
+
+The cluster build scripts (`1_build_grid/build_grid_*.sh`) and the SLURM submit scripts
+already do this for you. You only need it explicitly when compiling an example by hand
+(`3_examples/*/build.sh`) — source `config.sh` first.
+
+---
+
 ## Step 1 — Build Grid
 
 ### macOS (Homebrew)
