@@ -114,9 +114,10 @@ to relink against the fresh install.
 
 ## Step 2 — Test the build
 
-Tests and benchmarks run from `2_test_grid/` on macOS. On lq, submit via the
-SLURM scripts in `$HOME/projects/grid_qcd/jobs/` (not in this repo —
-cluster-specific paths and account names).
+Tests and benchmarks run from `2_test_grid/` on macOS. On clusters, submit via that
+machine's SLURM scripts (not in this repo — cluster-specific paths and account names):
+on lq they live in `$BASE_DIR/submit_scripts/`, on Perlmutter under the relevant
+`*/perlmutter/` example directory.
 
 ```bash
 # macOS
@@ -124,8 +125,8 @@ cluster-specific paths and account names).
 ./2_test_grid/benchmark_grid.sh
 
 # lq
-sbatch $HOME/projects/grid_qcd/jobs/test-txqcd.sbatch
-sbatch $HOME/projects/grid_qcd/jobs/benchmark-txqcd.sbatch
+sbatch $BASE_DIR/submit_scripts/test-txqcd.sbatch
+sbatch $BASE_DIR/submit_scripts/benchmark-txqcd.sbatch
 ```
 
 **Known failures on lq GPU builds** (not regressions):
@@ -147,8 +148,8 @@ input for direct comparison.
 mkdir -p $BASE_DIR/runs/mobius_eofa/hmc
 cp 3_examples/mobius_dwf_test/inputs/ip_hmc_test.xml \
    $BASE_DIR/runs/mobius_eofa/hmc/input.xml
-sbatch $HOME/projects/grid_qcd/jobs/run-eofa.sbatch
-sbatch $HOME/projects/grid_qcd/jobs/run-rhmc.sbatch
+sbatch $BASE_DIR/submit_scripts/run-eofa.sbatch    # lq; see that machine's run notes
+sbatch $BASE_DIR/submit_scripts/run-rhmc.sbatch
 ```
 
 Each job writes to its run directory:
@@ -204,7 +205,8 @@ Tunes the 4 intermediate masses for Hasenbusch preconditioning of the
 `cl21_48_96_b6p3_m0p2416_m0p2050` 2+1f Wilson-clover ensemble.
 
 Requires the TXQCD build (`install-txqcd-gpu`) for EO clover actions.
-See `hasenbusch.md` in `$HOME/projects/grid_qcd/` for the full tuning guide.
+See [`5_studies/hasenbusch_tune/README.md`](5_studies/hasenbusch_tune/README.md) for the
+full tuning guide (physics, env-var interface, tuning loop).
 
 ```bash
 # lq
@@ -214,7 +216,8 @@ cd 5_studies/hasenbusch_tune && bash lq/build.sh
 cd 5_studies/hasenbusch_tune && bash perlmutter/build_puregrid.sh
 ```
 
-Submit via the machine-specific sbatch scripts in `submit_scripts/hasenbusch_tune/`.
+Submit via that machine's sbatch scripts (on lq: `$BASE_DIR/submit_scripts/`; on
+Perlmutter: `5_studies/hasenbusch_tune/perlmutter/`).
 
 ---
 
