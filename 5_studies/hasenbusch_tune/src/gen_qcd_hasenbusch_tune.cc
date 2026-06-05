@@ -29,6 +29,7 @@
 
 #include "params.h"
 #include <cstring>
+#include <iomanip>
 #include <Grid/Grid.h>
 #include <Grid/parallelIO/IldgIO.h>
 #include <Grid/qcd/action/pseudofermion/QCDLogDetCloverEOAction.h>
@@ -162,6 +163,12 @@ int main(int argc, char **argv) {
     std::cout << GridLogMessage << "No IMPORT_CFG — cold start." << std::endl;
     SU<Nc>::ColdConfiguration(pRNG, Umu);
   }
+
+  // Plaquette of the loaded/initial gauge field — validates that IMPORT_CFG was
+  // read correctly (compare to the ensemble reference, e.g. cfg_2000 ≈ 0.54351).
+  std::cout << GridLogMessage << "Initial plaquette = "
+            << std::setprecision(10)
+            << WilsonLoops<PeriodicGimplR>::avgPlaquette(Umu) << std::endl;
 
   // ── Fermion operator setup ────────────────────────────────────────────────
   typedef WilsonCloverFermion<WilsonImplR, CloverHelpers<WilsonImplR>> WCF;
