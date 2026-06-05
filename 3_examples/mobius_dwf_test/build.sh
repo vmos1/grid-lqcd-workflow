@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile EOFA and RHMC executables against the lq Grid-TXQCD install.
-# Run after: source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
+# Run after: source /lustre2/nplqcd/vayyar/grid_qcd/grid-lqcd-workflow/config.sh
 
 set -euo pipefail
 

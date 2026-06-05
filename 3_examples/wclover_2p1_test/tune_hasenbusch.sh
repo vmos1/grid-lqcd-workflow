@@ -71,7 +71,7 @@ if [[ "${SUBMIT}" == "--submit" ]]; then
 #SBATCH --time=00:30:00
 #SBATCH --output=${LOGFILE}
 
-source ${BASE}/env.sh
+source ${BASE}/grid-lqcd-workflow/config.sh
 ${BIN} --ParameterFile ${RUNXML} --grid 8.8.8.16 --mpi 1.1.1.1
 SBATCH
     echo "==> Sbatch script written: ${JOBSCRIPT}"
@@ -81,7 +81,7 @@ else
         echo "ERROR: binary not found at ${BIN}. Run: bash build.sh"
         exit 1
     fi
-    source "${BASE}/env.sh"
+    source "${BASE}/grid-lqcd-workflow/config.sh"
     echo "==> Running interactively (log: ${LOGFILE})"
     "${BIN}" --ParameterFile "${RUNXML}" \
              --grid 8.8.8.16 --mpi 1.1.1.1 2>&1 | tee "${LOGFILE}"

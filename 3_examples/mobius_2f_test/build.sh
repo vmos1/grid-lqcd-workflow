@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile 2-flavor Möbius DWF comparison codes against the lq Grid install.
-# Run after: source /lustre2/nplqcd/vayyar/grid_qcd/env.sh
+# Run after: source /lustre2/nplqcd/vayyar/grid_qcd/grid-lqcd-workflow/config.sh
 #
 # Both codes represent [det(M_phys)/det(M_PV)]^2 via different algorithms:
 #   dw2f_cg_mobius   -- exact 2-flavor CG (TwoFlavourEvenOddRatioPseudoFermionAction)
@@ -14,7 +14,7 @@ GRID_CONFIG=${GRID_CONFIG:-/lustre2/nplqcd/vayyar/grid_qcd/install-grid-gpu/bin/
 
 if [ ! -x "${GRID_CONFIG}" ]; then
     echo "ERROR: grid-config not found at ${GRID_CONFIG}"
-    echo "Set GRID_CONFIG or source env.sh first."
+    echo "Set GRID_CONFIG or source config.sh first."
     exit 1
 fi
 
