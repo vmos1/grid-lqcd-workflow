@@ -1,4 +1,12 @@
-// gen_qcd_hasenbusch_tune.cc
+// gen_qcd_hasenbusch_tune_compact.cc
+//
+// COMPACT-CLOVER variant of gen_qcd_hasenbusch_tune.cc.  Identical physics,
+// but the light + strange operators are CompactWilsonCloverFermion (lean
+// Diagonal/Triangle clover storage, ~6x smaller host footprint) and the two
+// EO log-det actions use QCDLogDetCompactCloverEOAction, which reconstructs the
+// full even-block on demand via ConvertLayout.  Lets the 48^3x96 tune fit on
+// 2 nodes instead of 8.  See wclover_eo_compact_a_vs_b_comparison.md (A-vs-B
+// writeup) and hasenbusch_tests_perlmutter.md (test log).
 //
 // Standalone Hasenbusch mass tuning for 2+1f Wilson-clover QCD.
 // Intended for the cl21_48_96_b6p3_m0p2416_m0p2050 ensemble (or any ensemble
@@ -32,7 +40,7 @@
 #include <iomanip>
 #include <Grid/Grid.h>
 #include <Grid/parallelIO/IldgIO.h>
-#include <Grid/qcd/action/pseudofermion/QCDLogDetCloverEOAction.h>
+#include <Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOAction.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourRatio.h>
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h>
 #include <Grid/qcd/action/gauge/PlaqPlusRectangleAction.h>
@@ -171,8 +179,10 @@ int main(int argc, char **argv) {
             << WilsonLoops<PeriodicGimplR>::avgPlaquette(Umu) << std::endl;
 
   // ── Fermion operator setup ────────────────────────────────────────────────
-  typedef WilsonCloverFermion<WilsonImplR, CloverHelpers<WilsonImplR>> WCF;
-  typedef WilsonCloverFermion<WilsonImplF, CloverHelpers<WilsonImplF>> WCF_f;
+  // Compact operator must use CompactCloverHelpers — that is what libGrid
+  // explicitly instantiates (CloverHelpers would link-fail).
+  typedef CompactWilsonCloverFermion<WilsonImplR, CompactCloverHelpers<WilsonImplR>> WCF;
+  typedef CompactWilsonCloverFermion<WilsonImplF, CompactCloverHelpers<WilsonImplF>> WCF_f;
 
   // SP gauge field for mixed-precision strange.
   LatticeGaugeFieldF UmuF(&GridF);
@@ -197,12 +207,12 @@ int main(int argc, char **argv) {
   std::vector<std::unique_ptr<WCF>> LightOps;
   for (int i = 0; i < n_ops; ++i)
     LightOps.emplace_back(std::make_unique<WCF>(
-        Umu, Grid_, RBGrid_, ladder[i], csw, csw, anis, impl_p));
+        Umu, Grid_, RBGrid_, ladder[i], csw, csw, /*cF=*/1.0, anis, impl_p));
   std::cout << GridLogMessage << "Built " << n_ops << " DP light operators." << std::endl;
 
   // Strange: DP + SP for mixed-precision multishift RHMC.
-  WCF   StrangeOp (Umu,  Grid_,  RBGrid_,  mass_strange, csw, csw, anis, impl_p);
-  WCF_f StrangeOpF(UmuF, GridF, RBGridF,  mass_strange, csw, csw, anis, impl_pF);
+  WCF   StrangeOp (Umu,  Grid_,  RBGrid_,  mass_strange, csw, csw, /*cF=*/1.0, anis, impl_p);
+  WCF_f StrangeOpF(UmuF, GridF, RBGridF,  mass_strange, csw, csw, /*cF=*/1.0, anis, impl_pF);
 
   // ── Solvers ───────────────────────────────────────────────────────────────
   // CG tolerances are env-overridable for fast Hasenbusch mass tuning — the force
@@ -225,7 +235,7 @@ int main(int argc, char **argv) {
 
   // ── Actions ───────────────────────────────────────────────────────────────
   // Light EO log-det: -2 ln|det(M_ee)| at mass_light.
-  QCDLogDetCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
+  QCDLogDetCompactCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
   LightLogDet.is_smeared = true;
 
   // Hasenbusch ratio levels.
@@ -245,12 +255,14 @@ int main(int argc, char **argv) {
   std::cout << GridLogMessage << "Built " << n_pf << " ratio PF levels." << std::endl;
 
   // Strange EO log-det: -ln|det(M_ee)| at mass_strange.
-  QCDLogDetCloverEOAction<WilsonImplR> StrangeLogDet(StrangeOp, 1);
+  QCDLogDetCompactCloverEOAction<WilsonImplR> StrangeLogDet(StrangeOp, 1);
   StrangeLogDet.is_smeared = true;
 
   // Strange RHMC. Bounds and degree matched to Chroma's rat_3strange monomial.
   OneFlavourRationalParams strange_rat(1e-4, 100.0, cg_max, cg_tol, 20, 64, 100, 1e-6, 1e-4);
-  std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF>>
+  // FermOp template args must be the compact operator types (defaults are the
+  // non-compact WilsonCloverFermion).  The action body is operator-generic.
+  std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
       StrangeBase;
   Action<LatticeGaugeField> *StrangePtr = nullptr;
 #ifdef GRID_HAVE_QUDA
@@ -271,7 +283,7 @@ int main(int argc, char **argv) {
 #endif
   {
     StrangeBase = std::make_unique<
-        OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF>>(
+        OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
         StrangeOp, StrangeOpF, &RBGridF, strange_rat, 50);
     StrangeBase->is_smeared = true;
     StrangePtr = StrangeBase.get();

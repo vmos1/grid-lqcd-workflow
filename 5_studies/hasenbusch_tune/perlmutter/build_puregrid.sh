@@ -21,7 +21,10 @@ set -e
 GRID_TXQCD=${GRID_TXQCD:-$GRID_SRC}      # GRID_SRC set by config.sh
 GRID_CONFIG=${GRID_CONFIG:-$GRID_TXQCD/build/grid-config}
 TXQCD_PROD=${TXQCD_PROD:-$GRID_TXQCD/production}     # for params.h
-GRID_BUILD=${GRID_BUILD:-$GRID_TXQCD/build}          # for libGrid.a + generated Config.h
+# libGrid.a + generated Config.h live next to the grid-config actually in use.
+# Derive from GRID_CONFIG (NOT the inherited GRID_BUILD, which config.sh points
+# at an out-of-tree build-$PROFILE dir that this in-tree builder does not use).
+GRID_BUILD=$(cd "$(dirname "$GRID_CONFIG")" && pwd)
 
 if [ ! -x "$GRID_CONFIG" ]; then
   echo "ERROR: grid-config not found/executable at: $GRID_CONFIG" >&2
@@ -29,8 +32,10 @@ if [ ! -x "$GRID_CONFIG" ]; then
   exit 1
 fi
 
-SRC=$HB/src/gen_qcd_hasenbusch_tune.cc
-BIN=$HB/bin/gen_qcd_hasenbusch_tune
+# Source/binary are overridable so the same script builds the compact-clover
+# variant:  SRC=.../gen_qcd_hasenbusch_tune_compact.cc BIN=.../bin/..._compact bash build_puregrid.sh
+SRC=${SRC:-$HB/src/gen_qcd_hasenbusch_tune.cc}
+BIN=${BIN:-$HB/bin/gen_qcd_hasenbusch_tune}
 
 CXX=$($GRID_CONFIG --cxx)
 CXXFLAGS="$($GRID_CONFIG --cxxflags) -I$TXQCD_PROD -I$GRID_TXQCD -I$GRID_BUILD/Grid"
