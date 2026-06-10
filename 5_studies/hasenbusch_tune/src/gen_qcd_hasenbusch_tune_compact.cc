@@ -13,14 +13,17 @@
 // with env-var overrides).  Built with the TXQCD production Makefile so QUDA
 // is available for the strange RHMC force.
 //
-// Physics: splits det(M_l)^2/det(M_PV)^2 into N ratio levels via HASEN_LADDER.
+// Physics: represents det(M_l)^2 as a Hasenbusch ratio chain (HASEN_LADDER)
+//          capped by a bare-det tail at the heaviest ladder mass, matching the
+//          Chroma cfg_2000 action (no Pauli-Villars).
 // Prints a "FORCES traj=N ..." line per trajectory for easy grep + analysis.
 // No HDF5 output, no checkpoint management — designed for short tuning runs.
 //
 // Key env vars:
 //   HASEN_LADDER   Comma-separated masses light→heavy, e.g.
 //                  "-0.2416,-0.2400,-0.2320,-0.2180,-0.1870"
-//                  Lightest must equal MASS_LIGHT. Top anchors to m_PV=1.0.
+//                  Lightest must equal MASS_LIGHT. Heaviest entry is the
+//                  bare-det tail mass (no Pauli-Villars is appended).
 //   N_TRAJ         Number of trajectories (default 5)
 //   MDSTEPS        MD steps per trajectory (default 20)
 //   IMPORT_CFG     Path to starting gauge config (NERSC or Chroma LIME)
@@ -42,6 +45,7 @@
 #include <Grid/parallelIO/IldgIO.h>
 #include <Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOAction.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourRatio.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavour.h>
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h>
 #include <Grid/qcd/action/gauge/PlaqPlusRectangleAction.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
@@ -81,7 +85,7 @@ class MixedPrecCGWrapper : public OperatorFunction<FieldD> {
 
 // ---------------------------------------------------------------------------
 // ForceNormObserver: prints one grep-able FORCES line per trajectory.
-// Format: FORCES traj=N LogDet=X PF0=X PF1=X ... Strange=X Gauge=X
+// Format: FORCES traj=N PF0=X PF1=X ... Tail=X Strange=X Gauge=X
 // ---------------------------------------------------------------------------
 struct ForceNormObserver : public HmcObservable<LatticeGaugeField> {
   struct Ref { std::string name; Action<LatticeGaugeField> *act; };
@@ -123,7 +127,8 @@ int main(int argc, char **argv) {
 
   // ── Hasenbusch ladder ─────────────────────────────────────────────────────
   // HASEN_LADDER: comma-separated masses, strictly increasing (light→heavy).
-  // Lightest entry must equal MASS_LIGHT.  m_PV=1.0 is appended automatically.
+  // Lightest entry must equal MASS_LIGHT.  Heaviest entry is the bare-det Tail
+  // mass (no Pauli-Villars is appended — see note below).
   // If unset: single-level (no Hasenbusch) — use for baseline timing.
   std::vector<RealD> ladder;
   if (const char *hl = std::getenv("HASEN_LADDER"); hl && *hl) {
@@ -141,10 +146,13 @@ int main(int argc, char **argv) {
     ladder = { mass_light };
     std::cout << GridLogMessage << "HASEN_LADDER not set — single-level baseline." << std::endl;
   }
-  const RealD m_pv = 1.0;
-  ladder.push_back(m_pv);  // append fixed PV top
+  // No Pauli-Villars: the chain is capped by a bare-det tail on the heaviest
+  // ladder mass (ladder.back()), matching the Chroma cfg_2000 action
+  // (TWO_FLAVOR_EOPREC_CONSTDET_FERM_MONOMIAL at -0.1870), so the telescoping
+  // recovers det(M_l)^2 exactly with no leftover PV factor.
 
-  std::cout << GridLogMessage << "Hasenbusch chain (" << (ladder.size()-1) << " levels):";
+  std::cout << GridLogMessage << "Hasenbusch chain (" << (ladder.size()-1)
+            << " ratios + bare-det tail at " << ladder.back() << "):";
   for (auto m : ladder) std::cout << " " << m;
   std::cout << std::endl;
 
@@ -201,7 +209,7 @@ int main(int argc, char **argv) {
   impl_pF.boundary_phases = std::vector<Complex>({1., 1., 1., -1.});
   WilsonAnisotropyCoefficients anis;
 
-  // One DP light operator per ladder mass (includes m_PV at ladder.back()).
+  // One DP light operator per ladder mass (heaviest = bare-det tail mass; no PV).
   // Hasenbusch ratios have small Δm → CG is well-conditioned → DP only needed.
   int n_ops = (int)ladder.size();
   std::vector<std::unique_ptr<WCF>> LightOps;
@@ -234,9 +242,11 @@ int main(int argc, char **argv) {
       CG_strange_md(1e-6, cg_max, 50, &RBGridF, StrangeSchurOpD, StrangeSchurOpF);
 
   // ── Actions ───────────────────────────────────────────────────────────────
-  // Light EO log-det: -2 ln|det(M_ee)| at mass_light.
-  QCDLogDetCompactCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
-  LightLogDet.is_smeared = true;
+  // NOTE: there is deliberately NO light det(M_ee) log-det action.  The
+  // full-lattice ratio chain + bare-det tail below already represent the
+  // COMPLETE det(M_l)^2 (both M_ee and M_oo); an EO log-det here (which is meant
+  // to pair with a Schur action, as the strange sector does) would double-count
+  // det(M_ee).  See the action-bookkeeping note in hasenbusch_tests_perlmutter.md.
 
   // Hasenbusch ratio levels.
   // Level k: det(M(ladder[k])) / det(M(ladder[k+1]))
@@ -253,6 +263,14 @@ int main(int argc, char **argv) {
     RatioPF.back()->is_smeared = true;
   }
   std::cout << GridLogMessage << "Built " << n_pf << " ratio PF levels." << std::endl;
+
+  // Bare-det tail: det(M(ladder.back()))^2 as a single two-flavour pseudofermion,
+  // capping the telescoping ratio chain so the light sector is exactly det(M_l)^2.
+  // Replaces the old hand-inserted Pauli-Villars ratio (matches Chroma's
+  // TWO_FLAVOR_EOPREC_CONSTDET_FERM_MONOMIAL tail at the heaviest mass).
+  TwoFlavourPseudoFermionAction<WilsonImplR> LightTail(
+      *LightOps[n_ops-1], CG_deriv, CG_action);
+  LightTail.is_smeared = true;
 
   // Strange EO log-det: -ln|det(M_ee)| at mass_strange.
   QCDLogDetCompactCloverEOAction<WilsonImplR> StrangeLogDet(StrangeOp, 1);
@@ -307,8 +325,8 @@ int main(int argc, char **argv) {
   ActionLevel<LatticeGaugeField, Reps> L1(1);
   ActionLevel<LatticeGaugeField, Reps> L2(gauge_mult);
 
-  L1.push_back(&LightLogDet);
   for (auto &pf : RatioPF) L1.push_back(pf.get());
+  L1.push_back(&LightTail);
   L1.push_back(&StrangeLogDet);
   L1.push_back(&StrangeSchurPF);
   L2.push_back(&GaugeAction);
@@ -324,9 +342,9 @@ int main(int argc, char **argv) {
 
   // ── Force norm observer ───────────────────────────────────────────────────
   ForceNormObserver ForceObs;
-  ForceObs.refs.push_back({"LogDet", &LightLogDet});
   for (int k = 0; k < n_pf; ++k)
     ForceObs.refs.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
+  ForceObs.refs.push_back({"Tail", &LightTail});
   ForceObs.refs.push_back({"Strange", &StrangeSchurPF});
   ForceObs.refs.push_back({"Gauge",   &GaugeAction});
 
@@ -341,24 +359,35 @@ int main(int argc, char **argv) {
     int nsamp = 1;
     if (const char *ns = std::getenv("FORCES_SAMPLES"); ns && *ns) nsamp = std::atoi(ns);
     const bool skip_strange = std::getenv("FORCES_SKIP_STRANGE") != nullptr;
+    const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
+    auto skip = [&](const std::string &nm) {
+      return (skip_strange && nm == "Strange") || (skip_gauge && nm == "Gauge");
+    };
     LatticeGaugeField force(&Grid_);
     const int nref = (int)ForceObs.refs.size();
     std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0);
     Smear.set_Field(Umu);   // smear the fixed config once (deterministic)
     for (int s = 0; s < nsamp; ++s)
       for (int i = 0; i < nref; ++i) {
-        if (skip_strange && ForceObs.refs[i].name == "Strange") continue;
+        if (skip(ForceObs.refs[i].name)) continue;
         Action<LatticeGaugeField> *act = ForceObs.refs[i].act;
         act->refresh(Smear, sRNG, pRNG);                 // heatbath pseudofermions
         act->deriv(Smear, force);                        // force incl. smearing chain rule
         force = PeriodicGimplR::projectForce(force);     // same projection the integrator uses
-        acc_avg[i] += std::sqrt(norm2(force) / force.Grid()->gSites());
-        acc_max[i] += std::sqrt(maxLocalNorm2(force));
+        double favg = std::sqrt(norm2(force) / force.Grid()->gSites());
+        double fmax = std::sqrt(maxLocalNorm2(force));
+        acc_avg[i] += favg;
+        acc_max[i] += fmax;
+        // Stream each level immediately so a later-level stall can't swallow the
+        // numbers already computed (the end-of-loop summary is otherwise gated
+        // behind every ref, including the FORCES_ONLY gauge eval).
+        std::cout << GridLogMessage << "FORCES_ONLY level " << ForceObs.refs[i].name
+                  << " sample " << s << " avg=" << favg << " max=" << fmax << std::endl;
       }
     auto emit = [&](const char *tag, std::vector<double> &acc) {
       std::cout << GridLogMessage << "FORCES_ONLY samples=" << nsamp << " " << tag << ":";
       for (int i = 0; i < nref; ++i)
-        if (!(skip_strange && ForceObs.refs[i].name == "Strange"))
+        if (!skip(ForceObs.refs[i].name))
           std::cout << " " << ForceObs.refs[i].name << "=" << acc[i] / nsamp;
       std::cout << std::endl;
     };

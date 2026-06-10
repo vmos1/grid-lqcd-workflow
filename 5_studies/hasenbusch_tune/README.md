@@ -9,6 +9,13 @@ The baseline chain is extracted directly from the `cfg_2000` metadata.
 > notes are in the lq runbook (`$BASE_DIR/CLAUDE.md`) and `1_build_grid/PERLMUTTER_BUILD_NOTES.md`.
 > This README is machine-indifferent: physics, the binary's env-var interface, and the tuning loop.
 
+> **Status (2026-06-09/10):** the action was corrected to drop the hand-inserted
+> Pauli-Villars ratio and a double-counted light log-det — see
+> `../../../hasenbusch_action_correction.md`. An automated mass-tuning loop
+> (`5_studies/hasenbusch_tune/autotune/`) now drives the search — see
+> `../../../hasenbusch_autotune.md`. The env-var interface and Chroma-baseline table
+> below reflect the corrected (no-PV) action.
+
 ---
 
 ## Ensemble
@@ -39,7 +46,7 @@ The original run used a 5-level Hasenbusch chain with masses **clustered near m_
 | PF1 | −0.2400 | −0.2320 | 0.0080 |
 | PF2 | −0.2320 | −0.2180 | 0.0140 |
 | PF3 | −0.2180 | −0.1870 | 0.0310 |
-| PF4 | −0.1870 | m_PV (top) | — |
+| Tail | det M(−0.1870)² (bare det, no ratio — caps the chain) | — | — |
 
 Steps widen away from the critical mass — the spectrum is densest near m_l, so fine
 spacing is needed there. These masses are the **tuning starting point and baseline**.
@@ -73,7 +80,7 @@ for the full A-vs-B writeup and `wclover_eo_compact_theory.tex` for the physics.
 
 | Var | Meaning |
 |-----|---------|
-| `HASEN_LADDER` | Comma-separated masses light→heavy, e.g. `-0.2416,-0.2400,-0.2320,-0.2180,-0.1870`. Lightest **must** equal `MASS_LIGHT`; m_PV = 1.0 is appended automatically. Unset → single-level baseline (for timing comparison). |
+| `HASEN_LADDER` | Comma-separated masses light→heavy, e.g. `-0.2416,-0.2400,-0.2320,-0.2180,-0.1870`. Lightest **must** equal `MASS_LIGHT`; heaviest is the bare-det **Tail** mass (no Pauli-Villars appended — the ratio chain + Tail exactly reproduce det(M_l)²). Unset → single-level baseline (for timing comparison). |
 | `MASS_LIGHT` / `MASS_STRANGE` | Quark masses (defaults −0.2416 / −0.2050 for this ensemble). |
 | `CSW`, `BETA`, `U0` | Clover coeff, gauge coupling, mean-field u0 (use `U0=1.0` for LW tree-level). |
 | `STOUT_NSMEAR` | Stout smearing levels (default 1). **Set `0` for cold-start smoke tests** — see "Cold-start" below. |
@@ -159,19 +166,23 @@ heatbaths each pseudofermion and evaluates a single `deriv()` per level on the i
 config, printing:
 
 ```
-FORCES_ONLY samples=N avg: LogDet=.. PF0=.. PF1=.. .. PF4=.. Strange=.. Gauge=..
+FORCES_ONLY samples=N avg: PF0=.. PF1=.. PF2=.. PF3=.. Tail=.. Strange=.. Gauge=..
 FORCES_ONLY samples=N max: ...
 ```
+
+(There is deliberately no `LogDet` field for the light sector — the ratio chain + Tail
+already represent the full det(M_l)²; see the action-correction doc linked above. The
+strange sector's EO log-det is part of the action set but not part of this force list.)
 
 Read the `avg:` line → adjust `HASEN_LADDER` → repeat (each iteration is minutes, not hours).
 Combine with `FORCES_SKIP_STRANGE=1` and loose `TUNE_CG_TOL_ACTION/DERIV` (e.g. `1e-4`) to
 cut the dominant light-quark solve time. The forces are identical between the compact and
 non-compact binaries, so tune on whichever fits the machine.
 
-The deterministic levels (`LogDet`, `Gauge`) printed by `FORCES_ONLY` have been validated
-to reproduce the integrator's first-MD-step force on a thermalized config bit-for-bit;
-the pseudofermion levels are stochastic (depend on the heatbath draw), so average over a
-few `FORCES_SAMPLES` if you need a tighter estimate.
+The pseudofermion levels (`PF*`, `Tail`, `Strange`) are stochastic (depend on the heatbath
+draw), so average over a few `FORCES_SAMPLES` if you need a tighter estimate. `Gauge` is
+deterministic but currently **hangs in `FORCES_ONLY`** (known issue, integrator-safe) —
+set `FORCES_SKIP_GAUGE=1` to skip it; its value (~6.88) is known from the integrator path.
 
 ---
 
