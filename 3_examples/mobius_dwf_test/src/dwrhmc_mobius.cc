@@ -7,7 +7,7 @@
 //   RHMC: OneFlavourEvenOddRatioRationalPseudoFermionAction (MobiusFermionD)
 //         rational approx of [det(M_phys)/det(M_PV)]^{1/2}
 //
-// Based on dweofa_mobius_HSDM_v3.cc (Sungwoo / Peter Boyle / Guido Cossu)
+// Based on dweofa_mobius_HSDM.cc (Sungwoo / Peter Boyle / Guido Cossu)
 
 /*************************************************************************************
 Grid physics library, www.github.com/paboyle/Grid
