@@ -6,7 +6,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../../config.sh"
 
-BIN="$SCRIPT_DIR/bin/dweofa_mobius_HSDM"
+BIN="$SCRIPT_DIR/bin/dweofa_mobius_1flavor"
 XML="$SCRIPT_DIR/inputs/ip_hmc_mobius_test.xml"
 
 if [ ! -f "$BIN" ]; then
