@@ -31,6 +31,7 @@
 // Run:     see ~/projects/grid_qcd/jobs/tune-hasenbusch.sbatch
 
 #include "params.h"
+#include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <Grid/Grid.h>
@@ -219,8 +220,13 @@ int main(int argc, char **argv) {
   // TUNE_CG_TOL_DERIV=1e-4 cuts the dominant light-quark solves substantially.
   const RealD cg_tol_act = TXQCDProduction::detail::env_real("TUNE_CG_TOL_ACTION", cg_tol);
   const RealD cg_tol_drv = TXQCDProduction::detail::env_real("TUNE_CG_TOL_DERIV", 1e-6);
+  // TUNE_CG_TOL_STRANGE loosens the strange RHMC's multishift CG (otherwise
+  // pinned to the production cg_tol regardless of TUNE_CG_TOL_*) — only
+  // matters when the strange sector is actually evaluated (full HMC, or
+  // FORCES_ONLY without FORCES_SKIP_STRANGE).
+  const RealD cg_tol_strange = TXQCDProduction::detail::env_real("TUNE_CG_TOL_STRANGE", cg_tol);
   std::cout << GridLogMessage << "CG tol: action/heatbath=" << cg_tol_act
-            << " deriv=" << cg_tol_drv << std::endl;
+            << " deriv=" << cg_tol_drv << " strange=" << cg_tol_strange << std::endl;
   ConjugateGradient<LatticeFermion> CG_action(cg_tol_act, cg_max);  // ratio S() + heatbath
   ConjugateGradient<LatticeFermion> CG_deriv(cg_tol_drv,  cg_max);  // ratio deriv()
 
@@ -267,7 +273,7 @@ int main(int argc, char **argv) {
   StrangeLogDet.is_smeared = true;
 
   // Strange RHMC. Bounds and degree matched to Chroma's rat_3strange monomial.
-  OneFlavourRationalParams strange_rat(1e-4, 100.0, cg_max, cg_tol, 20, 64, 100, 1e-6, 1e-4);
+  OneFlavourRationalParams strange_rat(1e-4, 100.0, cg_max, cg_tol_strange, 20, 64, 100, 1e-6, 1e-4);
   std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF>>
       StrangeBase;
   Action<LatticeGaugeField> *StrangePtr = nullptr;
@@ -277,7 +283,7 @@ int main(int argc, char **argv) {
   if (std::getenv("QUDA_FORCE") != nullptr) {
     QudaCloverParams qp;
     qp.mass = mass_strange; qp.csw = csw; qp.anti_periodic_t = true;
-    qp.tol = cg_tol; qp.max_iter = cg_max;
+    qp.tol = cg_tol_strange; qp.max_iter = cg_max;
     qp.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
     StrangeQuda = std::make_unique<
         OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF>>(
@@ -353,24 +359,29 @@ int main(int argc, char **argv) {
     };
     LatticeGaugeField force(&Grid_);
     const int nref = (int)ForceObs.refs.size();
-    std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0);
+    std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0), acc_time(nref, 0.0);
     Smear.set_Field(Umu);   // smear the fixed config once (deterministic)
     for (int s = 0; s < nsamp; ++s)
       for (int i = 0; i < nref; ++i) {
         if (skip(ForceObs.refs[i].name)) continue;
         Action<LatticeGaugeField> *act = ForceObs.refs[i].act;
         act->refresh(Smear, sRNG, pRNG);                 // heatbath pseudofermions
+        auto t0 = std::chrono::steady_clock::now();
         act->deriv(Smear, force);                        // force incl. smearing chain rule
+        auto t1 = std::chrono::steady_clock::now();
+        double ftime = std::chrono::duration<double>(t1 - t0).count();
         force = PeriodicGimplR::projectForce(force);     // same projection the integrator uses
         double favg = std::sqrt(norm2(force) / force.Grid()->gSites());
         double fmax = std::sqrt(maxLocalNorm2(force));
         acc_avg[i] += favg;
         acc_max[i] += fmax;
+        acc_time[i] += ftime;
         // Stream each level immediately so a later-level stall can't swallow the
         // numbers already computed (the end-of-loop summary is otherwise gated
         // behind every ref, including the FORCES_ONLY gauge eval).
         std::cout << GridLogMessage << "FORCES_ONLY level " << ForceObs.refs[i].name
-                  << " sample " << s << " avg=" << favg << " max=" << fmax << std::endl;
+                  << " sample " << s << " avg=" << favg << " max=" << fmax
+                  << " time=" << ftime << std::endl;
       }
     auto emit = [&](const char *tag, std::vector<double> &acc) {
       std::cout << GridLogMessage << "FORCES_ONLY samples=" << nsamp << " " << tag << ":";
@@ -381,6 +392,7 @@ int main(int argc, char **argv) {
     };
     emit("avg", acc_avg);
     emit("max", acc_max);
+    emit("time", acc_time);
     Grid_finalize();
     return 0;
   }
