@@ -1,7 +1,3 @@
-// v3: 033024 sungwoo
-//     made compatible with Grid version 03/26/24 (da59379)
-// 041224 sungwoo: time anti-periodic BC
-
 /*************************************************************************************
 
 Grid physics library, www.github.com/paboyle/Grid
