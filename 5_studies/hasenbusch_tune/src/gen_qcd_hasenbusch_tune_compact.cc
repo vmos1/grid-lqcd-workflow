@@ -320,26 +320,52 @@ int main(int argc, char **argv) {
   PlaqPlusRectangleAction<PeriodicGimplR> GaugeAction(beta, -beta / (20.0 * u0_ens * u0_ens));
   GaugeAction.is_smeared = false;
 
-  // ── Integrator: flat 2-level (fermion L1 + gauge L2) ─────────────────────
-  // Flat structure is intentional for tuning: all PF levels at the same MD
-  // rate gives a clean per-level force comparison.
+  // ── Integrator: 3-level strange / light / gauge, env-configurable ────────
+  // Tuned-ladder force table (RMS / max), mass-independent except PF*/Tail:
+  //   Gauge   6.88 / 10.4  (stiff, cheap)         -> finest, sub-stepped
+  //   Tail    0.835 / 2.5  PF0-3 0.2-0.43         -> light fermion band
+  //   Strange 0.62 / 2.2   (soft, but 373s solve) -> 2.4x the light solve cost
+  //
+  // One general 3-level structure (coarsest=strange, then light, finest=gauge)
+  // with two integer knobs:
+  //   LIGHT_INNER_MULT (=1): light sub-steps per strange step.
+  //       =1 -> strange co-stepped with light (forces are ~equal, so this is
+  //             the force-balanced choice; same step counts/cost as a flat
+  //             2-level fermion/gauge integrator).
+  //       =2 -> strange evaluated half as often: its force allows ~its own
+  //             rate, and its 373s solve is 2.4x the light's, so coarsening it
+  //             can be a net win despite a small acceptance hit.  Decide by
+  //             measured time/traj / acceptance, not by the proxy.
+  //   GAUGE_INNER_MULT (=4): gauge sub-steps per light step.  Only gauge is
+  //       well separated in force (sqrt(6.88/0.835) ~ 3).  =1 collapses gauge
+  //       to the light rate (toward single-timescale) for an A/B baseline.
+  //
+  // Correctness: each action term is in exactly one level; the Metropolis test
+  // keeps the sampled distribution exact for any multipliers -- only the
+  // acceptance/efficiency changes.
   int gauge_mult = 4;
   if (const char *gm = std::getenv("GAUGE_INNER_MULT"); gm && *gm) gauge_mult = std::atoi(gm);
-  std::cout << GridLogMessage << "GAUGE_INNER_MULT=" << gauge_mult << std::endl;
+  int light_mult = 1;
+  if (const char *lm = std::getenv("LIGHT_INNER_MULT"); lm && *lm) light_mult = std::atoi(lm);
+  std::cout << GridLogMessage
+            << "Integrator: 3-level strange/light/gauge  LIGHT_INNER_MULT="
+            << light_mult << " GAUGE_INNER_MULT=" << gauge_mult << std::endl;
 
   typedef Representations<EmptyRep<LatticeGaugeField>> Reps;
-  ActionLevel<LatticeGaugeField, Reps> L1(1);
-  ActionLevel<LatticeGaugeField, Reps> L2(gauge_mult);
+  ActionLevel<LatticeGaugeField, Reps> Lstrange(1);          // coarsest
+  ActionLevel<LatticeGaugeField, Reps> Llight(light_mult);
+  ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);   // finest
 
-  for (auto &pf : RatioPF) L1.push_back(pf.get());
-  L1.push_back(&LightTail);
-  L1.push_back(&StrangeLogDet);
-  L1.push_back(&StrangeSchurPF);
-  L2.push_back(&GaugeAction);
+  Lstrange.push_back(&StrangeSchurPF);
+  Lstrange.push_back(&StrangeLogDet);
+  for (auto &pf : RatioPF) Llight.push_back(pf.get());
+  Llight.push_back(&LightTail);
+  Lgauge.push_back(&GaugeAction);
 
   ActionSet<LatticeGaugeField, Reps> Aset;
-  Aset.push_back(L1);
-  Aset.push_back(L2);
+  Aset.push_back(Lstrange);   // coarsest pushed first
+  Aset.push_back(Llight);
+  Aset.push_back(Lgauge);
 
   // ── Stout smearing ────────────────────────────────────────────────────────
   Smear_Stout<PeriodicGimplR> Stout(stout_rho_inv);
