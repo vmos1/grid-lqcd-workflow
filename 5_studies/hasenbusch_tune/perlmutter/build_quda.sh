@@ -40,8 +40,10 @@ QUDA_LIBDIR=${QUDA_LIBDIR:-lib}                               # some installs us
 # ─────────────────────────────────────────────────────────────────────────────
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=${HERE}/../src/gen_qcd_hasenbusch_tune.cc
-BIN=${HERE}/../bin/gen_qcd_hasenbusch_tune
+# SRC/BIN overridable: e.g. build the compact (Approach B) binary with QUDA via
+#   SRC=.../src/gen_qcd_hasenbusch_tune_compact.cc BIN=.../bin/gen_qcd_hasenbusch_tune_compact_quda
+SRC=${SRC:-${HERE}/../src/gen_qcd_hasenbusch_tune.cc}
+BIN=${BIN:-${HERE}/../bin/gen_qcd_hasenbusch_tune}
 mkdir -p "$(dirname "$BIN")"
 
 if [ ! -x "$GRID_CONFIG" ]; then
@@ -55,9 +57,14 @@ if [ ! -d "${QUDA_PREFIX}/include" ]; then
   exit 1
 fi
 
+# In-tree Grid-TXQCD build (no `make install`): grid-config omits the Grid
+# source/build include paths and the libGrid.a -L path, so add them here
+# (mirrors build_puregrid.sh / production/Makefile). GRID_BUILD = dir of grid-config.
+GRID_BUILD=$(cd "$(dirname "$GRID_CONFIG")" && pwd)
+
 CXX=$($GRID_CONFIG --cxx)
-CXXFLAGS="$($GRID_CONFIG --cxxflags) -I${TXQCD_PROD}"
-LDFLAGS=$($GRID_CONFIG --ldflags)
+CXXFLAGS="$($GRID_CONFIG --cxxflags) -I${TXQCD_PROD} -I${GRID_TXQCD} -I${GRID_BUILD}/Grid"
+LDFLAGS="$($GRID_CONFIG --ldflags) -L${GRID_BUILD}/Grid"
 LIBS=$($GRID_CONFIG --libs)
 
 # ── QUDA link (mirrors Grid-TXQCD/production/Makefile) ───────────────────────
