@@ -290,15 +290,24 @@ int main(int argc, char **argv) {
       StrangeBase;
   Action<LatticeGaugeField> *StrangePtr = nullptr;
 #ifdef GRID_HAVE_QUDA
-  std::unique_ptr<OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF>>
+  // FermOp template args must be the compact operator types (WCF/WCF_f), same as
+  // the non-QUDA branch below; the action's defaults are the non-compact
+  // WilsonCloverFermion, which won't bind the compact StrangeOp/StrangeOpF.
+  std::unique_ptr<OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
       StrangeQuda;
   if (std::getenv("QUDA_FORCE") != nullptr) {
     QudaCloverParams qp;
     qp.mass = mass_strange; qp.csw = csw; qp.anti_periodic_t = true;
     qp.tol = cg_tol_strange; qp.max_iter = cg_max;
     qp.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    // QudaCloverParams defaults cuda_prec_sloppy=SINGLE; the QUDA multishift force
+    // solve diverges on the small rational shifts at 48^3x96 near-critical
+    // conditioning ("too many true residual norm increases"). QUDA_FORCE_SLOPPY_DP=1
+    // runs the multishift fully double-precision (robust, but no mixed-prec speedup).
+    if (std::getenv("QUDA_FORCE_SLOPPY_DP") != nullptr)
+      qp.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
     StrangeQuda = std::make_unique<
-        OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF>>(
+        OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
         StrangeOp, StrangeOpF, &RBGridF, strange_rat, qp, 50);
     StrangeQuda->is_smeared = true;
     StrangePtr = StrangeQuda.get();
