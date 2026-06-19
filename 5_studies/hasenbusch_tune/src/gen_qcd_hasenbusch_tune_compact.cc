@@ -126,6 +126,25 @@ int main(int argc, char **argv) {
   std::cout << GridLogMessage << "N_TRAJ=" << n_traj
             << "  MDSTEPS=" << mdsteps << std::endl;
 
+  // ── TRAJL is MANDATORY for HMC (no compiled-in default) ─────────────────────
+  // A silent trajL default lets this driver disagree with another driver's
+  // trajectory length (the 2+1 driver defaults to sqrt(2); this one used to
+  // default to 1.0), making HMC timings non-comparable.  Require TRAJL explicitly
+  // and fail fast HERE — before the (5.7 GB at 48^3) config load.  Forces-only
+  // runs don't use the integrator, so they are exempt.
+  if (std::getenv("FORCES_ONLY") == nullptr) {
+    const char *tl = std::getenv("TRAJL");
+    if (!tl || !*tl) {
+      std::cout << GridLogMessage
+                << "FATAL: TRAJL is not set.  This driver has no default trajectory "
+                   "length for HMC — set it explicitly, e.g. "
+                   "TRAJL=0.35355339059327379 (sqrt(2)/4, the benchmark value)."
+                << std::endl;
+      Grid_finalize();
+      return 1;
+    }
+  }
+
   // ── Hasenbusch ladder ─────────────────────────────────────────────────────
   // HASEN_LADDER: comma-separated masses, strictly increasing (light→heavy).
   // Lightest entry must equal MASS_LIGHT.  Heaviest entry is the bare-det Tail
@@ -283,7 +302,15 @@ int main(int argc, char **argv) {
   StrangeLogDet.is_smeared = true;
 
   // Strange RHMC. Bounds and degree matched to Chroma's rat_3strange monomial.
-  OneFlavourRationalParams strange_rat(1e-4, 100.0, cg_max, cg_tol_strange, 20, 64, 100, 1e-6, 1e-4);
+  // Env-overridable for spectra where lo=1e-4 sits below lambda_min (phantom poles
+  // that QUDA's multishift cannot invert); e.g. 48^3 b6.3 needs RAT_LO~0.4 RAT_HI~35.
+  const RealD rat_lo = TXQCDProduction::detail::env_real("RAT_LO", 1e-4);
+  const RealD rat_hi = TXQCDProduction::detail::env_real("RAT_HI", 100.0);
+  int rat_degree = 20;
+  if (const char *rd = std::getenv("RAT_DEGREE"); rd && *rd) rat_degree = std::atoi(rd);
+  std::cout << GridLogMessage << "Strange rational: lo=" << rat_lo << " hi=" << rat_hi
+            << " degree=" << rat_degree << std::endl;
+  OneFlavourRationalParams strange_rat(rat_lo, rat_hi, cg_max, cg_tol_strange, rat_degree, 64, 100, 1e-6, 1e-4);
   // FermOp template args must be the compact operator types (defaults are the
   // non-compact WilsonCloverFermion).  The action body is operator-generic.
   std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
@@ -464,7 +491,10 @@ int main(int argc, char **argv) {
 
   // ── HMC ──────────────────────────────────────────────────────────────────
   IntegratorParameters MD;
-  MD.name = "MinimumNorm2"; MD.MDsteps = mdsteps; MD.trajL = 1.0;
+  MD.name = "MinimumNorm2"; MD.MDsteps = mdsteps;
+  // TRAJL has no default and is validated at startup (see the mandatory check
+  // above), so it is guaranteed present here.
+  MD.trajL = std::atof(std::getenv("TRAJL"));
 
   HMCparameters HMCp;
   HMCp.StartTrajectory    = 0;
