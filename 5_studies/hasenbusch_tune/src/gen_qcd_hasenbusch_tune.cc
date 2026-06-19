@@ -400,6 +400,7 @@ int main(int argc, char **argv) {
   // ── HMC ──────────────────────────────────────────────────────────────────
   IntegratorParameters MD;
   MD.name = "MinimumNorm2"; MD.MDsteps = mdsteps; MD.trajL = 1.0;
+  if (const char *tl = std::getenv("TRAJL"); tl && *tl) MD.trajL = std::atof(tl);
 
   HMCparameters HMCp;
   HMCp.StartTrajectory    = 0;
