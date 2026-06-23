@@ -585,6 +585,7 @@ int main(int argc, char **argv) {
     if (const char *ns = std::getenv("FORCES_SAMPLES"); ns && *ns) nsamp = std::atoi(ns);
     const bool skip_strange = std::getenv("FORCES_SKIP_STRANGE") != nullptr;
     const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
+    const bool skip_light   = std::getenv("FORCES_SKIP_LIGHT")   != nullptr;  // LogDet + Schur PF
     struct Ref { std::string name; Action<LatticeGaugeField> *act; };
     std::vector<Ref> refs = {
         {"LightLogDet",    &LightLogDet},
@@ -595,7 +596,8 @@ int main(int argc, char **argv) {
     };
     auto skip = [&](const std::string &nm) {
       return (skip_strange && (nm == "StrangeSchurPF" || nm == "StrangeLogDet")) ||
-             (skip_gauge && nm == "Gauge");
+             (skip_gauge && nm == "Gauge") ||
+             (skip_light && (nm == "LightLogDet" || nm == "LightSchurPF"));
     };
     LatticeGaugeField force(&Grid);
     const int nref = (int)refs.size();
