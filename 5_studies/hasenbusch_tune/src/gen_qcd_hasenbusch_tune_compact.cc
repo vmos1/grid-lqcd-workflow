@@ -327,12 +327,28 @@ int main(int argc, char **argv) {
     qp.mass = mass_strange; qp.csw = csw; qp.anti_periodic_t = true;
     qp.tol = cg_tol_strange; qp.max_iter = cg_max;
     qp.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
-    // QudaCloverParams defaults cuda_prec_sloppy=SINGLE; the QUDA multishift force
-    // solve diverges on the small rational shifts at 48^3x96 near-critical
-    // conditioning ("too many true residual norm increases"). QUDA_FORCE_SLOPPY_DP=1
-    // runs the multishift fully double-precision (robust, but no mixed-prec speedup).
+    // QUDA_FORCE_SLOPPY_DP=1 → run the strange multishift force solve fully DOUBLE
+    // (default cuda_prec_sloppy=SINGLE).  IMPORTANT: this does NOT fix the 48^3 b6.3
+    // wrong-force bug.  Test 4 (job 54678995) ran with this flag ON and the QUDA
+    // multishift still diverged ("too many true residual norm increases" → wrong
+    // force ‖F‖avg 18 / max 1857) even in full double.  So the 48^3 QUDA-strange
+    // failure is precision-INDEPENDENT (pure-Grid converges with the SAME shifts);
+    // the cause is in the QUDA operator/shift setup (kappa-form normalization of the
+    // Remez shifts / matpc), not sloppy precision.  See
+    // docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
     if (std::getenv("QUDA_FORCE_SLOPPY_DP") != nullptr)
       qp.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
+    // QUDA_FORCE_RECON_NO=1 → reconstruct_sloppy = NO (full links).  REQUIRED at
+    // 48^3: the antiperiodic-t phase is baked in by negating the last-timeslice
+    // time links (det=-1, not SU(3)); RECONSTRUCT_12 (the default) mis-rebuilds
+    // the 3rd row of those links (it assumes det=+1), corrupting the sloppy
+    // operator at the boundary and stalling the near-critical multishift base
+    // shift.  recon=NO stores the full link → fixes it.  Verified 2026-06-22 in
+    // the isolated solver test: recon=NO → 7/7 shifts, 34 iters (= Grid's count),
+    // with SINGLE sloppy (keeps the mixed-precision speedup); recon_12 → 2/7,
+    // diverged.  16^3 tolerates recon_12 (well-conditioned), 48^3 does not.
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp.recon_sloppy = QUDA_RECONSTRUCT_NO;
     StrangeQuda = std::make_unique<
         OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
         StrangeOp, StrangeOpF, &RBGridF, strange_rat, qp, 50);
@@ -429,9 +445,11 @@ int main(int argc, char **argv) {
     if (const char *ns = std::getenv("FORCES_SAMPLES"); ns && *ns) nsamp = std::atoi(ns);
     const bool skip_strange = std::getenv("FORCES_SKIP_STRANGE") != nullptr;
     const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
+    const bool skip_light   = std::getenv("FORCES_SKIP_LIGHT")   != nullptr;  // Tail + PF{k} ladder
     auto skip = [&](const std::string &nm) {
       return (skip_strange && (nm == "Strange" || nm == "StrangeLogDet")) ||
-             (skip_gauge && nm == "Gauge");
+             (skip_gauge && nm == "Gauge") ||
+             (skip_light && (nm == "Tail" || nm.rfind("PF", 0) == 0));
     };
     LatticeGaugeField force(&Grid_);
     const int nref = (int)ForceObs.refs.size();
@@ -510,6 +528,49 @@ int main(int argc, char **argv) {
   typedef MinimumNorm2<PeriodicGimplR,
                        SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
   IntT MDyn(&Grid_, MD, Aset, Smear);
+
+  // ── REVERSIBILITY_CHECK=1: forward+backward MD, report |U_back-U_0| ──────────
+  // Driver-only, env-gated diagnostic (default OFF → byte-identical HMC path).
+  // Tests that the MD force (notably the QUDA strange force) is a *deterministic,
+  // reversible* function of U — the property HMC exactness requires of the force
+  // independent of its magnitude (see
+  // docs/2026_6_22_quda_grid_normalization_mismatch.md, caveat 3).  A reversible,
+  // deterministic force returns U to U_0 at ~solver tolerance even if it is the
+  // gradient of a slightly different operator (the ~4% case); a nondeterministic
+  // solver force does not.  REV_THERM>0 first roughens U with that many plain
+  // (refresh+integrate) sweeps so the check runs on a representative, non-cold
+  // config.  Mirrors Grid HMC's per-trajectory sequence (refresh→Sinitial→
+  // integrate) plus the reverse leg (reverse_momenta→integrate).
+  if (std::getenv("REVERSIBILITY_CHECK") != nullptr) {
+    int rev_therm = 0;
+    if (const char *rt = std::getenv("REV_THERM"); rt && *rt) rev_therm = std::atoi(rt);
+    for (int i = 0; i < rev_therm; ++i) {
+      MDyn.refresh(Umu, sRNG, pRNG);
+      MDyn.integrate(Umu);
+      std::cout << GridLogMessage << "[REVERSIBILITY] thermalize sweep "
+                << (i + 1) << "/" << rev_therm << std::endl;
+    }
+    LatticeGaugeField U0(&Grid_); U0 = Umu;
+    MDyn.refresh(Umu, sRNG, pRNG);          // heatbath P + pseudofermions φ (φ held fixed)
+    RealD H0 = MDyn.Sinitial(Umu);
+    MDyn.integrate(Umu);                     // forward:  (U0, P)  → (U1, P1)
+    RealD H1 = MDyn.S(Umu);
+    MDyn.reverse_momenta();                  // P1 → −P1
+    MDyn.integrate(Umu);                     // backward: (U1,−P1) → (U2, …) ≈ (U0, …)
+    RealD H2 = MDyn.S(Umu);
+    LatticeGaugeField dU(&Grid_); dU = Umu - U0;
+    RealD relU = std::sqrt(norm2(dU) / norm2(U0));
+    std::streamsize prec = std::cout.precision(); std::cout.precision(6);
+    std::cout << GridLogMessage << "[REVERSIBILITY] relU=|U_back-U_0|/|U_0|="
+              << std::scientific << relU
+              << "  dH_fwd=" << (H1 - H0)
+              << "  |H_back-H_0|=" << std::fabs(H2 - H0)
+              << "  (H0=" << H0 << " H1=" << H1 << " H2=" << H2 << ")" << std::endl;
+    std::cout.precision(prec);
+    Grid_finalize();
+    return 0;
+  }
+
   HybridMonteCarlo<IntT> HMC(HMCp, MDyn, sRNG, pRNG, Obs, Umu);
   HMC.evolve();
 
