@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build gen_qcd_hasenbusch_tune on Perlmutter — PURE-GRID (no QUDA).
+# Build the hasenbusch_tune driver on Perlmutter — PURE-GRID (no QUDA).
 #
 # Compiles against an IN-TREE Grid-TXQCD build (build/Grid/libGrid.a; no `make install`).
 # grid-config alone is NOT sufficient in-tree: it omits the Grid source/build include
@@ -32,10 +32,10 @@ if [ ! -x "$GRID_CONFIG" ]; then
   exit 1
 fi
 
-# Source/binary are overridable so the same script builds the compact-clover
-# variant:  SRC=.../gen_qcd_hasenbusch_tune_compact.cc BIN=.../bin/..._compact bash build_puregrid.sh
-SRC=${SRC:-$HB/src/gen_qcd_hasenbusch_tune.cc}
-BIN=${BIN:-$HB/bin/gen_qcd_hasenbusch_tune}
+# Default builds the compact-clover driver.  SRC/BIN are overridable to build other
+# variants, e.g. SRC=$HB/src/gen_qcd_hasenbusch_tune_compact_schur.cc BIN=$HB/bin/..._compact_schur
+SRC=${SRC:-$HB/src/gen_qcd_hasenbusch_tune_compact.cc}
+BIN=${BIN:-$HB/bin/gen_qcd_hasenbusch_tune_compact}
 
 CXX=$($GRID_CONFIG --cxx)
 CXXFLAGS="$($GRID_CONFIG --cxxflags) -I$TXQCD_PROD -I$GRID_TXQCD -I$GRID_BUILD/Grid"

@@ -45,7 +45,7 @@ grid_qcd/                              ← top-level working directory
 │   ├── 4_analysis/                    ← HMC observable analysis toolkit
 │   ├── 5_studies/                     ← ongoing physics studies (pre-production tuning)
 │   │   └── hasenbusch_tune/           ← Hasenbusch mass tuning for cl21_48_96_b6p3
-│   │       ├── src/                   ← gen_qcd_hasenbusch_tune.cc
+│   │       ├── src/                   ← gen_qcd_hasenbusch_tune_compact{,_schur}.cc
 │   │       ├── bin/                   ← compiled binary (git-ignored)
 │   │       ├── lq/
 │   │       │   └── build.sh           ← compile on lq
