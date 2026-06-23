@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build gen_qcd_hasenbusch_tune on Perlmutter — WITH QUDA, against YOUR OWN
+# Build the hasenbusch_tune driver on Perlmutter — WITH QUDA, against YOUR OWN
 # Grid-TXQCD build, linking a REUSED (prebuilt) QUDA install.
 #
 # Architecture (identical to Grid-TXQCD/production/Makefile):
@@ -40,10 +40,10 @@ QUDA_LIBDIR=${QUDA_LIBDIR:-lib}                               # some installs us
 # ─────────────────────────────────────────────────────────────────────────────
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-# SRC/BIN overridable: e.g. build the compact (Approach B) binary with QUDA via
-#   SRC=.../src/gen_qcd_hasenbusch_tune_compact.cc BIN=.../bin/gen_qcd_hasenbusch_tune_compact_quda
-SRC=${SRC:-${HERE}/../src/gen_qcd_hasenbusch_tune.cc}
-BIN=${BIN:-${HERE}/../bin/gen_qcd_hasenbusch_tune}
+# Default builds the compact-clover driver with QUDA.  SRC/BIN overridable for other
+# variants, e.g. SRC=.../src/gen_qcd_hasenbusch_tune_compact_schur.cc BIN=.../bin/..._compact_schur_quda
+SRC=${SRC:-${HERE}/../src/gen_qcd_hasenbusch_tune_compact.cc}
+BIN=${BIN:-${HERE}/../bin/gen_qcd_hasenbusch_tune_compact}
 mkdir -p "$(dirname "$BIN")"
 
 if [ ! -x "$GRID_CONFIG" ]; then
