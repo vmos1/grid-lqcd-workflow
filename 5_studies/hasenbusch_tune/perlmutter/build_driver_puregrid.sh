@@ -8,7 +8,7 @@
 # #ifdef GRID_HAVE_QUDA guards drop the QUDA strange-force path.
 #
 # Prereq: Grid-TXQCD built WITH LIME (see ../../1_build_grid/PERLMUTTER_BUILD_NOTES.md).
-# Usage:  bash build_puregrid.sh        (sources workflow config.sh → machines/perlmutter.sh)
+# Usage:  bash build_driver_puregrid.sh (sources workflow config.sh → machines/perlmutter.sh)
 
 # Resolve paths relative to THIS script (works from anywhere).
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)

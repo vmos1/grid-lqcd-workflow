@@ -5,7 +5,7 @@ demonstrating a wall-time speedup over the Chroma baseline that generated this e
 The baseline chain is extracted directly from the `cfg_2000` metadata.
 
 > **Machine-specific details** (how to build/submit on each cluster) live outside this
-> file: build via `lq/build.sh` or `perlmutter/build_puregrid.sh` (below); operational
+> file: build via `lq/build.sh` or `perlmutter/build_driver_puregrid.sh` (below); operational
 > notes are in the lq runbook (`$BASE_DIR/CLAUDE.md`) and `1_build_grid/PERLMUTTER_BUILD_NOTES.md`.
 > This README is machine-indifferent: physics, the binary's env-var interface, and the tuning loop.
 
@@ -132,12 +132,12 @@ preconditioning. Full-lattice ratio is fine; an EO Schur ratio action is a Phase
 # lq:
 bash lq/build.sh
 # Perlmutter (pure-Grid, no QUDA):
-bash perlmutter/build_puregrid.sh
+bash perlmutter/build_driver_puregrid.sh
 ```
 
 Both compile out-of-tree against the corresponding Grid-TXQCD build's `grid-config`
 (plus the in-tree `-I/-L` flags those scripts add). Requires `install-txqcd-gpu` (EO
-clover, mixed-precision CG). QUDA strange force is Phase 2 — see `perlmutter/build_quda.sh`.
+clover, mixed-precision CG). QUDA strange force is Phase 2 — see `perlmutter/build_driver_quda.sh`.
 
 The build scripts produce both `gen_qcd_hasenbusch_tune` and `gen_qcd_hasenbusch_tune_compact`
 (override `SRC`/`BIN` to build just one). The compact binary additionally requires the

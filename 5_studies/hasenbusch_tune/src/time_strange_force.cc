@@ -39,7 +39,7 @@
 // Build (Perlmutter, pure-Grid, COMPACT default):
 //   cd grid-lqcd-workflow/5_studies/hasenbusch_tune
 //   SRC=$PWD/src/time_strange_force.cc BIN=$PWD/bin/time_strange_force \
-//     bash perlmutter/build_puregrid.sh
+//     bash perlmutter/build_driver_puregrid.sh
 //
 //   non-compact: append -DUSE_NONCOMPACT to the compile (one-off):
 //     CXX=$(../../../Grid-TXQCD/build/grid-config --cxx); ... add -DUSE_NONCOMPACT

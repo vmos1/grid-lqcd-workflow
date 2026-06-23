@@ -59,7 +59,7 @@ fi
 
 # In-tree Grid-TXQCD build (no `make install`): grid-config omits the Grid
 # source/build include paths and the libGrid.a -L path, so add them here
-# (mirrors build_puregrid.sh / production/Makefile). GRID_BUILD = dir of grid-config.
+# (mirrors build_driver_puregrid.sh / production/Makefile). GRID_BUILD = dir of grid-config.
 GRID_BUILD=$(cd "$(dirname "$GRID_CONFIG")" && pwd)
 
 CXX=$($GRID_CONFIG --cxx)
@@ -68,20 +68,35 @@ LDFLAGS="$($GRID_CONFIG --ldflags) -L${GRID_BUILD}/Grid"
 LIBS=$($GRID_CONFIG --libs)
 
 # ── QUDA link (mirrors Grid-TXQCD/production/Makefile) ───────────────────────
+# QUDA_COMMS selects the comms backend the QUDA install was built with:
+#   qmp (default) -> link libqmp + compile QudaInit.h's QMP path (-DGRID_QUDA_USE_QMP)
+#   mpi           -> link libquda only; QudaInit.h hands QUDA Grid's MPI comm + rank map
+QUDA_COMMS=${QUDA_COMMS:-qmp}
 QLIB=${QUDA_PREFIX}/${QUDA_LIBDIR}
-MLIB=${QMP_PREFIX}/${QUDA_LIBDIR}
-CXXFLAGS+=" -DGRID_HAVE_QUDA -I${QUDA_PREFIX}/include -I${QMP_PREFIX}/include"
-LDFLAGS+=" -L${QLIB} -L${MLIB} -Xlinker -rpath -Xlinker ${QLIB} -Xlinker -rpath -Xlinker ${MLIB}"
-if [ -n "${QUDA_STATIC}" ]; then
-  LIBS="-l:libquda.a -l:libqmp.a ${LIBS}"
+CXXFLAGS+=" -DGRID_HAVE_QUDA -I${QUDA_PREFIX}/include"
+LDFLAGS+=" -L${QLIB} -Xlinker -rpath -Xlinker ${QLIB}"
+if [ "${QUDA_COMMS}" = "qmp" ]; then
+  MLIB=${QMP_PREFIX}/${QUDA_LIBDIR}
+  CXXFLAGS+=" -DGRID_QUDA_USE_QMP -I${QMP_PREFIX}/include"
+  LDFLAGS+=" -L${MLIB} -Xlinker -rpath -Xlinker ${MLIB}"
+  if [ -n "${QUDA_STATIC}" ]; then
+    LIBS="-l:libquda.a -l:libqmp.a ${LIBS}"
+  else
+    LIBS="-lquda -lqmp ${LIBS}"
+  fi
 else
-  LIBS="-lquda -lqmp ${LIBS}"
+  # mpi comms: no QMP headers/libs at all
+  if [ -n "${QUDA_STATIC}" ]; then
+    LIBS="-l:libquda.a ${LIBS}"
+  else
+    LIBS="-lquda ${LIBS}"
+  fi
 fi
 
 echo "Compiler:    ${CXX}"
 echo "grid-config: ${GRID_CONFIG}"
 echo "QUDA_PREFIX: ${QUDA_PREFIX}  (lib: ${QLIB})"
-echo "QMP_PREFIX:  ${QMP_PREFIX}"
+echo "QUDA_COMMS:  ${QUDA_COMMS}  (QMP_PREFIX: ${QMP_PREFIX})"
 echo "Source:      ${SRC}"
 echo "Binary:      ${BIN}"
 echo "Building (GRID_HAVE_QUDA defined) ..."

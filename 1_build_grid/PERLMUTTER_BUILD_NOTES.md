@@ -226,7 +226,7 @@ Supersedes the "building/TODO" states above:
   smearing ON. Add a `HOT_START` env knob to `gen_qcd_hasenbusch_tune.cc` (~L162,
   `SU<Nc>::ColdConfiguration`→`HotConfiguration`), recompile. **Applies to the proxy tuning too** (also cold-start).
 - Smoke job: `perlmutter/smoke_puregrid.sbatch` (no-QUDA variant; runnable via `bash` or `sbatch`).
-- **Pure-Grid build script written: `perlmutter/build_puregrid.sh`** — encapsulates the working
-  in-tree compile (recompile = `bash build_puregrid.sh`). The QUDA `perlmutter/build.sh` is still
+- **Pure-Grid build script written: `perlmutter/build_driver_puregrid.sh`** — encapsulates the working
+  in-tree compile (recompile = `bash build_driver_puregrid.sh`). The QUDA `perlmutter/build.sh` is still
   unfixed: it mandates `QUDA_PREFIX` and lacks the in-tree `-I/-L` flags — fix both before Phase 2.
 
