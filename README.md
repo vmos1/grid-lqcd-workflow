@@ -50,8 +50,8 @@ grid_qcd/                              ← top-level working directory
 │   │       ├── lq/
 │   │       │   └── build.sh           ← compile on lq
 │   │       └── perlmutter/
-│   │           ├── build_puregrid.sh  ← compile pure-Grid (no QUDA)
-│   │           └── build_quda.sh      ← compile with QUDA (Phase 2)
+│   │           ├── build_driver_puregrid.sh  ← compile driver, pure-Grid (no QUDA)
+│   │           └── build_driver_quda.sh      ← compile driver, with QUDA
 │   │   ├── hmc/                       ← Python package
 │   │   │   ├── extract.py             ← parse Grid logs → DataFrame
 │   │   │   ├── autocorr.py            ← integrated autocorrelation (Gamma/UW)
@@ -229,7 +229,7 @@ full tuning guide (physics, env-var interface, tuning loop).
 cd 5_studies/hasenbusch_tune && bash lq/build.sh
 
 # Perlmutter (pure-Grid, no QUDA)
-cd 5_studies/hasenbusch_tune && bash perlmutter/build_puregrid.sh
+cd 5_studies/hasenbusch_tune && bash perlmutter/build_driver_puregrid.sh
 ```
 
 Submit via that machine's sbatch scripts (on lq: `$BASE_DIR/submit_scripts/`; on
