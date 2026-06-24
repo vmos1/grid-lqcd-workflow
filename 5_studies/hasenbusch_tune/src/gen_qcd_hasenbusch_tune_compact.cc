@@ -48,6 +48,9 @@
 #include <Grid/qcd/action/pseudofermion/TwoFlavourRatio.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavour.h>
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h>
+// EVEN-parity Grid-native Schur monomial — same parity as the QUDA force path,
+// opt-in via STRANGE_EVEN=1 for same-parity grid-vs-quda force validation.
+#include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionEven.h>
 #include <Grid/qcd/action/gauge/PlaqPlusRectangleAction.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
@@ -315,6 +318,10 @@ int main(int argc, char **argv) {
   // non-compact WilsonCloverFermion).  The action body is operator-generic.
   std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
       StrangeBase;
+  // Same-parity validation holder: Grid-native EVEN-parity Schur monomial,
+  // opt-in via STRANGE_EVEN=1 (default off -> stock ODD-parity behavior).
+  std::unique_ptr<OneFlavourSchurCloverRationalActionEven<WilsonImplR, WCF>>
+      StrangeEven;
   Action<LatticeGaugeField> *StrangePtr = nullptr;
 #ifdef GRID_HAVE_QUDA
   // FermOp template args must be the compact operator types (WCF/WCF_f), same as
@@ -357,7 +364,18 @@ int main(int argc, char **argv) {
     std::cout << GridLogMessage << "[Strange] QUDA_FORCE active." << std::endl;
   } else
 #endif
-  {
+  if (std::getenv("STRANGE_EVEN") != nullptr) {
+    // EVEN-parity Schur (same parity as the QUDA force path) so a pure-grid vs
+    // grid-quda comparison is same-pseudofermion; default unset -> stock ODD.
+    StrangeEven = std::make_unique<
+        OneFlavourSchurCloverRationalActionEven<WilsonImplR, WCF>>(
+        StrangeOp, strange_rat);
+    StrangeEven->is_smeared = true;
+    StrangePtr = StrangeEven.get();
+    std::cout << GridLogMessage
+              << "[Strange] STRANGE_EVEN active — Grid native EVEN-parity Schur"
+              << std::endl;
+  } else {
     StrangeBase = std::make_unique<
         OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
         StrangeOp, StrangeOpF, &RBGridF, strange_rat, 50);
