@@ -99,6 +99,9 @@ class TwoFlavourSchurCloverActionMP
 // OneFlavourSchurCloverRationalActionMP — mixed-precision rational action
 // shared with gen_txqcd_cfgs.cc.
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h>
+// EVEN-parity Grid-native Schur monomial — same parity as the QUDA force path,
+// opt-in via STRANGE_EVEN=1 for same-parity grid-vs-quda force validation.
+#include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionEven.h>
 
 struct QcdDiag : public HmcObservable<LatticeGaugeField> {
   struct ActionRef { std::string name; Action<LatticeGaugeField> *action; };
@@ -461,6 +464,10 @@ int main(int argc, char **argv) {
   // computeCloverForceQuda (PyQUDA dagger=YES convention, cos=1.0 vs PathA).
   std::unique_ptr<OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF>>
       StrangeSchurPF_baseHolder;
+  // Same-parity validation holder: Grid-native EVEN-parity Schur monomial,
+  // opt-in via STRANGE_EVEN=1 (default off -> stock ODD-parity behavior).
+  std::unique_ptr<OneFlavourSchurCloverRationalActionEven<WilsonImplR>>
+      StrangeSchurPF_evenHolder;
   Action<LatticeGaugeField> *StrangeSchurPFptr = nullptr;
 #ifdef GRID_HAVE_QUDA
   std::unique_ptr<OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF>>
@@ -484,11 +491,27 @@ int main(int argc, char **argv) {
   } else
 #endif
   {
-    StrangeSchurPF_baseHolder = std::make_unique<
-        OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF>>(
-        StrangeFermOp, StrangeFermOpF, &RBGridF, strange_rat, 50);
-    StrangeSchurPF_baseHolder->is_smeared = true;
-    StrangeSchurPFptr = StrangeSchurPF_baseHolder.get();
+    // STRANGE_EVEN=1 -> Grid's native EVEN-parity Schur monomial (same parity as
+    // the QUDA force path) so a pure-grid vs grid-quda force comparison is
+    // same-pseudofermion (single-precision floor) instead of cross-parity
+    // (Odd-vs-Even -> different phi -> the ~0.175% structural offset).
+    // Default (unset) -> stock ODD-parity mixed-precision monomial.
+    if (std::getenv("STRANGE_EVEN") != nullptr) {
+      StrangeSchurPF_evenHolder = std::make_unique<
+          OneFlavourSchurCloverRationalActionEven<WilsonImplR>>(
+          StrangeFermOp, strange_rat);
+      StrangeSchurPF_evenHolder->is_smeared = true;
+      StrangeSchurPFptr = StrangeSchurPF_evenHolder.get();
+      std::cout << GridLogMessage
+                << "[Strange Nf=1] STRANGE_EVEN active — Grid native EVEN-parity Schur"
+                << std::endl;
+    } else {
+      StrangeSchurPF_baseHolder = std::make_unique<
+          OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF>>(
+          StrangeFermOp, StrangeFermOpF, &RBGridF, strange_rat, 50);
+      StrangeSchurPF_baseHolder->is_smeared = true;
+      StrangeSchurPFptr = StrangeSchurPF_baseHolder.get();
+    }
   }
   Action<LatticeGaugeField> &StrangeSchurPF = *StrangeSchurPFptr;
 
