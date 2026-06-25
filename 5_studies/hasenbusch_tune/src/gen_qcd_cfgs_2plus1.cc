@@ -8,6 +8,8 @@
 #include <Grid/qcd/action/fermion/CompactWilsonCloverFermion.h>
 #include <Grid/qcd/action/gauge/PlaqPlusRectangleAction.h>
 #include <Grid/qcd/utils/WilsonLoops.h>
+#include <Grid/qcd/observables/plaquette.h>
+#include <Grid/qcd/observables/polyakov_loop.h>
 #ifdef HAVE_HDF5
 #include <Grid/serialisation/Hdf5IO.h>
 #endif
@@ -704,7 +706,13 @@ int main(int argc, char **argv) {
   // Pure-HMC timing build: QcdDiag does per-trajectory stochastic VEV solves
   // (+ optional eig + HDF5 dump) — non-MD work that pollutes wall/traj.
   // Attach only on RUN_DIAG=1.
-  std::vector<HmcObservable<LatticeGaugeField> *> Obs = {&ckpt};
+  // Per-trajectory gauge observables (plaquette + Polyakov loop) — Grid's stock
+  // loggers. Read-only gauge reductions: draw no RNG, mutate nothing, ~ms cost.
+  // They fire after the trajectory's force/H/dH/Metropolis are finalized, so the
+  // HMC sequence is bit-identical with or without them.
+  PlaquetteLogger<PeriodicGimplR> plaqLog;
+  PolyakovLogger<PeriodicGimplR>  polyLog;
+  std::vector<HmcObservable<LatticeGaugeField> *> Obs = {&ckpt, &plaqLog, &polyLog};
   if (std::getenv("RUN_DIAG") != nullptr) Obs.push_back(&diag);
 
   // TEST_SIGMA_LOOP: σ-loop replay test.  Runs Wilson::MeeDeriv (the trusted
