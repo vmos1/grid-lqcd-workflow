@@ -52,6 +52,8 @@
 // opt-in via STRANGE_EVEN=1 for same-parity grid-vs-quda force validation.
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionEven.h>
 #include <Grid/qcd/action/gauge/PlaqPlusRectangleAction.h>
+#include <Grid/qcd/observables/plaquette.h>
+#include <Grid/qcd/observables/polyakov_loop.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
 #ifdef GRID_HAVE_QUDA
@@ -541,7 +543,11 @@ int main(int argc, char **argv) {
   HMCp.StartingType       = "ColdStart";
   HMCp.MD                 = MD;
 
-  std::vector<HmcObservable<LatticeGaugeField> *> Obs = {&ForceObs};
+  // Per-trajectory gauge observables (plaquette + Polyakov loop) — Grid's stock
+  // loggers. Read-only gauge reductions: draw no RNG, mutate nothing, ~ms cost.
+  PlaquetteLogger<PeriodicGimplR> plaqLog;
+  PolyakovLogger<PeriodicGimplR>  polyLog;
+  std::vector<HmcObservable<LatticeGaugeField> *> Obs = {&ForceObs, &plaqLog, &polyLog};
 
   typedef MinimumNorm2<PeriodicGimplR,
                        SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
