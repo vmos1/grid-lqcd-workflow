@@ -43,11 +43,13 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <set>
+#include <sstream>
 #include <Grid/Grid.h>
 #include <Grid/parallelIO/IldgIO.h>
 #include <Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOAction.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverAction.h>
-#include <Grid/qcd/action/pseudofermion/TwoFlavourEvenOddRatio.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioAction.h>
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h>
 // EVEN-parity Grid-native Schur monomial — same parity as the QUDA force path,
 // opt-in via STRANGE_EVEN=1 for same-parity grid-vs-quda force validation.
@@ -59,6 +61,9 @@
 #include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
 #ifdef GRID_HAVE_QUDA
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
+#include <Grid/algorithms/iterative/QudaMGSchurSolver.h>
+#include <Grid/algorithms/iterative/QudaCGSchurSolver.h>
 #endif
 
 using namespace Grid;
@@ -338,21 +343,164 @@ int main(int argc, char **argv) {
   QCDLogDetCompactCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
   LightLogDet.is_smeared = true;
 
-  // Hasenbusch ratio levels (EO/Schur-preconditioned).
+  // Hasenbusch ratio levels (EO/Schur-preconditioned, clover-correct).
   //   det(Schur(ladder[k]))^2 / det(Schur(ladder[k+1]))^2  via
-  //   TwoFlavourEvenOddRatioPseudoFermionAction(NumOp=heavy, DenOp=light, DS, AS).
+  //   TwoFlavourSchurCloverRatioAction(NumOp=heavy, DenOp=light, DS, AS) -- the
+  //   Schur-only ratio class (no ConstEE assumption, unlike Mike's
+  //   TwoFlavourEvenOddRatio.h, which crashes here for clover).  The EE
+  //   determinant is supplied separately by LightLogDet above (telescoping).
   // Small Δm → well-conditioned → DP CG (CG_deriv/CG_action) suffices (as in the full-op driver).
+  // Two independent QUDA hooks, same QudaMGSchurSolver.h wrapper (2-solve gamma5 trick is agnostic
+  // to which inner solver QudaCloverInverter runs):
+  //   HASEN_MG_RUNG=<k>          -- rung k's Mpc(DenOp) solve via QUDA MULTIGRID (use_multigrid=true).
+  //   HASEN_QUDA_CG_RUNGS=<csv>  -- these rungs' Mpc(DenOp) solve via plain QUDA CG (still GPU-side /
+  //                                 faster than Grid's CG, no MG preconditioner setup cost) -- useful
+  //                                 for the heavier, already-well-conditioned rungs where MG's extra
+  //                                 setup isn't worth it but QUDA's CG throughput still helps.
+  // A rung may only be routed one way; HASEN_MG_RUNG takes precedence if both list the same rung.
+  // Both env vars accept a comma-separated list of rung indices (HASEN_MG_RUNG=0 or HASEN_MG_RUNG=0,1,2
+  // both work) so a single run can put MG on every rung at once, for a same-seed timing/force
+  // comparison against the Grid-CG and QUDA-CG passes.
   int n_pf = n_ops - 1;
-  std::vector<std::unique_ptr<TwoFlavourEvenOddRatioPseudoFermionAction<WilsonImplR>>> RatioPF;
+  std::vector<std::unique_ptr<Action<LatticeGaugeField>>> RatioPF;
+#ifdef GRID_HAVE_QUDA
+  std::vector<std::unique_ptr<QudaRungSolverBase>> QudaRungSolver(n_pf);
+  // Parallel, INDEPENDENT solver vector for the heatbath (refresh()) step --
+  // built at NumOp's mass (ladder[k+1]), not DenOp's (ladder[k]), since
+  // refresh's normal-equation problem is M_1^dag M_1, not M_0's.  Only
+  // populated for rungs listed in HASEN_QUDA_CG_HEATBATH_RUNGS -- see
+  // TwoFlavourSchurCloverRatioActionQuda.h for why QudaCGSchurSolver (no
+  // extra code) is the right tool: it already solves exactly the
+  // M^dag M x = b, then apply M problem HeatbathSolver poses.
+  std::vector<std::unique_ptr<QudaCGSchurSolver>> HeatbathQudaSolver(n_pf);
+#endif
+  auto parse_rung_list = [](const char *env) {
+    std::set<int> out;
+    if (const char *v = std::getenv(env); v && *v) {
+      std::stringstream ss(v);
+      std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) out.insert(std::atoi(tok.c_str()));
+    }
+    return out;
+  };
+  std::set<int> mg_rungs      = parse_rung_list("HASEN_MG_RUNG");
+  std::set<int> quda_cg_rungs = parse_rung_list("HASEN_QUDA_CG_RUNGS");
+  std::set<int> quda_cg_heatbath_rungs = parse_rung_list("HASEN_QUDA_CG_HEATBATH_RUNGS");
   for (int k = 0; k < n_pf; ++k) {
-    RatioPF.emplace_back(
-        std::make_unique<TwoFlavourEvenOddRatioPseudoFermionAction<WilsonImplR>>(
-            *LightOps[k+1],  // NumOp = heavier mass
-            *LightOps[k],    // DenOp = lighter mass
-            CG_deriv, CG_action));
+    bool want_mg = mg_rungs.count(k);
+    bool want_quda_cg = !want_mg && quda_cg_rungs.count(k);
+    if (want_mg || want_quda_cg) {
+#ifdef GRID_HAVE_QUDA
+      QudaCloverParams qp_mg;
+      qp_mg.mass = ladder[k];  // DenOp mass -- the rung being QUDA-accelerated
+      qp_mg.csw  = csw;
+      qp_mg.anti_periodic_t = true;
+      qp_mg.tol = cg_tol_drv;
+      qp_mg.max_iter = cg_max;
+      qp_mg.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+      qp_mg.use_multigrid = want_mg;
+      // Diagnostic: QudaCloverParams defaults cuda_prec_sloppy=SINGLE (mixed-
+      // precision inner iterations). QUDA_SLOPPY_DOUBLE=1 forces pure double
+      // precision throughout, to test whether a plain-CG rung's force
+      // discrepancy vs Grid-CG (seen at 48^3, NOT at 16^3) is caused by
+      // single-precision roundoff accumulating over the many (~1000s at 48^3
+      // near-critical rungs) CG iterations needed to hit a fixed residual
+      // tolerance -- MG needs far fewer iterations for the same tolerance, so
+      // if this hypothesis is right, only plain CG should be sensitive to it.
+      if (std::getenv("QUDA_SLOPPY_DOUBLE") != nullptr) {
+        qp_mg.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
+      }
+      // 48^3 antiperiodic-t: the boundary time links carry the baked-in -1
+      // (det=-1); RECONSTRUCT_12 (the default) mis-rebuilds them, assuming
+      // det=+1. Same fix as the strange/light paths in
+      // gen_qcd_hasenbusch_tune_compact.cc (QUDA_FORCE_RECON_NO), ported here
+      // because compact_schur's plain QUDA-CG rungs never had it -- 16^3 is
+      // well-conditioned enough to tolerate the mis-reconstruction, 48^3 is not.
+      if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr) {
+        qp_mg.recon_sloppy = QUDA_RECONSTRUCT_NO;
+      }
+      if (want_mg) {
+        // Same HMC_MG_* knobs as the existing USE_HMC_MG single-mass path
+        // (TwoFlavourSchurCloverQudaForceActionMP.h) -- reused verbatim.
+        const char *nlv = std::getenv("HMC_MG_NLEVEL");
+        qp_mg.mg.n_level = nlv ? std::atoi(nlv) : 2;
+        auto parse_block = [](const char *s, std::array<int,4> dflt) {
+          if (!s || !*s) return dflt;
+          std::array<int,4> b = dflt;
+          std::sscanf(s, "%d %d %d %d", &b[0], &b[1], &b[2], &b[3]);
+          return b;
+        };
+        std::array<int,4> b0 = parse_block(std::getenv("HMC_MG_BLOCK_L0"), {4,4,4,4});
+        std::array<int,4> b1 = parse_block(std::getenv("HMC_MG_BLOCK_L1"), {2,2,2,2});
+        qp_mg.mg.geo_block_size = (qp_mg.mg.n_level >= 3)
+            ? std::vector<std::array<int,4>>{b0, b1}
+            : std::vector<std::array<int,4>>{b0};
+        if (const char *nv = std::getenv("HMC_MG_NVEC")) {
+          int a=0,b=0,c=0; int n = std::sscanf(nv, "%d %d %d", &a,&b,&c);
+          std::vector<int> v; if(n>=1)v.push_back(a); if(n>=2)v.push_back(b); if(n>=3)v.push_back(c);
+          if (!v.empty()) { qp_mg.mg.n_vec_levels = v; qp_mg.mg.n_vec = v[0]; }
+        }
+        if (const char *cm = std::getenv("HMC_MG_COARSE_MAXITER"))
+          qp_mg.mg.coarse_solver_maxiter = std::atoi(cm);
+        if (const char *r = std::getenv("HMC_MG_REFRESH"))
+          qp_mg.mg.setup_maxiter_refresh = std::atoi(r);
+        if (const char *r = std::getenv("HMC_MG_REBUILD_EVERY"))
+          qp_mg.mg.rebuild_every = std::atoi(r);
+      }
+      if (want_mg) {
+        QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+      } else {
+        // Plain QUDA-CG: QudaMGSchurSolver's zero-pad/gamma5 trick was only
+        // ever validated for use_multigrid=true (MG's QUDA_DIRECT_SOLVE,
+        // where matpc_type is irrelevant). Its inner QudaCloverInverter
+        // hardcodes matpc_type=EVEN_EVEN, which is the WRONG parity/form for
+        // our Odd-checkerboard asymmetric Schur system under CG's
+        // QUDA_NORMOP_PC_SOLVE -- see QudaCGSchurSolver.h for the fix
+        // (direct half-volume solve, ODD_ODD_ASYMMETRIC, same convention
+        // already proven in OneFlavourSchurCloverQudaRationalActionMP.h).
+        QudaRungSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+      }
+      // Heatbath (refresh()) acceleration is INDEPENDENT of the deriv/action
+      // choice above -- separate env var, separate solver instance, built at
+      // NumOp's mass (ladder[k+1]).  Only offered on rungs that already have
+      // a QUDA deriv/action solver (this loop branch) -- no infrastructure
+      // exists yet to attach a QUDA heatbath solver to a plain-Grid-CG rung.
+      OperatorFunction<LatticeFermion> *heatbath_solver_ptr = &CG_action;
+      if (quda_cg_heatbath_rungs.count(k)) {
+        QudaCloverParams qp_hb;
+        qp_hb.mass = ladder[k+1];  // NumOp mass -- refresh solves M_1^dag M_1
+        qp_hb.csw  = csw;
+        qp_hb.anti_periodic_t = true;
+        qp_hb.tol = cg_tol_act;  // heatbath sets phi for the whole trajectory -- match CG_action's tol
+        qp_hb.max_iter = cg_max;
+        qp_hb.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+        qp_hb.use_multigrid = false;
+        if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+          qp_hb.recon_sloppy = QUDA_RECONSTRUCT_NO;
+        HeatbathQudaSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k+1]->GaugeGrid(), qp_hb, Odd);
+        heatbath_solver_ptr = HeatbathQudaSolver[k].get();
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " HeatbathSolver = QUDA CG, mass=" << ladder[k+1] << std::endl;
+      }
+      RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioActionQuda<WilsonImplR, WCF>>(
+          *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr));
+      std::cout << GridLogMessage << "[Ladder] rung " << k
+                << " DerivativeSolver/ActionSolver = "
+                << (want_mg ? ("QUDA MG (" + std::to_string(qp_mg.mg.n_level) + " levels)") : std::string("QUDA CG"))
+                << ", mass=" << ladder[k] << std::endl;
+#else
+      std::cerr << "HASEN_MG_RUNG/HASEN_QUDA_CG_RUNGS require a QUDA build.\n"; exit(1);
+#endif
+    } else {
+      RatioPF.emplace_back(
+          std::make_unique<TwoFlavourSchurCloverRatioAction<WilsonImplR, WCF>>(
+              *LightOps[k+1],  // NumOp = heavier mass
+              *LightOps[k],    // DenOp = lighter mass
+              CG_deriv, CG_action));
+    }
     RatioPF.back()->is_smeared = true;
   }
-  std::cout << GridLogMessage << "Built " << n_pf << " EO ratio PF levels." << std::endl;
+  std::cout << GridLogMessage << "Built " << n_pf << " Schur ratio PF levels." << std::endl;
 
   // Schur tail: det(Schur(ladder.back()))^2 as a single EO-Schur monomial, capping the chain.
   // Mixed-precision MD force (SP inner + DP reliable), mirroring the 2+1 driver's LightSchurPF.
@@ -412,6 +560,14 @@ int main(int argc, char **argv) {
     // docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
     if (std::getenv("QUDA_FORCE_SLOPPY_DP") != nullptr)
       qp.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
+    // QUDA_FORCE_RECON_NO=1 → reconstruct_sloppy = NO (full links). REQUIRED at
+    // 48^3: the antiperiodic-t phase is baked in by negating the last-timeslice
+    // time links (det=-1, not SU(3)); RECONSTRUCT_12 (the default) mis-rebuilds
+    // the 3rd row of those links (it assumes det=+1), corrupting the sloppy
+    // solve. Ported from gen_qcd_hasenbusch_tune_compact.cc (memory
+    // quda-strange-recon-fix) -- this driver's strange QUDA path never had it.
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp.recon_sloppy = QUDA_RECONSTRUCT_NO;
     StrangeQuda = std::make_unique<
         OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
         StrangeOp, StrangeOpF, &RBGridF, strange_rat, qp, 50);
@@ -529,18 +685,24 @@ int main(int argc, char **argv) {
     };
     LatticeGaugeField force(&Grid_);
     const int nref = (int)ForceObs.refs.size();
-    std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0), acc_time(nref, 0.0);
+    std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0), acc_time(nref, 0.0), acc_refresh(nref, 0.0);
     Smear.set_Field(Umu);   // smear the fixed config once (deterministic)
     for (int s = 0; s < nsamp; ++s)
       for (int i = 0; i < nref; ++i) {
         if (skip(ForceObs.refs[i].name)) continue;
         Action<LatticeGaugeField> *act = ForceObs.refs[i].act;
-        double ftime;
+        double ftime, rtime = 0.0;
         if (act->is_smeared) {
           // Smeared pseudofermion / log-det levels: heatbath, then evaluate the
           // force through the smearing chain rule -- exactly as the integrator's
-          // first P-update does.
+          // first P-update does.  refresh() is the heatbath solve -- for a
+          // ratio rung this is the expensive step on a near-critical mass (it
+          // is NOT accelerated by HASEN_MG_RUNG, which only speeds up
+          // deriv()/S(); see QudaMGSchurSolver notes), so time it separately
+          // from deriv() rather than lump both into one number.
+          auto tr0 = std::chrono::steady_clock::now();
           act->refresh(Smear, sRNG, pRNG);               // heatbath pseudofermions
+          rtime = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr0).count();
           auto t0 = std::chrono::steady_clock::now();
           act->deriv(Smear, force);                      // force incl. smearing chain rule
           ftime = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -562,12 +724,33 @@ int main(int argc, char **argv) {
         acc_avg[i] += favg;
         acc_max[i] += fmax;
         acc_time[i] += ftime;
+        acc_refresh[i] += rtime;
         // Stream each level immediately so a later-level stall can't swallow the
         // numbers already computed (the end-of-loop summary is otherwise gated
         // behind every ref, including the FORCES_ONLY gauge eval).
         std::cout << GridLogMessage << "FORCES_ONLY level " << ForceObs.refs[i].name
                   << " sample " << s << " avg=" << favg << " max=" << fmax
-                  << " time=" << ftime << std::endl;
+                  << " refresh=" << rtime << " time=" << ftime << std::endl;
+#ifdef GRID_HAVE_QUDA
+        // FORCES_ONLY is a ONE-SHOT diagnostic (single heatbath+force per rung,
+        // no MD loop) -- unlike the real HMC path, nothing revisits this rung's
+        // solver again after its last sample, so its GPU memory (gauge/clover
+        // copies, and for MG the coarse-grid + null-vector state) can be freed
+        // immediately rather than held for the rest of the program. This caps
+        // peak GPU memory at ~1 QUDA-routed rung's worth instead of accumulating
+        // one per rung -- avoids the OOM seen routing all 4 rungs through
+        // QUDA/MG simultaneously at 48^3. Real HMC trajectories must NOT do
+        // this (they reuse the same solver every MD step, which is the whole
+        // point of amortizing MG's setup cost) -- this code path only runs
+        // inside the FORCES_ONLY block, never in the trajectory/integrator path.
+        if (s == nsamp - 1 && ForceObs.refs[i].name.rfind("PF", 0) == 0) {
+          int k = std::atoi(ForceObs.refs[i].name.c_str() + 2);
+          if (k >= 0 && k < (int)QudaRungSolver.size() && QudaRungSolver[k]) {
+            QudaRungSolver[k].reset();
+            std::cout << GridLogMessage << "[FORCES_ONLY] freed QUDA solver for rung " << k << std::endl;
+          }
+        }
+#endif
       }
     auto emit = [&](const char *tag, std::vector<double> &acc) {
       std::cout << GridLogMessage << "FORCES_ONLY samples=" << nsamp << " " << tag << ":";
@@ -578,6 +761,7 @@ int main(int argc, char **argv) {
     };
     emit("avg", acc_avg);
     emit("max", acc_max);
+    emit("refresh", acc_refresh);
     emit("time", acc_time);
     Grid_finalize();
     return 0;
@@ -590,10 +774,18 @@ int main(int argc, char **argv) {
   // above), so it is guaranteed present here.
   MD.trajL = std::atof(std::getenv("TRAJL"));
 
+  // NoMetropolisUntil: default 0 (chroma-style Metropolis-from-trajectory-0);
+  // override via NO_METROP env var to skip accept/reject for the first N
+  // trajectories -- useful for inspecting raw dH/force behaviour without the
+  // gauge reverting on a reject (same convention as gen_qcd_cfgs_2plus1.cc).
+  int no_metrop = 0;
+  if (const char *nm = std::getenv("NO_METROP"); nm && *nm) no_metrop = std::atoi(nm);
+  std::cout << GridLogMessage << "NoMetropolisUntil=" << no_metrop << std::endl;
+
   HMCparameters HMCp;
   HMCp.StartTrajectory    = 0;
   HMCp.Trajectories       = n_traj;
-  HMCp.NoMetropolisUntil  = 0;
+  HMCp.NoMetropolisUntil  = no_metrop;
   HMCp.MetropolisTest     = true;
   HMCp.PerformRandomShift = false;
   HMCp.StartingType       = "ColdStart";
