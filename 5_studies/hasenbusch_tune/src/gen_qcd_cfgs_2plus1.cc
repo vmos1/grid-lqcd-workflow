@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cstdio>
 #include <chrono>
+#include <set>
+#include <sstream>
 #include <Grid/parallelIO/IldgIO.h>
 #include <Grid/qcd/action/fermion/WilsonCloverFermion.h>
 #include <Grid/qcd/action/fermion/CompactWilsonCloverFermion.h>
@@ -15,11 +17,15 @@
 #endif
 #include <Grid/qcd/action/pseudofermion/QCDLogDetCloverEOAction.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverAction.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioAction.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavour.h>
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalAction.h>
 #ifdef GRID_HAVE_QUDA
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverQudaForceActionMP.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
+#include <Grid/algorithms/iterative/QudaMGSchurSolver.h>
+#include <Grid/algorithms/iterative/QudaCGSchurSolver.h>
 #endif
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
@@ -97,6 +103,13 @@ class TwoFlavourSchurCloverActionMP
   FermOpF &opF_;
 };
 }  // namespace Grid
+
+#ifdef GRID_HAVE_QUDA
+// TwoFlavourSchurCloverRatioActionQuda now lives in its own additive
+// Grid-TXQCD header (shared with gen_qcd_hasenbusch_tune_compact_schur.cc) --
+// see TwoFlavourSchurCloverRatioActionQuda.h for the rationale.
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
+#endif
 
 // OneFlavourSchurCloverRationalActionMP — mixed-precision rational action
 // shared with gen_txqcd_cfgs.cc.
@@ -335,6 +348,34 @@ int main(int argc, char **argv) {
 
   typedef WilsonCloverFermion<WilsonImplR, CloverHelpers<WilsonImplR>> WCF;
 
+  // ── Hasenbusch ladder ─────────────────────────────────────────────────────
+  // HASEN_LADDER: comma-separated masses light→heavy, e.g.
+  //   "-0.2416,-0.2400,-0.2320,-0.2180,-0.1870"
+  // Lightest entry must equal mass_light.  Heaviest entry is the bare-det tail
+  // mass (no Pauli-Villars appended) -- matches the Chroma cfg_2000 action and
+  // the already-validated compact_schur.cc construction.  If unset: single-
+  // level (no Hasenbusch) -- byte-for-byte today's behavior.
+  std::vector<RealD> ladder;
+  if (const char *hl = std::getenv("HASEN_LADDER"); hl && *hl) {
+    std::string s(hl); size_t pos = 0, c;
+    while ((c = s.find(',', pos)) != std::string::npos) {
+      ladder.push_back(std::atof(s.substr(pos, c - pos).c_str())); pos = c + 1;
+    }
+    if (pos < s.size()) ladder.push_back(std::atof(s.substr(pos).c_str()));
+    if (ladder.size() < 2) { std::cerr << "HASEN_LADDER needs >=2 masses.\n"; exit(1); }
+    for (size_t i = 1; i < ladder.size(); ++i)
+      if (!(ladder[i] > ladder[i-1])) {
+        std::cerr << "HASEN_LADDER must be strictly increasing.\n"; exit(1);
+      }
+  } else {
+    ladder = { mass_light };
+    std::cout << GridLogMessage << "HASEN_LADDER not set -- single-level baseline." << std::endl;
+  }
+  std::cout << GridLogMessage << "Hasenbusch chain (" << (ladder.size()-1)
+            << " ratios + bare-det tail at " << ladder.back() << "):";
+  for (auto m : ladder) std::cout << " " << m;
+  std::cout << std::endl;
+
   // Single-precision grid + gauge field + operator for mixed-precision CG.
   GridCartesian        GridF(latt, GridDefaultSimd(Nd, vComplexF::Nsimd()), mpi);
   GridRedBlackCartesian RBGridF(&GridF);
@@ -357,15 +398,31 @@ int main(int argc, char **argv) {
   WilsonImplParams impl_pF;
   impl_pF.boundary_phases.resize(Nd, 1.0);
   impl_pF.boundary_phases[Nd - 1] = -1.0;
-  WCF_f FermOpF(UmuF, GridF, RBGridF, mass_light, csw, csw,
+  // SP tail operator -- bound to the HEAVIEST ladder mass (== mass_light when
+  // HASEN_LADDER is unset, identical to today).
+  WCF_f FermOpF(UmuF, GridF, RBGridF, ladder.back(), csw, csw,
                 WilsonAnisotropyCoefficients(), impl_pF);
 
-  // Light quarks (Nf=2): EO-preconditioned LogDet + Schur.
+  // Light quarks (Nf=2): EO-preconditioned LogDet + Hasenbusch ratio chain +
+  // Schur tail.  One DP operator per ladder mass; small Δm between rungs ->
+  // well-conditioned -> DP CG suffices for the ratio rungs (mirrors
+  // gen_qcd_hasenbusch_tune_compact_schur.cc's rationale).
+  int n_ops = (int)ladder.size();
+  std::vector<std::unique_ptr<WCF>> LightOps;
+  for (int i = 0; i < n_ops; ++i)
+    LightOps.emplace_back(std::make_unique<WCF>(
+        Umu, Grid, RBGrid, ladder[i], csw, csw,
+        WilsonAnisotropyCoefficients(), impl_p));
+  std::cout << GridLogMessage << "Built " << n_ops << " DP light operators." << std::endl;
+  // FermOp = the tail operator (heaviest ladder mass).  All existing
+  // FermOp-based code below (mixed-precision tail action, TEST_SIGMA_LOOP,
+  // TEST_LAMBDA, FD_NONEO, QUDA_FORCE_LIGHT) is unchanged and now transparently
+  // targets the tail -- identical to today when HASEN_LADDER is unset.
+  WCF &FermOp = *LightOps.back();
+
   // Action solver (accept/reject): tight DP CG at cg_tol=1e-8.
   // Derivative solver (MD force): mixed-precision CG (SP inner + DP correction),
   // outer tolerance 1e-6 (mdtol bias cancels on Metropolis accept/reject).
-  WCF FermOp(Umu, Grid, RBGrid, mass_light, csw, csw,
-             WilsonAnisotropyCoefficients(), impl_p);
   RealD cg_action_tol = cg_tol;
   if (const char *t = std::getenv("CG_TOL"); t && *t) cg_action_tol = std::atof(t);
   std::cout << GridLogMessage << "CG_TOL=" << cg_action_tol << std::endl;
@@ -383,7 +440,9 @@ int main(int argc, char **argv) {
                      SchurDifferentiableOperator<WilsonImplR>,
                      SchurDifferentiableOperator<WilsonImplF>>
       CG_md(cg_md_tol, cg_max, 50, &RBGridF, SchurOpD, SchurOpF);
-  QCDLogDetCloverEOAction<WilsonImplR> LightLogDet(FermOp, 2);
+  // LogDet is at the LIGHTEST ladder mass -- the EE determinants telescope
+  // exactly across the chain (see TwoFlavourSchurCloverRatioAction.h header).
+  QCDLogDetCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
   LightLogDet.is_smeared = true;
   // SOLVER_DEBUG=1 forces DP CG_action also for the derivative — used to
   // disentangle MP-CG bug from structural deriv vs S inconsistency.
@@ -436,6 +495,126 @@ int main(int argc, char **argv) {
   }
   Action<LatticeGaugeField> &LightSchurPF = *LightSchurPFptr;
 
+  // ── Hasenbusch ratio rungs (EO-Schur, clover-correct) ─────────────────────
+  // n_pf = n_ops - 1 ratios det(Schur(ladder[k]))^2 / det(Schur(ladder[k+1]))^2,
+  // NumOp = heavier (ladder[k+1]), DenOp = lighter (ladder[k]).  Well-conditioned
+  // by construction (small mass splitting) -> plain DP CG suffices, except any
+  // rung listed in HASEN_MG_RUNG (QUDA multigrid, QudaMGSchurSolver.h) or
+  // HASEN_QUDA_CG_RUNGS (plain QUDA CG, QudaCGSchurSolver.h -- half-volume
+  // direct solve with matpc_type=ODD_ODD_ASYMMETRIC, the parity/form Grid's
+  // own SchurDiagMooeeOperator uses; QudaMGSchurSolver must NOT be reused for
+  // plain CG -- its inner QudaCloverInverter hardcodes matpc_type=EVEN_EVEN,
+  // correct-but-irrelevant for MG's QUDA_DIRECT_SOLVE, wrong for CG's
+  // QUDA_NORMOP_PC_SOLVE; see gen_qcd_hasenbusch_tune_compact_schur.cc, where
+  // this was found and fixed first). Both env vars accept a comma-separated
+  // list of rung indices; HASEN_MG_RUNG takes precedence if a rung is listed
+  // in both. n_pf==0 when HASEN_LADDER is unset -> no rungs built, identical
+  // to today.
+  ConjugateGradient<LatticeFermion> CG_ladder_deriv(cg_md_tol, cg_max);
+  int n_pf = n_ops - 1;
+  std::vector<std::unique_ptr<Action<LatticeGaugeField>>> RatioPF;
+#ifdef GRID_HAVE_QUDA
+  std::vector<std::unique_ptr<QudaRungSolverBase>> QudaRungSolver(n_pf);
+  // Parallel, INDEPENDENT solver vector for the heatbath (refresh()) step --
+  // built at NumOp's mass (ladder[k+1]), not DenOp's (ladder[k]); see
+  // TwoFlavourSchurCloverRatioActionQuda.h and
+  // gen_qcd_hasenbusch_tune_compact_schur.cc (where this was added first).
+  std::vector<std::unique_ptr<QudaCGSchurSolver>> HeatbathQudaSolver(n_pf);
+#endif
+  auto parse_rung_list = [](const char *env) {
+    std::set<int> out;
+    if (const char *v = std::getenv(env); v && *v) {
+      std::stringstream ss(v);
+      std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) out.insert(std::atoi(tok.c_str()));
+    }
+    return out;
+  };
+  std::set<int> mg_rungs      = parse_rung_list("HASEN_MG_RUNG");
+  std::set<int> quda_cg_rungs = parse_rung_list("HASEN_QUDA_CG_RUNGS");
+  std::set<int> quda_cg_heatbath_rungs = parse_rung_list("HASEN_QUDA_CG_HEATBATH_RUNGS");
+  for (int k = 0; k < n_pf; ++k) {
+    bool want_mg = mg_rungs.count(k);
+    bool want_quda_cg = !want_mg && quda_cg_rungs.count(k);
+    if (want_mg || want_quda_cg) {
+#ifdef GRID_HAVE_QUDA
+      QudaCloverParams qp_mg;
+      qp_mg.mass = ladder[k];  // DenOp mass -- the rung being QUDA-accelerated
+      qp_mg.csw  = csw;
+      qp_mg.anti_periodic_t = true;
+      qp_mg.tol = cg_md_tol;
+      qp_mg.max_iter = cg_max;
+      qp_mg.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+      qp_mg.use_multigrid = want_mg;
+      if (want_mg) {
+        // Same HMC_MG_* knobs as the existing USE_HMC_MG single-mass path
+        // (TwoFlavourSchurCloverQudaForceActionMP.h) -- reused verbatim.
+        const char *nlv = std::getenv("HMC_MG_NLEVEL");
+        qp_mg.mg.n_level = nlv ? std::atoi(nlv) : 2;
+        auto parse_block = [](const char *s, std::array<int,4> dflt) {
+          if (!s || !*s) return dflt;
+          std::array<int,4> b = dflt;
+          std::sscanf(s, "%d %d %d %d", &b[0], &b[1], &b[2], &b[3]);
+          return b;
+        };
+        std::array<int,4> b0 = parse_block(std::getenv("HMC_MG_BLOCK_L0"), {4,4,4,4});
+        std::array<int,4> b1 = parse_block(std::getenv("HMC_MG_BLOCK_L1"), {2,2,2,2});
+        qp_mg.mg.geo_block_size = (qp_mg.mg.n_level >= 3)
+            ? std::vector<std::array<int,4>>{b0, b1}
+            : std::vector<std::array<int,4>>{b0};
+        if (const char *nv = std::getenv("HMC_MG_NVEC")) {
+          int a=0,b=0,c=0; int n = std::sscanf(nv, "%d %d %d", &a,&b,&c);
+          std::vector<int> v; if(n>=1)v.push_back(a); if(n>=2)v.push_back(b); if(n>=3)v.push_back(c);
+          if (!v.empty()) { qp_mg.mg.n_vec_levels = v; qp_mg.mg.n_vec = v[0]; }
+        }
+        if (const char *cm = std::getenv("HMC_MG_COARSE_MAXITER"))
+          qp_mg.mg.coarse_solver_maxiter = std::atoi(cm);
+        if (const char *r = std::getenv("HMC_MG_REFRESH"))
+          qp_mg.mg.setup_maxiter_refresh = std::atoi(r);
+        if (const char *r = std::getenv("HMC_MG_REBUILD_EVERY"))
+          qp_mg.mg.rebuild_every = std::atoi(r);
+        QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+      } else {
+        QudaRungSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+      }
+      // Heatbath (refresh()) acceleration is INDEPENDENT of the deriv/action
+      // choice above -- separate env var, separate solver instance, built at
+      // NumOp's mass (ladder[k+1]).  Only offered on rungs that already have
+      // a QUDA deriv/action solver (this loop branch).
+      OperatorFunction<LatticeFermion> *heatbath_solver_ptr = &CG_action;
+      if (quda_cg_heatbath_rungs.count(k)) {
+        QudaCloverParams qp_hb;
+        qp_hb.mass = ladder[k+1];  // NumOp mass -- refresh solves M_1^dag M_1
+        qp_hb.csw  = csw;
+        qp_hb.anti_periodic_t = true;
+        qp_hb.tol = cg_action_tol;  // heatbath sets phi for the whole trajectory -- match CG_action's tol
+        qp_hb.max_iter = cg_max;
+        qp_hb.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+        qp_hb.use_multigrid = false;
+        if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+          qp_hb.recon_sloppy = QUDA_RECONSTRUCT_NO;
+        HeatbathQudaSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k+1]->GaugeGrid(), qp_hb, Odd);
+        heatbath_solver_ptr = HeatbathQudaSolver[k].get();
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " HeatbathSolver = QUDA CG, mass=" << ladder[k+1] << std::endl;
+      }
+      RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioActionQuda<WilsonImplR>>(
+          *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr));
+      std::cout << GridLogMessage << "[Ladder] rung " << k
+                << " DerivativeSolver/ActionSolver = "
+                << (want_mg ? ("QUDA MG (" + std::to_string(qp_mg.mg.n_level) + " levels)") : std::string("QUDA CG"))
+                << ", mass=" << ladder[k] << std::endl;
+#else
+      std::cerr << "HASEN_MG_RUNG/HASEN_QUDA_CG_RUNGS require a QUDA build.\n"; exit(1);
+#endif
+    } else {
+      RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioAction<WilsonImplR>>(
+          *LightOps[k+1], *LightOps[k], CG_ladder_deriv, CG_action));
+    }
+    RatioPF.back()->is_smeared = true;
+  }
+  std::cout << GridLogMessage << "Built " << n_pf << " Schur ratio PF levels." << std::endl;
+
   // Strange quark (Nf=1): EO-preconditioned LogDet + Schur RHMC.
   // MD force uses mixed-precision multishift CG (SP inner + DP reliable).
   WCF StrangeFermOp(Umu, Grid, RBGrid, mass_strange, csw, csw,
@@ -482,6 +661,14 @@ int main(int argc, char **argv) {
     qp.tol = cg_tol;
     qp.max_iter = cg_max;
     qp.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    // QUDA_FORCE_RECON_NO=1 → reconstruct_sloppy = NO (full links). REQUIRED at
+    // 48^3: the antiperiodic-t phase is baked in by negating the last-timeslice
+    // time links (det=-1, not SU(3)); RECONSTRUCT_12 (the default) mis-rebuilds
+    // the 3rd row of those links (it assumes det=+1), corrupting the sloppy
+    // solve. Ported from gen_qcd_hasenbusch_tune_compact_schur.cc (memory
+    // quda-strange-recon-fix) -- this driver's strange QUDA path never had it.
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp.recon_sloppy = QUDA_RECONSTRUCT_NO;
     StrangeSchurPF_qudaHolder = std::make_unique<
         OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF>>(
         StrangeFermOp, StrangeFermOpF, &RBGridF, strange_rat, qp, 50);
@@ -545,6 +732,7 @@ int main(int argc, char **argv) {
   ActionLevel<LatticeGaugeField, Reps> L1(1);
   ActionLevel<LatticeGaugeField, Reps> L2(std::max(1, gauge_inner_mult));
   L1.push_back(&LightLogDet);
+  for (auto &pf : RatioPF) L1.push_back(pf.get());
   L1.push_back(&LightSchurPF);
   L1.push_back(&StrangeLogDet);
   L1.push_back(&StrangeSchurPF);
@@ -612,17 +800,17 @@ int main(int argc, char **argv) {
     const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
     const bool skip_light   = std::getenv("FORCES_SKIP_LIGHT")   != nullptr;  // LogDet + Schur PF
     struct Ref { std::string name; Action<LatticeGaugeField> *act; };
-    std::vector<Ref> refs = {
-        {"LightLogDet",    &LightLogDet},
-        {"LightSchurPF",   &LightSchurPF},
-        {"StrangeLogDet",  &StrangeLogDet},
-        {"StrangeSchurPF", &StrangeSchurPF},
-        {"Gauge",          &GaugeAction}
-    };
+    std::vector<Ref> refs = {{"LightLogDet", &LightLogDet}};
+    for (int k = 0; k < n_pf; ++k)
+      refs.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
+    refs.push_back({"LightSchurPF",   &LightSchurPF});
+    refs.push_back({"StrangeLogDet",  &StrangeLogDet});
+    refs.push_back({"StrangeSchurPF", &StrangeSchurPF});
+    refs.push_back({"Gauge",          &GaugeAction});
     auto skip = [&](const std::string &nm) {
       return (skip_strange && (nm == "StrangeSchurPF" || nm == "StrangeLogDet")) ||
              (skip_gauge && nm == "Gauge") ||
-             (skip_light && (nm == "LightLogDet" || nm == "LightSchurPF"));
+             (skip_light && (nm == "LightLogDet" || nm == "LightSchurPF" || nm.rfind("PF", 0) == 0));
     };
     LatticeGaugeField force(&Grid);
     const int nref = (int)refs.size();
@@ -695,13 +883,15 @@ int main(int argc, char **argv) {
   ckpt.rng_prefix = cfg_dir + "/ckpoint_rng";
   ckpt.interval   = meas_skip;
 
-  QcdDiag diag(cfg_dir + "/hmc_diagnostics", meas_skip, {
-      {"LightLogDet", &LightLogDet},
-      {"LightSchurPF", &LightSchurPF},
-      {"StrangeLogDet", &StrangeLogDet},
-      {"StrangeSchurPF", &StrangeSchurPF},
-      {"Gauge", &GaugeAction}
-  }, Smear, Grid, RBGrid, pRNG);
+  std::vector<QcdDiag::ActionRef> diagActions = {{"LightLogDet", &LightLogDet}};
+  for (int k = 0; k < n_pf; ++k)
+    diagActions.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
+  diagActions.push_back({"LightSchurPF", &LightSchurPF});
+  diagActions.push_back({"StrangeLogDet", &StrangeLogDet});
+  diagActions.push_back({"StrangeSchurPF", &StrangeSchurPF});
+  diagActions.push_back({"Gauge", &GaugeAction});
+  QcdDiag diag(cfg_dir + "/hmc_diagnostics", meas_skip, diagActions,
+               Smear, Grid, RBGrid, pRNG);
 
   // Pure-HMC timing build: QcdDiag does per-trajectory stochastic VEV solves
   // (+ optional eig + HDF5 dump) — non-MD work that pollutes wall/traj.
@@ -987,10 +1177,12 @@ int main(int argc, char **argv) {
 
     std::vector<std::pair<std::string, Action<LatticeGaugeField>*>> actions = {
         {"PlaqRect",      &GaugeAction},
-        {"LightLogDet",   &LightLogDet},
-        {"LightSchurPF",  &LightSchurPF},
-        {"StrangeLogDet", &StrangeLogDet},
-        {"StrangeSchurPF", &StrangeSchurPF}};
+        {"LightLogDet",   &LightLogDet}};
+    for (int k = 0; k < n_pf; ++k)
+      actions.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
+    actions.push_back({"LightSchurPF",  &LightSchurPF});
+    actions.push_back({"StrangeLogDet", &StrangeLogDet});
+    actions.push_back({"StrangeSchurPF", &StrangeSchurPF});
     if (fd_noneo) actions.push_back({"LightTwoFlNonEO", LightTwoFlNonEO.get()});
 
     // FD_NO_SMEAR=1 disables stout smearing on all fermion actions for the
@@ -1001,6 +1193,7 @@ int main(int argc, char **argv) {
       LightSchurPF.is_smeared = false;
       StrangeLogDet.is_smeared = false;
       StrangeSchurPF.is_smeared = false;
+      for (auto &pf : RatioPF) pf->is_smeared = false;
       std::cout << GridLogMessage << "[FD] FD_NO_SMEAR=1 — fermion is_smeared=false" << std::endl;
     }
 
