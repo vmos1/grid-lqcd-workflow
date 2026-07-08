@@ -58,6 +58,7 @@
 #include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
 #ifdef GRID_HAVE_QUDA
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
+#include <Grid/algorithms/iterative/QudaCloverInverter.h>
 #endif
 
 using namespace Grid;
@@ -88,6 +89,101 @@ class MixedPrecCGWrapper : public OperatorFunction<FieldD> {
   GridBase *rbgrid_f_;
   SchurOpD &schur_d_; SchurOpF &schur_f_;
 };
+
+#ifdef GRID_HAVE_QUDA
+// ---------------------------------------------------------------------------
+// TwoFlavourRatioQuda — full-operator Hasenbusch ratio with ALL fermion solves
+// (heatbath/refresh, action/S, force/deriv) routed through QudaCloverInverter
+// (QUDA-CG).  Self-contained reimplementation of the stock
+// TwoFlavourRatioPseudoFermionAction (whose Phi/NumOp/DenOp/solvers are private)
+// so we can use the CORRECT per-mass inverter in each phase:
+//   refresh : solves (V†V)^-1 on the NumOp (HEAVIER) mass   -> qnum_
+//   S, deriv: solve  (M†M)^-1 on the DenOp (LIGHTER) mass   -> qden_
+// Each inverter is SetGauge'd to the current gauge before use.  The inverters
+// MUST be configured solve_type=NORMOP_SOLVE + solution_type=MATDAG_MAT so QUDA
+// returns the full-volume (M†M)^-1 (the matrix-vector products M/Mdag/MDeriv use
+// the Grid operators; only the inversion goes through QUDA).
+//
+// Subclasses the stock action only to slot into the existing action container;
+// the base members are unused (we override refresh/S/deriv and carry our Phi_).
+// Body mirrors Grid's TwoFlavourRatio.h exactly, with the solver call replaced.
+// ---------------------------------------------------------------------------
+template <class Impl>
+class TwoFlavourRatioQuda : public TwoFlavourRatioPseudoFermionAction<Impl> {
+ public:
+  INHERIT_IMPL_TYPES(Impl);
+  typedef TwoFlavourRatioPseudoFermionAction<Impl> Base;
+
+  TwoFlavourRatioQuda(FermionOperator<Impl> &NumOp,
+                      FermionOperator<Impl> &DenOp,
+                      QudaCloverInverter &qinv_num,   // NumOp (heavier) mass
+                      QudaCloverInverter &qinv_den,   // DenOp (lighter) mass
+                      OperatorFunction<FermionField> &dummyDS,
+                      OperatorFunction<FermionField> &dummyAS)
+      : Base(NumOp, DenOp, dummyDS, dummyAS),
+        NumOp_(NumOp), DenOp_(DenOp),
+        qnum_(qinv_num), qden_(qinv_den),
+        Phi_(NumOp.FermionGrid()) {}
+
+  std::string action_name() override { return "TwoFlavourRatioQuda"; }
+
+  void refresh(const GaugeField &U, GridSerialRNG &, GridParallelRNG &pRNG) override {
+    RealD scale = std::sqrt(0.5);
+    FermionField eta(NumOp_.FermionGrid());
+    FermionField tmp(NumOp_.FermionGrid());
+    gaussian(pRNG, eta);
+    NumOp_.ImportGauge(U);
+    DenOp_.ImportGauge(U);
+    qnum_.SetGauge(U);
+    MdagMLinearOperator<FermionOperator<Impl>, FermionField> MdagMOp(NumOp_);
+    DenOp_.Mdag(eta, Phi_);          // Mdag eta
+    tmp = Zero();
+    qnum_(MdagMOp, Phi_, tmp);       // (V†V)^-1 Mdag eta   [NumOp]
+    NumOp_.M(tmp, Phi_);             // V†^-1 Mdag eta
+    Phi_ = Phi_ * scale;
+  }
+
+  RealD S(const GaugeField &U) override {
+    NumOp_.ImportGauge(U);
+    DenOp_.ImportGauge(U);
+    qden_.SetGauge(U);
+    FermionField X(NumOp_.FermionGrid());
+    FermionField Y(NumOp_.FermionGrid());
+    MdagMLinearOperator<FermionOperator<Impl>, FermionField> MdagMOp(DenOp_);
+    NumOp_.Mdag(Phi_, Y);            // Y = V† phi
+    X = Zero();
+    qden_(MdagMOp, Y, X);            // X = (M†M)^-1 V† phi  [DenOp]
+    DenOp_.M(X, Y);                  // Y = M†^-1 V† phi
+    return norm2(Y);
+  }
+
+  void deriv(const GaugeField &U, GaugeField &dSdU) override {
+    NumOp_.ImportGauge(U);
+    DenOp_.ImportGauge(U);
+    qden_.SetGauge(U);
+    FermionField X(NumOp_.FermionGrid());
+    FermionField Y(NumOp_.FermionGrid());
+    GaugeField force(NumOp_.GaugeGrid());
+    MdagMLinearOperator<FermionOperator<Impl>, FermionField> MdagMOp(DenOp_);
+    NumOp_.Mdag(Phi_, Y);            // Y = V† phi
+    X = Zero();
+    qden_(MdagMOp, Y, X);            // X = (M†M)^-1 V† phi  [DenOp]
+    DenOp_.M(X, Y);                  // Y = M†^-1 V† phi
+    NumOp_.MDeriv(force, X, Phi_, DaggerYes);  dSdU = force;
+    NumOp_.MDeriv(force, Phi_, X, DaggerNo );  dSdU = dSdU + force;
+    DenOp_.MDeriv(force, Y, X, DaggerNo );     dSdU = dSdU - force;
+    DenOp_.MDeriv(force, X, Y, DaggerYes);     dSdU = dSdU - force;
+    dSdU *= -1.0;
+  }
+
+ private:
+  FermionOperator<Impl> &NumOp_;
+  FermionOperator<Impl> &DenOp_;
+  QudaCloverInverter &qnum_;
+  QudaCloverInverter &qden_;
+  FermionField Phi_;
+};
+#endif  // GRID_HAVE_QUDA
 
 // ---------------------------------------------------------------------------
 // ForceNormObserver: prints one grep-able FORCES line per trajectory.
@@ -283,8 +379,76 @@ int main(int argc, char **argv) {
   //   constructor: TwoFlavourRatioPseudoFermionAction(NumOp=heavy, DenOp=light, ...)
   //   represents det(DenOp=light)^2 / det(NumOp=heavy)^2
   int n_pf = n_ops - 1;
+
+  // QUDA_LIGHT=1 → route each Hasenbusch rung's FORCE (deriv) solve through a
+  // QudaCloverInverter (QUDA-CG; add QUDA_LIGHT_MG=1 for multigrid).  One
+  // inverter per rung, at that rung's DenOp (lighter) mass = ladder[k].  The
+  // accept/reject + heatbath solves stay on Grid CG (infrequent).  Built once,
+  // re-SetGauge'd every MD step inside TwoFlavourRatioQudaMP::deriv().
+#ifdef GRID_HAVE_QUDA
+  const bool quda_light = (std::getenv("QUDA_LIGHT") != nullptr);
+  std::vector<std::unique_ptr<QudaCloverInverter>> LightQuda;
+  if (quda_light) {
+    Quda::initialize(/*device=*/-1, /*mpi_dims=*/nullptr, LightOps[0]->GaugeGrid());
+    const bool quda_light_mg = (std::getenv("QUDA_LIGHT_MG") != nullptr);
+    for (int i = 0; i < n_ops; ++i) {       // one inverter per ladder mass
+      QudaCloverParams qp_l;
+      qp_l.mass = ladder[i];
+      qp_l.csw  = csw;
+      qp_l.anti_periodic_t = true;
+      qp_l.tol = cg_tol_drv;
+      qp_l.max_iter = cg_max;
+      qp_l.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+      // 48^3 antiperiodic-t: the boundary time links carry the baked-in -1
+      // (det=-1); RECONSTRUCT_12 mis-rebuilds them.  Use full links (same as
+      // the strange QUDA_FORCE_RECON_NO note above).
+      if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+        qp_l.recon_sloppy = QUDA_RECONSTRUCT_NO;
+      if (quda_light_mg) {
+        qp_l.use_multigrid = true;
+        if (const char *nlv = std::getenv("MG_NLEVEL")) qp_l.mg.n_level = std::atoi(nlv);
+        if (const char *nv  = std::getenv("MG_NVEC"))   qp_l.mg.n_vec   = std::atoi(nv);
+        // geo_block_size kept at QudaMgUserParams defaults unless tuned later.
+      }
+      LightQuda.emplace_back(std::make_unique<QudaCloverInverter>(
+          LightOps[i]->GaugeGrid(), qp_l));
+      // The ratio deriv needs the FULL-volume (M†M)^-1 Y (base TwoFlavourRatio
+      // solves the full MdagM, not the Schur complement).  QudaCloverInverter
+      // defaults to returning M^-1 via an EO-preconditioned normal solve
+      // (NORMOP_PC + MAT).  For CG, switch to the UNPRECONDITIONED normal
+      // equations: QUDA rejects MATDAG_MAT_SOLUTION unless solve_type is
+      // unpreconditioned (check_params.h: "Unpreconditioned MATDAG_MAT ...
+      // requires an unpreconditioned solve_type").
+      if (!quda_light_mg) {
+        LightQuda.back()->InvertParam().solve_type    = QUDA_NORMOP_SOLVE;
+        LightQuda.back()->InvertParam().solution_type = QUDA_MATDAG_MAT_SOLUTION;
+      } else {
+        // MG path returns M^-1 (DIRECT_SOLVE + MAT).  Forming (M†M)^-1 from it
+        // needs a two-solve γ5 refactor (see TwoFlavourSchurCloverQudaForceActionMP) —
+        // NOT yet wired, so the MG force is unvalidated.  CG first.
+        std::cout << GridLogMessage << "[Light] WARNING: QUDA_LIGHT_MG force is "
+                     "NOT yet (M†M)^-1-correct (needs two-solve refactor)." << std::endl;
+      }
+    }
+    std::cout << GridLogMessage << "[Light] QUDA_LIGHT active — "
+              << (quda_light_mg ? "QUDA-MG" : "QUDA-CG")
+              << " for ALL light solves (refresh+action+force), "
+              << n_ops << " per-mass inverters." << std::endl;
+  }
+#endif
+
   std::vector<std::unique_ptr<TwoFlavourRatioPseudoFermionAction<WilsonImplR>>> RatioPF;
   for (int k = 0; k < n_pf; ++k) {
+#ifdef GRID_HAVE_QUDA
+    if (quda_light) {
+      RatioPF.emplace_back(
+          std::make_unique<TwoFlavourRatioQuda<WilsonImplR>>(
+              *LightOps[k+1], *LightOps[k],
+              *LightQuda[k+1], *LightQuda[k], CG_deriv, CG_action));
+      RatioPF.back()->is_smeared = true;
+      continue;
+    }
+#endif
     RatioPF.emplace_back(
         std::make_unique<TwoFlavourRatioPseudoFermionAction<WilsonImplR>>(
             *LightOps[k+1],  // NumOp = heavier mass
