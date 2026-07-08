@@ -573,6 +573,8 @@ int main(int argc, char **argv) {
           qp_mg.mg.setup_maxiter_refresh = std::atoi(r);
         if (const char *r = std::getenv("HMC_MG_REBUILD_EVERY"))
           qp_mg.mg.rebuild_every = std::atoi(r);
+        // HMC_MG_REFRESH_EVERY / HMC_MG_THRESHOLD_COUNT / HMC_MG_RSD_TOL_FACTOR
+        applyHmcMgCadenceEnv(qp_mg.mg);
         QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
       } else {
         QudaRungSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);

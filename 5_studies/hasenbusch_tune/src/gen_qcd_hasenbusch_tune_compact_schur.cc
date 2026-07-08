@@ -18,7 +18,9 @@
 //          capped by a bare-det tail at the heaviest ladder mass, matching the
 //          Chroma cfg_2000 action (no Pauli-Villars).
 // Prints a "FORCES traj=N ..." line per trajectory for easy grep + analysis.
-// No HDF5 output, no checkpoint management — designed for short tuning runs.
+// Checkpointing (2026-07-08, roadmap D): opt-in via CKPT_DIR — per-trajectory
+// ILDG .lime config + RNG state, with CKPT_RESUME_TRAJ stream resume.  Unset =
+// the original no-output tuning behavior.  See the Checkpointer block in main.
 //
 // Key env vars:
 //   HASEN_LADDER   Comma-separated masses light→heavy, e.g.
@@ -233,14 +235,71 @@ int main(int argc, char **argv) {
   std::cout << std::endl;
 
   // ── RNG ───────────────────────────────────────────────────────────────────
+  // HMC_SEED_OFFSET=k shifts every seed integer by k, giving an independent
+  // momentum/pseudofermion stream. Unset/0 = the historical fixed seeds, so
+  // all previous runs stay bit-reproducible.
   GridSerialRNG   sRNG;
   GridParallelRNG pRNG(&Grid_);
-  sRNG.SeedFixedIntegers({11, 12, 13, 14, 15});
-  pRNG.SeedFixedIntegers({16, 17, 18, 19, 20});
+  int seed_off = 0;
+  if (const char *so = std::getenv("HMC_SEED_OFFSET")) seed_off = std::atoi(so);
+  if (seed_off)
+    std::cout << GridLogMessage << "HMC_SEED_OFFSET=" << seed_off << std::endl;
+  sRNG.SeedFixedIntegers({11 + seed_off, 12 + seed_off, 13 + seed_off,
+                          14 + seed_off, 15 + seed_off});
+  pRNG.SeedFixedIntegers({16 + seed_off, 17 + seed_off, 18 + seed_off,
+                          19 + seed_off, 20 + seed_off});
+
+  // ── Checkpointer (roadmap D: config I/O) ──────────────────────────────────
+  // CKPT_DIR=<dir> enables per-trajectory checkpointing via Grid's stock
+  // ILDGHmcCheckpointer: gauge -> <dir>/ckpoint_lat.<traj> (ILDG .lime,
+  // readable back through this driver's own IMPORT_CFG path and by Chroma
+  // tooling), full RNG state (serial+parallel) -> <dir>/ckpoint_rng.<traj>.
+  // Unset = no checkpointing — the old behavior (accepted configs are lost).
+  //   CKPT_INTERVAL=<n>     save every n-th trajectory (default 1).
+  //   CKPT_START_TRAJ=<n>   trajectory-numbering offset for a FRESH start from
+  //                         IMPORT_CFG (e.g. 2000 -> first save ckpoint_lat.2001).
+  //   CKPT_RESUME_TRAJ=<n>  resume a stream: restore gauge + BOTH RNGs from
+  //                         <dir>/ckpoint_{lat,rng}.<n> (IMPORT_CFG ignored, the
+  //                         fixed seeds above overwritten) and continue at n+1.
+  // Checkpoints are written after EVERY trajectory incl. rejects (the RNG state
+  // must advance for stream continuity; a rejected trajectory re-saves the
+  // reverted gauge field with the post-reject RNG).
+  std::unique_ptr<ILDGHmcCheckpointer<PeriodicGimplR>> Ckpt;
+  int ckpt_start = 0;
+  if (const char *cd = std::getenv("CKPT_DIR"); cd && *cd) {
+    CheckpointerParameters cp;
+    cp.config_prefix  = std::string(cd) + "/ckpoint_lat";
+    cp.smeared_prefix = std::string(cd) + "/ckpoint_lat_smr";
+    cp.rng_prefix     = std::string(cd) + "/ckpoint_rng";
+    cp.saveInterval   = 1;
+    if (const char *ci = std::getenv("CKPT_INTERVAL"); ci && *ci)
+      cp.saveInterval = std::atoi(ci);
+    cp.saveSmeared    = false;
+    cp.format         = "IEEE64BIG";
+    Ckpt = std::make_unique<ILDGHmcCheckpointer<PeriodicGimplR>>(cp);
+    std::cout << GridLogMessage << "[Ckpt] CKPT_DIR=" << cd
+              << " interval=" << cp.saveInterval << std::endl;
+  }
+  if (const char *st = std::getenv("CKPT_START_TRAJ"); st && *st)
+    ckpt_start = std::atoi(st);
+  int ckpt_resume = -1;
+  if (const char *rt = std::getenv("CKPT_RESUME_TRAJ"); rt && *rt)
+    ckpt_resume = std::atoi(rt);
+  if (ckpt_resume >= 0 && !Ckpt) {
+    std::cout << GridLogMessage
+              << "FATAL: CKPT_RESUME_TRAJ requires CKPT_DIR." << std::endl;
+    Grid_finalize();
+    return 1;
+  }
 
   // ── Gauge field ───────────────────────────────────────────────────────────
   LatticeGaugeField Umu(&Grid_);
-  if (const char *ic = std::getenv("IMPORT_CFG"); ic && *ic) {
+  if (ckpt_resume >= 0) {
+    std::cout << GridLogMessage << "[Ckpt] CKPT_RESUME_TRAJ=" << ckpt_resume
+              << " — restoring gauge + RNG state (IMPORT_CFG ignored)" << std::endl;
+    Ckpt->CheckpointRestore(ckpt_resume, Umu, sRNG, pRNG);
+    ckpt_start = ckpt_resume;
+  } else if (const char *ic = std::getenv("IMPORT_CFG"); ic && *ic) {
     std::cout << GridLogMessage << "IMPORT_CFG=" << ic << std::endl;
     FILE *fp = std::fopen(ic, "rb"); char magic[16] = {0};
     if (fp) { std::fread(magic, 1, sizeof(magic), fp); std::fclose(fp); }
@@ -446,6 +505,8 @@ int main(int argc, char **argv) {
           qp_mg.mg.setup_maxiter_refresh = std::atoi(r);
         if (const char *r = std::getenv("HMC_MG_REBUILD_EVERY"))
           qp_mg.mg.rebuild_every = std::atoi(r);
+        // HMC_MG_REFRESH_EVERY / HMC_MG_THRESHOLD_COUNT / HMC_MG_RSD_TOL_FACTOR
+        applyHmcMgCadenceEnv(qp_mg.mg);
       }
       if (want_mg) {
         QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
@@ -596,58 +657,65 @@ int main(int argc, char **argv) {
   }
   Action<LatticeGaugeField> &StrangeSchurPF = *StrangePtr;
 
-  // LW gauge action matching Chroma's LW_TREE_GAUGEACT with u0=1 (tree-level).
-  // params.h defaults u0=0.8326 for the collaborator's ensemble; override via U0=1.0.
+  // LW gauge action matching Chroma's LW_TREE_GAUGEACT: rect coeff
+  // -beta/(20 u0^2) with u0 = the tadpole factor the ENSEMBLE was generated
+  // with (embedded in each config's .lime XML) -- cl21 48^3 b6.3:
+  // 0.84570646270714; cl3 16^3 b6.1: 0.832605301399891.  U0 must be set per
+  // ensemble: a mismatch leaves the imported config off-shell and the gauge
+  // relaxation drift drives the near-critical light sector singular
+  // (tau~=0.15 blow-up, root-caused 2026-07-07, confirmed job 55645079).
+  // NOTE this local default (1.0) shadows params.h's u0 default (0.8326) --
+  // never rely on either; scripts set U0 explicitly.
   const RealD u0_ens = TXQCDProduction::detail::env_real("U0", 1.0);
   PlaqPlusRectangleAction<PeriodicGimplR> GaugeAction(beta, -beta / (20.0 * u0_ens * u0_ens));
   GaugeAction.is_smeared = false;
+  std::cout << GridLogMessage << std::setprecision(15)
+            << "[Action] BETA=" << beta << " U0=" << u0_ens
+            << " rect_coeff=" << -beta / (20.0 * u0_ens * u0_ens)
+            << " CSW=" << csw
+            << " MASS_LIGHT=" << mass_light
+            << " MASS_STRANGE=" << mass_strange
+            << std::setprecision(6) << std::endl;
 
-  // ── Integrator: 3-level strange / light / gauge, env-configurable ────────
-  // Tuned-ladder force table (RMS / max), mass-independent except PF*/Tail:
-  //   Gauge   6.88 / 10.4  (stiff, cheap)         -> finest, sub-stepped
-  //   Tail    0.835 / 2.5  PF0-3 0.2-0.43         -> light fermion band
-  //   Strange 0.62 / 2.2   (soft, but 373s solve) -> 2.4x the light solve cost
+  // ── Integrator: 2-level fermions / gauge, matching Chroma ────────────────
+  // ALL fermion monomials (strange RHMC + both logdets + light ladder + tail)
+  // share the top level -- Chroma's production grouping (rat_strange + has0-3
+  // + logdets at n_steps; only cancel+gauge finer).  In Grid's nested scheme
+  // a child level always runs 2 x multiplier x its parent's steps (each
+  // parent step recurses into the child once per drift slot -- same
+  // convention as Chroma's lcm_sts_*_recursive), so
+  //   gauge steps/traj = MDSTEPS x 2 x GAUGE_INNER_MULT.
+  //   GAUGE_INNER_MULT=2 (default) at MDSTEPS=12 reproduces Chroma's
+  //   12x2x2=48-step inner level exactly.
+  // The earlier 3-level strange/light/gauge layout was dropped 2026-07-06:
+  // it silently ran the light ladder 2x finer than strange (the recursion
+  // factor -- no multiplier setting avoids it), i.e. 2x the light-sector
+  // force solves for nothing Chroma needs.  Re-add later, if profiling ever
+  // justifies it, by giving the light actions their own ActionLevel again.
+  // See docs/2026_7_6_integrator_step_accounting_summary.md.
   //
-  // One general 3-level structure (coarsest=strange, then light, finest=gauge)
-  // with two integer knobs:
-  //   LIGHT_INNER_MULT (=1): light sub-steps per strange step.
-  //       =1 -> strange co-stepped with light (forces are ~equal, so this is
-  //             the force-balanced choice; same step counts/cost as a flat
-  //             2-level fermion/gauge integrator).
-  //       =2 -> strange evaluated half as often: its force allows ~its own
-  //             rate, and its 373s solve is 2.4x the light's, so coarsening it
-  //             can be a net win despite a small acceptance hit.  Decide by
-  //             measured time/traj / acceptance, not by the proxy.
-  //   GAUGE_INNER_MULT (=4): gauge sub-steps per light step.  Only gauge is
-  //       well separated in force (sqrt(6.88/0.835) ~ 3).  =1 collapses gauge
-  //       to the light rate (toward single-timescale) for an A/B baseline.
-  //
-  // Correctness: each action term is in exactly one level; the Metropolis test
-  // keeps the sampled distribution exact for any multipliers -- only the
+  // Correctness: each action term is in exactly one level; the Metropolis
+  // test keeps the sampled distribution exact for any multipliers -- only
   // acceptance/efficiency changes.
-  int gauge_mult = 4;
+  int gauge_mult = 2;
   if (const char *gm = std::getenv("GAUGE_INNER_MULT"); gm && *gm) gauge_mult = std::atoi(gm);
-  int light_mult = 1;
-  if (const char *lm = std::getenv("LIGHT_INNER_MULT"); lm && *lm) light_mult = std::atoi(lm);
   std::cout << GridLogMessage
-            << "Integrator: 3-level strange/light/gauge  LIGHT_INNER_MULT="
-            << light_mult << " GAUGE_INNER_MULT=" << gauge_mult << std::endl;
+            << "Integrator: 2-level (strange+light)/gauge  GAUGE_INNER_MULT="
+            << gauge_mult << std::endl;
 
   typedef Representations<EmptyRep<LatticeGaugeField>> Reps;
-  ActionLevel<LatticeGaugeField, Reps> Lstrange(1);          // coarsest
-  ActionLevel<LatticeGaugeField, Reps> Llight(light_mult);
-  ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);   // finest
+  ActionLevel<LatticeGaugeField, Reps> Lferm(1);             // top: all fermions
+  ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);   // finest: gauge
 
-  Lstrange.push_back(&StrangeSchurPF);
-  Lstrange.push_back(&StrangeLogDet);
-  Llight.push_back(&LightLogDet);
-  for (auto &pf : RatioPF) Llight.push_back(pf.get());
-  Llight.push_back(&LightTailSchur);
+  Lferm.push_back(&StrangeSchurPF);
+  Lferm.push_back(&StrangeLogDet);
+  Lferm.push_back(&LightLogDet);
+  for (auto &pf : RatioPF) Lferm.push_back(pf.get());
+  Lferm.push_back(&LightTailSchur);
   Lgauge.push_back(&GaugeAction);
 
   ActionSet<LatticeGaugeField, Reps> Aset;
-  Aset.push_back(Lstrange);   // coarsest pushed first
-  Aset.push_back(Llight);
+  Aset.push_back(Lferm);      // coarsest pushed first
   Aset.push_back(Lgauge);
 
   // ── Stout smearing ────────────────────────────────────────────────────────
@@ -768,8 +836,16 @@ int main(int argc, char **argv) {
   }
 
   // ── HMC ──────────────────────────────────────────────────────────────────
+  // INTEGRATOR env var: "MinimumNorm2" (default, 2nd order) or "ForceGradient"
+  // (4th order -- the equivalent of Chroma's LCM_STS_FORCE_GRAD, tolerating
+  // ~2-3x larger steps at the same acceptance).  Same convention as
+  // gen_qcd_cfgs_2plus1.cc.
+  std::string integrator_name = "MinimumNorm2";
+  if (const char *env = std::getenv("INTEGRATOR"); env && *env)
+    integrator_name = env;
+  std::cout << GridLogMessage << "INTEGRATOR=" << integrator_name << std::endl;
   IntegratorParameters MD;
-  MD.name = "MinimumNorm2"; MD.MDsteps = mdsteps;
+  MD.name = integrator_name; MD.MDsteps = mdsteps;
   // TRAJL has no default and is validated at startup (see the mandatory check
   // above), so it is guaranteed present here.
   MD.trajL = std::atof(std::getenv("TRAJL"));
@@ -783,7 +859,10 @@ int main(int argc, char **argv) {
   std::cout << GridLogMessage << "NoMetropolisUntil=" << no_metrop << std::endl;
 
   HMCparameters HMCp;
-  HMCp.StartTrajectory    = 0;
+  // StartTrajectory sets the numbering the checkpointer saves under (evolve
+  // saves traj+1): 0 unless CKPT_START_TRAJ (fresh numbered stream) or
+  // CKPT_RESUME_TRAJ (continue at n+1) was given.
+  HMCp.StartTrajectory    = ckpt_start;
   HMCp.Trajectories       = n_traj;
   HMCp.NoMetropolisUntil  = no_metrop;
   HMCp.MetropolisTest     = true;
@@ -796,12 +875,25 @@ int main(int argc, char **argv) {
   PlaquetteLogger<PeriodicGimplR> plaqLog;
   PolyakovLogger<PeriodicGimplR>  polyLog;
   std::vector<HmcObservable<LatticeGaugeField> *> Obs = {&ForceObs, &plaqLog, &polyLog};
+  // Checkpointer runs last so the per-trajectory measurement lines land in the
+  // log before the "Written ILDG Configuration" lines.
+  if (Ckpt) Obs.push_back(Ckpt.get());
 
-  typedef MinimumNorm2<PeriodicGimplR,
-                       SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
-  IntT MDyn(&Grid_, MD, Aset, Smear);
-  HybridMonteCarlo<IntT> HMC(HMCp, MDyn, sRNG, pRNG, Obs, Umu);
-  HMC.evolve();
+  // Branch on integrator.  Both types compiled, chosen at runtime (mirrors
+  // gen_qcd_cfgs_2plus1.cc).
+  if (integrator_name == "ForceGradient") {
+    typedef ForceGradient<PeriodicGimplR,
+                          SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
+    IntT MDyn(&Grid_, MD, Aset, Smear);
+    HybridMonteCarlo<IntT> HMC(HMCp, MDyn, sRNG, pRNG, Obs, Umu);
+    HMC.evolve();
+  } else {
+    typedef MinimumNorm2<PeriodicGimplR,
+                         SmearedConfiguration<PeriodicGimplR>, Reps> IntT;
+    IntT MDyn(&Grid_, MD, Aset, Smear);
+    HybridMonteCarlo<IntT> HMC(HMCp, MDyn, sRNG, pRNG, Obs, Umu);
+    HMC.evolve();
+  }
 
   std::cout << GridLogMessage << "Hasenbusch tuning run complete." << std::endl;
   Grid_finalize();
