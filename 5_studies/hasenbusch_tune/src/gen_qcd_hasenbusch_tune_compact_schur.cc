@@ -27,6 +27,14 @@
 //                  "-0.2416,-0.2400,-0.2320,-0.2180,-0.1870"
 //                  Lightest must equal MASS_LIGHT. Heaviest entry is the
 //                  bare-det tail mass (no Pauli-Villars is appended).
+//   HASEN_TAIL_LEVEL  "outer" (default) = tail integrates with the ladder
+//                  rungs; "inner" = tail on the fine gauge level — Chroma's
+//                  actual has_cancel_2flav placement (cfg_2000 XML puts it in
+//                  the inner n_steps=2 sub-integrator WITH lw_tree_gauge).
+//   HASEN_QUDA_CG_TAIL  Set to 1 to run the tail's deriv (cg_tol_drv) and
+//                  action (cg_tol_act) solves through plain QUDA CG instead of
+//                  Grid mixed-precision CG.  The tail heatbath needs no solve
+//                  (phi = Mpc^dag eta), so it has no QUDA variant.
 //   N_TRAJ         Number of trajectories (default 5)
 //   MDSTEPS        MD steps per trajectory (default 20)
 //   IMPORT_CFG     Path to starting gauge config (NERSC or Chroma LIME)
@@ -64,6 +72,8 @@
 #ifdef GRID_HAVE_QUDA
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioQudaForceAction.h>
+#include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverQudaForceTailAction.h>
 #include <Grid/algorithms/iterative/QudaMGSchurSolver.h>
 #include <Grid/algorithms/iterative/QudaCGSchurSolver.h>
 #endif
@@ -115,6 +125,46 @@ class TwoFlavourSchurCloverActionMP
   FermOpF &opF_;
 };
 }  // namespace Grid
+
+// ---------------------------------------------------------------------------
+// Tail variant with QUDA-CG deriv/action solves (HASEN_QUDA_CG_TAIL=1).
+// Derives from the plain DP action (QUDA does its own precision handling, so
+// the SP-operator resync of the MP variant above is dead weight here) and
+// keeps the QUDA solvers' resident gauge in sync before each solve — the same
+// override pattern TwoFlavourSchurCloverRatioActionQuda uses for the ladder
+// rungs.  refresh() is untouched: the bare-det heatbath is an application
+// (phi = Mpc^dag eta), no solve.
+// ---------------------------------------------------------------------------
+#ifdef GRID_HAVE_QUDA
+namespace Grid {
+template <class ImplD, class FermOpD_>
+class TwoFlavourSchurCloverActionQudaTail
+    : public TwoFlavourSchurCloverAction<ImplD, FermOpD_> {
+ public:
+  typedef TwoFlavourSchurCloverAction<ImplD, FermOpD_> Base;
+  typedef typename ImplD::GaugeField GaugeField;
+
+  TwoFlavourSchurCloverActionQudaTail(typename Base::FermionOperator &opD,
+                                      QudaRungSolverBase &DS,
+                                      QudaRungSolverBase &AS)
+      : Base(opD, DS, AS), quda_ds_(DS), quda_as_(AS) {}
+
+  RealD S(const GaugeField &U) override {
+    quda_as_.SetGauge(U);
+    return Base::S(U);
+  }
+
+  void deriv(const GaugeField &U, GaugeField &dSdU) override {
+    quda_ds_.SetGauge(U);
+    Base::deriv(U, dSdU);
+  }
+
+ private:
+  QudaRungSolverBase &quda_ds_;
+  QudaRungSolverBase &quda_as_;
+};
+}  // namespace Grid
+#endif
 
 // ---------------------------------------------------------------------------
 // Mixed-precision CG wrapper — used for the strange RHMC force solver.
@@ -409,17 +459,27 @@ int main(int argc, char **argv) {
   //   TwoFlavourEvenOddRatio.h, which crashes here for clover).  The EE
   //   determinant is supplied separately by LightLogDet above (telescoping).
   // Small Δm → well-conditioned → DP CG (CG_deriv/CG_action) suffices (as in the full-op driver).
-  // Two independent QUDA hooks, same QudaMGSchurSolver.h wrapper (2-solve gamma5 trick is agnostic
+  // Three independent QUDA hooks, same QudaMGSchurSolver.h wrapper (2-solve gamma5 trick is agnostic
   // to which inner solver QudaCloverInverter runs):
-  //   HASEN_MG_RUNG=<k>          -- rung k's Mpc(DenOp) solve via QUDA MULTIGRID (use_multigrid=true).
+  //   HASEN_MG_RUNG=<csv>        -- these rungs' Mpc(DenOp) solve via QUDA MULTIGRID, each with its
+  //                                 OWN full MG setup (chroma's SEPARATE-SubspaceID pattern, e.g. its
+  //                                 subspace_mg at -0.187 next to mg_subspace at the light masses).
+  //                                 Multi-rung = one setup's time+GPU memory PER rung: check memory
+  //                                 headroom at 48^3 before listing more than one.
+  //   HASEN_MG_SHARED_RUNGS=<csv> -- these rungs solve at their own mass with a GCR outer
+  //                                 PRECONDITIONED BY the MG setup of the lowest-index HASEN_MG_RUNG
+  //                                 rung (chroma's SHARED-SubspaceID pattern: one setup at the
+  //                                 lightest mass serves the ladder).  Zero extra setup/memory; the
+  //                                 mass mismatch only costs outer GCR iterations, growing with the
+  //                                 distance from the donor mass -- LastIter/LastSecs per rung locate
+  //                                 the crossover mass where plain QUDA-CG wins.  Requires
+  //                                 HASEN_MG_RUNG to include a lower-index rung (the donor).
   //   HASEN_QUDA_CG_RUNGS=<csv>  -- these rungs' Mpc(DenOp) solve via plain QUDA CG (still GPU-side /
   //                                 faster than Grid's CG, no MG preconditioner setup cost) -- useful
   //                                 for the heavier, already-well-conditioned rungs where MG's extra
   //                                 setup isn't worth it but QUDA's CG throughput still helps.
-  // A rung may only be routed one way; HASEN_MG_RUNG takes precedence if both list the same rung.
-  // Both env vars accept a comma-separated list of rung indices (HASEN_MG_RUNG=0 or HASEN_MG_RUNG=0,1,2
-  // both work) so a single run can put MG on every rung at once, for a same-seed timing/force
-  // comparison against the Grid-CG and QUDA-CG passes.
+  // A rung may only be routed one way; precedence when the same rung is listed more than once:
+  // HASEN_MG_RUNG > HASEN_MG_SHARED_RUNGS > HASEN_QUDA_CG_RUNGS.  All accept comma-separated lists.
   int n_pf = n_ops - 1;
   std::vector<std::unique_ptr<Action<LatticeGaugeField>>> RatioPF;
 #ifdef GRID_HAVE_QUDA
@@ -443,12 +503,34 @@ int main(int argc, char **argv) {
     return out;
   };
   std::set<int> mg_rungs      = parse_rung_list("HASEN_MG_RUNG");
+  std::set<int> mg_shared_rungs = parse_rung_list("HASEN_MG_SHARED_RUNGS");
   std::set<int> quda_cg_rungs = parse_rung_list("HASEN_QUDA_CG_RUNGS");
   std::set<int> quda_cg_heatbath_rungs = parse_rung_list("HASEN_QUDA_CG_HEATBATH_RUNGS");
+  // HASEN_QUDA_FORCE_RUNGS=<csv|all> -- these rungs' force ASSEMBLY (the four
+  // hopping derivs + eight clover Cmunu derivs, the ~20 s/monomial floor at
+  // 48^3) runs on QUDA fused kernels (TwoFlavourSchurCloverRatioQudaForceAction,
+  // two Wilson+sigma calls per operator).  Orthogonal to the SOLVER routing
+  // above -- but v1 requires each listed rung to already be QUDA-routed, since
+  // the rung solver's SetGauge supplies the resident gauge the force calls use.
+  std::set<int> quda_force_rungs;
+  if (const char *v = std::getenv("HASEN_QUDA_FORCE_RUNGS"); v && *v) {
+    if (std::string(v) == "all") {
+      for (int k = 0; k < n_pf; ++k) quda_force_rungs.insert(k);
+    } else {
+      quda_force_rungs = parse_rung_list("HASEN_QUDA_FORCE_RUNGS");
+    }
+  }
+#ifdef GRID_HAVE_QUDA
+  // Donor for HASEN_MG_SHARED_RUNGS = the lowest-index own-MG rung, set when
+  // its solver is constructed below (loop runs k ascending, so the donor
+  // exists before any higher-index sharee is built).
+  QudaMGSchurSolver *mg_donor = nullptr;
+#endif
   for (int k = 0; k < n_pf; ++k) {
     bool want_mg = mg_rungs.count(k);
-    bool want_quda_cg = !want_mg && quda_cg_rungs.count(k);
-    if (want_mg || want_quda_cg) {
+    bool want_mg_shared = !want_mg && mg_shared_rungs.count(k);
+    bool want_quda_cg = !want_mg && !want_mg_shared && quda_cg_rungs.count(k);
+    if (want_mg || want_mg_shared || want_quda_cg) {
 #ifdef GRID_HAVE_QUDA
       QudaCloverParams qp_mg;
       qp_mg.mass = ladder[k];  // DenOp mass -- the rung being QUDA-accelerated
@@ -509,7 +591,19 @@ int main(int argc, char **argv) {
         applyHmcMgCadenceEnv(qp_mg.mg);
       }
       if (want_mg) {
-        QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+        auto s = std::make_unique<QudaMGSchurSolver>(LightOps[k]->GaugeGrid(), qp_mg, Odd);
+        if (mg_donor == nullptr) mg_donor = s.get();  // lowest-index own-MG rung donates
+        QudaRungSolver[k] = std::move(s);
+      } else if (want_mg_shared) {
+        // GCR at THIS rung's mass, preconditioned by the donor's MG setup
+        // (qp_mg.use_multigrid is false here, so no second setup is built).
+        if (mg_donor == nullptr) {
+          std::cerr << "HASEN_MG_SHARED_RUNGS=" << k
+                    << " needs a lower-index rung in HASEN_MG_RUNG (the MG donor).\n";
+          exit(1);
+        }
+        QudaRungSolver[k] = std::make_unique<QudaMGSchurSolver>(
+            LightOps[k]->GaugeGrid(), qp_mg, Odd, mg_donor);
       } else {
         // Plain QUDA-CG: QudaMGSchurSolver's zero-pad/gamma5 trick was only
         // ever validated for use_multigrid=true (MG's QUDA_DIRECT_SOLVE,
@@ -543,16 +637,39 @@ int main(int argc, char **argv) {
         std::cout << GridLogMessage << "[Ladder] rung " << k
                   << " HeatbathSolver = QUDA CG, mass=" << ladder[k+1] << std::endl;
       }
-      RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioActionQuda<WilsonImplR, WCF>>(
-          *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr));
+      if (quda_force_rungs.count(k)) {
+        // Force-assembly Path B: same solver wiring, deriv assembly on QUDA.
+        // qp_den = the rung's params (DenOp mass, already in qp_mg); qp_num =
+        // copy at NumOp's mass.  Both are parameter sources only (never
+        // solved/SetGauge'd) -- use_multigrid forced off inside the class.
+        QudaCloverParams qp_num = qp_mg;
+        qp_num.mass = ladder[k+1];
+        RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioQudaForceAction<WilsonImplR, WCF>>(
+            *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr,
+            qp_mg, qp_num));
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " FORCE ASSEMBLY = QUDA kernels (Wilson+sigma)" << std::endl;
+      } else {
+        RatioPF.emplace_back(std::make_unique<TwoFlavourSchurCloverRatioActionQuda<WilsonImplR, WCF>>(
+            *LightOps[k+1], *LightOps[k], *QudaRungSolver[k], *heatbath_solver_ptr));
+      }
       std::cout << GridLogMessage << "[Ladder] rung " << k
                 << " DerivativeSolver/ActionSolver = "
-                << (want_mg ? ("QUDA MG (" + std::to_string(qp_mg.mg.n_level) + " levels)") : std::string("QUDA CG"))
+                << (want_mg ? ("QUDA MG (" + std::to_string(qp_mg.mg.n_level) + " levels)")
+                    : want_mg_shared ? std::string("QUDA MG-shared (GCR at own mass, donor's setup)")
+                    : std::string("QUDA CG"))
                 << ", mass=" << ladder[k] << std::endl;
 #else
       std::cerr << "HASEN_MG_RUNG/HASEN_QUDA_CG_RUNGS require a QUDA build.\n"; exit(1);
 #endif
     } else {
+      if (quda_force_rungs.count(k)) {
+        std::cerr << "HASEN_QUDA_FORCE_RUNGS includes rung " << k
+                  << " but that rung is not QUDA-routed -- add it to HASEN_MG_RUNG / "
+                     "HASEN_MG_SHARED_RUNGS / HASEN_QUDA_CG_RUNGS first (v1 requires "
+                     "a QUDA rung solver for gauge residency).\n";
+        exit(1);
+      }
       RatioPF.emplace_back(
           std::make_unique<TwoFlavourSchurCloverRatioAction<WilsonImplR, WCF>>(
               *LightOps[k+1],  // NumOp = heavier mass
@@ -564,7 +681,11 @@ int main(int argc, char **argv) {
   std::cout << GridLogMessage << "Built " << n_pf << " Schur ratio PF levels." << std::endl;
 
   // Schur tail: det(Schur(ladder.back()))^2 as a single EO-Schur monomial, capping the chain.
-  // Mixed-precision MD force (SP inner + DP reliable), mirroring the 2+1 driver's LightSchurPF.
+  // Default = mixed-precision Grid MD force (SP inner + DP reliable), mirroring the 2+1
+  // driver's LightSchurPF.  HASEN_QUDA_CG_TAIL=1 swaps both tail solves (deriv at
+  // cg_tol_drv, action at cg_tol_act) to plain QUDA CG — the same QudaCGSchurSolver the
+  // ratio rungs use.  The tail heatbath is an application (phi = Mpc^dag eta, no solve),
+  // so it has no QUDA variant and stays identical across the two paths.
   int itail = n_ops - 1;
   SchurDifferentiableOperator<WilsonImplR> LightTailSchurD(*LightOps[itail]);
   SchurDifferentiableOperator<WilsonImplF> LightTailSchurF(*LightOpsF[itail]);
@@ -572,9 +693,69 @@ int main(int argc, char **argv) {
                      SchurDifferentiableOperator<WilsonImplR>,
                      SchurDifferentiableOperator<WilsonImplF>>
       CG_light_md(cg_tol_drv, cg_max, 50, &RBGridF, LightTailSchurD, LightTailSchurF);
-  TwoFlavourSchurCloverActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f> LightTailSchur(
-      *LightOps[itail], *LightOpsF[itail], CG_light_md, CG_action);
-  LightTailSchur.is_smeared = true;
+  std::unique_ptr<TwoFlavourSchurCloverActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
+      TailGrid;
+#ifdef GRID_HAVE_QUDA
+  std::unique_ptr<QudaCGSchurSolver> TailQudaDrvSolver, TailQudaActSolver;
+  std::unique_ptr<TwoFlavourSchurCloverActionQudaTail<WilsonImplR, WCF>> TailQuda;
+  std::unique_ptr<TwoFlavourSchurCloverQudaForceTailAction<WilsonImplR, WCF>> TailQudaForce;
+#endif
+  Action<LatticeGaugeField> *LightTailSchur = nullptr;
+  if (std::getenv("HASEN_QUDA_CG_TAIL") != nullptr) {
+#ifdef GRID_HAVE_QUDA
+    QudaCloverParams qp_tail;
+    qp_tail.mass = ladder[itail];
+    qp_tail.csw  = csw;
+    qp_tail.anti_periodic_t = true;
+    qp_tail.tol = cg_tol_drv;
+    qp_tail.max_iter = cg_max;
+    qp_tail.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    qp_tail.use_multigrid = false;
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp_tail.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    TailQudaDrvSolver = std::make_unique<QudaCGSchurSolver>(
+        LightOps[itail]->GaugeGrid(), qp_tail, Odd);
+    qp_tail.tol = cg_tol_act;  // S() feeds the Metropolis test — match CG_action's tol
+    TailQudaActSolver = std::make_unique<QudaCGSchurSolver>(
+        LightOps[itail]->GaugeGrid(), qp_tail, Odd);
+    if (std::getenv("HASEN_QUDA_FORCE_TAIL") != nullptr) {
+      // Force-assembly Path B for the tail: same QUDA-CG solvers, deriv
+      // assembly on QUDA fused kernels.  qp_tf is a parameter source only
+      // (tol/multigrid unused by the force calls).
+      QudaCloverParams qp_tf = qp_tail;
+      qp_tf.tol = cg_tol_drv;
+      TailQudaForce = std::make_unique<TwoFlavourSchurCloverQudaForceTailAction<WilsonImplR, WCF>>(
+          *LightOps[itail], *TailQudaDrvSolver, *TailQudaActSolver, qp_tf);
+      TailQudaForce->is_smeared = true;
+      LightTailSchur = TailQudaForce.get();
+      std::cout << GridLogMessage
+                << "[Ladder] tail FORCE ASSEMBLY = QUDA kernels (Wilson+sigma)"
+                << std::endl;
+    } else {
+      TailQuda = std::make_unique<TwoFlavourSchurCloverActionQudaTail<WilsonImplR, WCF>>(
+          *LightOps[itail], *TailQudaDrvSolver, *TailQudaActSolver);
+      TailQuda->is_smeared = true;
+      LightTailSchur = TailQuda.get();
+    }
+    std::cout << GridLogMessage
+              << "[Ladder] tail DerivativeSolver/ActionSolver = QUDA CG, mass="
+              << ladder[itail] << std::endl;
+#else
+    std::cerr << "HASEN_QUDA_CG_TAIL requires a QUDA build.\n"; exit(1);
+#endif
+  } else {
+    if (std::getenv("HASEN_QUDA_FORCE_TAIL") != nullptr) {
+      std::cerr << "HASEN_QUDA_FORCE_TAIL=1 requires HASEN_QUDA_CG_TAIL=1 "
+                   "(v1: the tail's QUDA solvers supply gauge residency for "
+                   "the force calls).\n";
+      exit(1);
+    }
+    TailGrid = std::make_unique<
+        TwoFlavourSchurCloverActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
+        *LightOps[itail], *LightOpsF[itail], CG_light_md, CG_action);
+    TailGrid->is_smeared = true;
+    LightTailSchur = TailGrid.get();
+  }
 
   // Strange EO log-det: -ln|det(M_ee)| at mass_strange.
   QCDLogDetCompactCloverEOAction<WilsonImplR> StrangeLogDet(StrangeOp, 1);
@@ -707,11 +888,30 @@ int main(int argc, char **argv) {
   ActionLevel<LatticeGaugeField, Reps> Lferm(1);             // top: all fermions
   ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);   // finest: gauge
 
+  // HASEN_TAIL_LEVEL=inner puts the bare-det tail on the fine gauge level —
+  // Chroma's actual has_cancel_2flav placement (the cfg_2000 XML integrates it
+  // in the inner n_steps=2 sub-integrator WITH lw_tree_gauge); default/outer =
+  // the historical placement with the ladder rungs.  Level membership only
+  // changes the integrator (discretization) error, not the sampled
+  // distribution: Metropolis stays exact either way (see Correctness above).
+  const char *tail_level_env = std::getenv("HASEN_TAIL_LEVEL");
+  std::string tail_level = (tail_level_env && *tail_level_env) ? tail_level_env : "outer";
+  if (tail_level != "outer" && tail_level != "inner") {
+    std::cerr << "HASEN_TAIL_LEVEL must be 'outer' or 'inner', got '"
+              << tail_level << "'\n";
+    exit(1);
+  }
+  std::cout << GridLogMessage << "[Ladder] tail level = " << tail_level
+            << (tail_level == "inner" ? " (with gauge — Chroma has_cancel placement)"
+                                      : " (with the ladder rungs)")
+            << std::endl;
+
   Lferm.push_back(&StrangeSchurPF);
   Lferm.push_back(&StrangeLogDet);
   Lferm.push_back(&LightLogDet);
   for (auto &pf : RatioPF) Lferm.push_back(pf.get());
-  Lferm.push_back(&LightTailSchur);
+  if (tail_level == "inner") Lgauge.push_back(LightTailSchur);
+  else                       Lferm.push_back(LightTailSchur);
   Lgauge.push_back(&GaugeAction);
 
   ActionSet<LatticeGaugeField, Reps> Aset;
@@ -728,7 +928,7 @@ int main(int argc, char **argv) {
   ForceObs.refs.push_back({"LightLogDet", &LightLogDet});
   for (int k = 0; k < n_pf; ++k)
     ForceObs.refs.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
-  ForceObs.refs.push_back({"LightSchurPF", &LightTailSchur});
+  ForceObs.refs.push_back({"LightSchurPF", LightTailSchur});
   ForceObs.refs.push_back({"Strange",       &StrangeSchurPF});
   ForceObs.refs.push_back({"StrangeLogDet", &StrangeLogDet});
   ForceObs.refs.push_back({"Gauge",         &GaugeAction});
@@ -813,9 +1013,27 @@ int main(int argc, char **argv) {
         // inside the FORCES_ONLY block, never in the trajectory/integrator path.
         if (s == nsamp - 1 && ForceObs.refs[i].name.rfind("PF", 0) == 0) {
           int k = std::atoi(ForceObs.refs[i].name.c_str() + 2);
-          if (k >= 0 && k < (int)QudaRungSolver.size() && QudaRungSolver[k]) {
-            QudaRungSolver[k].reset();
-            std::cout << GridLogMessage << "[FORCES_ONLY] freed QUDA solver for rung " << k << std::endl;
+          auto free_rung = [&](int r) {
+            if (r >= 0 && r < (int)QudaRungSolver.size() && QudaRungSolver[r]) {
+              QudaRungSolver[r].reset();
+              std::cout << GridLogMessage << "[FORCES_ONLY] freed QUDA solver for rung " << r << std::endl;
+            }
+          };
+          // Shared-MG: every sharee borrows the donor's MG handle, so the
+          // donor solver must outlive the highest-index sharee's final
+          // sample -- freeing it after its OWN last sample (the pre-shared
+          // behavior) left later sharees a dangling donor (null-handle
+          // assert, 2026-07-09).  Defer the donor's free to the last
+          // sharee; everything else frees as before.  No memory-cap change:
+          // the donor is alive through every earlier sweep regardless.
+          const bool have_shared = !mg_shared_rungs.empty() && !mg_rungs.empty();
+          const int  donor_rung  = have_shared ? *mg_rungs.begin() : -1;
+          const int  last_sharee = have_shared ? *mg_shared_rungs.rbegin() : -1;
+          if (have_shared && k == donor_rung && k < last_sharee) {
+            // sharees still pending in this final sweep -- keep the donor
+          } else {
+            free_rung(k);
+            if (have_shared && k == last_sharee) free_rung(donor_rung);
           }
         }
 #endif
