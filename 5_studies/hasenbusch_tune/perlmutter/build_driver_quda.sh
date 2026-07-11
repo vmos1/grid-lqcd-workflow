@@ -64,6 +64,15 @@ GRID_BUILD=$(cd "$(dirname "$GRID_CONFIG")" && pwd)
 
 CXX=$($GRID_CONFIG --cxx)
 CXXFLAGS="$($GRID_CONFIG --cxxflags) -I${TXQCD_PROD} -I${GRID_TXQCD} -I${GRID_BUILD}/Grid"
+# CXX_STD=c++20 overrides grid-config's -std (in both --cxx and --cxxflags).
+# Needed for sources that include QUDA's INTERNAL headers (e.g. via
+# Grid/util/QudaForcePrimitives.h / QudaSchurOpForce.h): the pinned QUDA is
+# past its "QUDA now uses C++20" commit, so array.h etc. use requires-clauses
+# that fail under -std=c++17.  The public quda.h alone needs no override.
+if [ -n "${CXX_STD:-}" ]; then
+  CXX=$(echo "$CXX" | sed "s/-std=c++[0-9a-z]*/-std=${CXX_STD}/")
+  CXXFLAGS=$(echo "$CXXFLAGS" | sed "s/-std=c++[0-9a-z]*/-std=${CXX_STD}/g")
+fi
 LDFLAGS="$($GRID_CONFIG --ldflags) -L${GRID_BUILD}/Grid"
 LIBS=$($GRID_CONFIG --libs)
 
