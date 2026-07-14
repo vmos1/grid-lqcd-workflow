@@ -74,6 +74,7 @@
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioQudaForceAction.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverQudaForceTailAction.h>
+#include <Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOQudaForceAction.h>
 #include <Grid/algorithms/iterative/QudaMGSchurSolver.h>
 #include <Grid/algorithms/iterative/QudaCGSchurSolver.h>
 #endif
@@ -451,6 +452,43 @@ int main(int argc, char **argv) {
   // Light EO log-det: det(M_ee(mass_light))^2  (Nf=2; lightest mass = LightOps[0]).
   QCDLogDetCompactCloverEOAction<WilsonImplR> LightLogDet(*LightOps[0], 2);
   LightLogDet.is_smeared = true;
+  Action<LatticeGaugeField> *LightLogDetPtr = &LightLogDet;
+
+  // HASEN_QUDA_FORCE_LOGDET=<light|strange|light,strange|all> routes the LogDet
+  // FORCE (the sigma_munu-trace clover derivative -- the one light piece v1 left
+  // in Grid) onto QUDA's fused sigma-trace kernel
+  // (QCDLogDetCompactCloverEOQudaForceAction).  S() stays Grid (cheap, twice per
+  // traj).  Default unset -> Grid base action, deriv bit-identical.
+  bool quda_force_logdet_light = false, quda_force_logdet_strange = false;
+  if (const char *v = std::getenv("HASEN_QUDA_FORCE_LOGDET"); v && *v) {
+    std::string s(v);
+    const bool all = (s == "all");
+    quda_force_logdet_light   = all || s.find("light")   != std::string::npos;
+    quda_force_logdet_strange = all || s.find("strange") != std::string::npos;
+  }
+#ifdef GRID_HAVE_QUDA
+  std::unique_ptr<QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>> LightLogDetQuda;
+  if (quda_force_logdet_light) {
+    QudaCloverParams qp_ld;
+    qp_ld.mass = ladder[0]; qp_ld.csw = csw; qp_ld.anti_periodic_t = true;
+    qp_ld.tol = cg_tol_drv; qp_ld.max_iter = cg_max;
+    qp_ld.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    qp_ld.use_multigrid = false;
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp_ld.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    LightLogDetQuda = std::make_unique<
+        QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>>(*LightOps[0], 2, qp_ld);
+    LightLogDetQuda->is_smeared = true;
+    LightLogDetPtr = LightLogDetQuda.get();
+    std::cout << GridLogMessage
+              << "[Ladder] LIGHT LogDet FORCE ASSEMBLY = QUDA sigma-trace kernel"
+              << std::endl;
+  }
+#else
+  if (quda_force_logdet_light || quda_force_logdet_strange) {
+    std::cerr << "HASEN_QUDA_FORCE_LOGDET requires a QUDA build.\n"; exit(1);
+  }
+#endif
 
   // Hasenbusch ratio levels (EO/Schur-preconditioned, clover-correct).
   //   det(Schur(ladder[k]))^2 / det(Schur(ladder[k+1]))^2  via
@@ -760,6 +798,26 @@ int main(int argc, char **argv) {
   // Strange EO log-det: -ln|det(M_ee)| at mass_strange.
   QCDLogDetCompactCloverEOAction<WilsonImplR> StrangeLogDet(StrangeOp, 1);
   StrangeLogDet.is_smeared = true;
+  Action<LatticeGaugeField> *StrangeLogDetPtr = &StrangeLogDet;
+#ifdef GRID_HAVE_QUDA
+  std::unique_ptr<QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>> StrangeLogDetQuda;
+  if (quda_force_logdet_strange) {
+    QudaCloverParams qp_sld;
+    qp_sld.mass = mass_strange; qp_sld.csw = csw; qp_sld.anti_periodic_t = true;
+    qp_sld.tol = cg_tol_drv; qp_sld.max_iter = cg_max;
+    qp_sld.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+    qp_sld.use_multigrid = false;
+    if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
+      qp_sld.recon_sloppy = QUDA_RECONSTRUCT_NO;
+    StrangeLogDetQuda = std::make_unique<
+        QCDLogDetCompactCloverEOQudaForceAction<WilsonImplR>>(StrangeOp, 1, qp_sld);
+    StrangeLogDetQuda->is_smeared = true;
+    StrangeLogDetPtr = StrangeLogDetQuda.get();
+    std::cout << GridLogMessage
+              << "[Strange] LogDet FORCE ASSEMBLY = QUDA sigma-trace kernel"
+              << std::endl;
+  }
+#endif
 
   // Strange RHMC. Bounds and degree matched to Chroma's rat_3strange monomial.
   // Env-overridable for spectra where lo=1e-4 sits below lambda_min (phantom poles
@@ -880,13 +938,36 @@ int main(int argc, char **argv) {
   // acceptance/efficiency changes.
   int gauge_mult = 2;
   if (const char *gm = std::getenv("GAUGE_INNER_MULT"); gm && *gm) gauge_mult = std::atoi(gm);
-  std::cout << GridLogMessage
-            << "Integrator: 2-level (strange+light)/gauge  GAUGE_INNER_MULT="
-            << gauge_mult << std::endl;
+
+  // HASEN_STRANGE_LEVEL=middle switches the 2-level (all-fermions / gauge)
+  // layout to a 3-level light / strange / gauge+tail integrator, giving the
+  // strange RHMC its own middle timescale so the over-resolved light ladder can
+  // take a coarser outer step.  Default unset = the verbatim 2-level path; the
+  // 3-level ActionLevels are never instantiated unless requested.  CRITICAL --
+  // level ORDER: Grid runs every child level at 2*mult*parent_steps, so the
+  // coarsest (root) level takes the fewest steps.  The light ladder is the
+  // expensive sector, so it MUST be the root; strange (its child) then inherits
+  // the intrinsic 2x refinement its larger force wants.  The 2026-07-06 3-level
+  // was dropped for the OPPOSITE order (strange/light/gauge), which ran the
+  // light 2x too fine.  See docs/2026_7_11_three_level_integrator_plan.md.
+  const char *strange_level_env = std::getenv("HASEN_STRANGE_LEVEL");
+  const bool three_level = (strange_level_env && std::string(strange_level_env) == "middle");
+  int strange_mult = 1;
+  if (const char *sm = std::getenv("HASEN_STRANGE_INNER_MULT"); sm && *sm) strange_mult = std::atoi(sm);
 
   typedef Representations<EmptyRep<LatticeGaugeField>> Reps;
-  ActionLevel<LatticeGaugeField, Reps> Lferm(1);             // top: all fermions
-  ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);   // finest: gauge
+  ActionSet<LatticeGaugeField, Reps> Aset;
+  // Grid's ActionLevel holds `actions` as a REFERENCE into its own actions_hirep;
+  // the copy that Aset.push_back() stores keeps that reference bound to THIS
+  // object.  So every ActionLevel pushed into Aset must outlive the Integrator
+  // ctor (built ~line 1105) -- declare them here at function scope, NOT inside
+  // the branch below (in-branch scoping dangles the reference and segfaults at
+  // the ctor's action-summary print).  Only the levels the chosen layout pushes
+  // into Aset are populated; the others stay empty and unused.
+  ActionLevel<LatticeGaugeField, Reps> Lferm(1);               // 2-level: all fermions
+  ActionLevel<LatticeGaugeField, Reps> Llight(1);              // 3-level: light rungs + logdets
+  ActionLevel<LatticeGaugeField, Reps> Lstrange(strange_mult); // 3-level: strange RHMC
+  ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);     // finest: gauge (+ tail if inner)
 
   // HASEN_TAIL_LEVEL=inner puts the bare-det tail on the fine gauge level —
   // Chroma's actual has_cancel_2flav placement (the cfg_2000 XML integrates it
@@ -906,17 +987,41 @@ int main(int argc, char **argv) {
                                       : " (with the ladder rungs)")
             << std::endl;
 
-  Lferm.push_back(&StrangeSchurPF);
-  Lferm.push_back(&StrangeLogDet);
-  Lferm.push_back(&LightLogDet);
-  for (auto &pf : RatioPF) Lferm.push_back(pf.get());
-  if (tail_level == "inner") Lgauge.push_back(LightTailSchur);
-  else                       Lferm.push_back(LightTailSchur);
-  Lgauge.push_back(&GaugeAction);
-
-  ActionSet<LatticeGaugeField, Reps> Aset;
-  Aset.push_back(Lferm);      // coarsest pushed first
-  Aset.push_back(Lgauge);
+  if (!three_level) {
+    std::cout << GridLogMessage
+              << "Integrator: 2-level (strange+light)/gauge  GAUGE_INNER_MULT="
+              << gauge_mult << std::endl;
+    Lferm.push_back(&StrangeSchurPF);
+    Lferm.push_back(StrangeLogDetPtr);
+    Lferm.push_back(LightLogDetPtr);
+    for (auto &pf : RatioPF) Lferm.push_back(pf.get());
+    if (tail_level == "inner") Lgauge.push_back(LightTailSchur);
+    else                       Lferm.push_back(LightTailSchur);
+    Lgauge.push_back(&GaugeAction);
+    Aset.push_back(Lferm);      // coarsest pushed first
+    Aset.push_back(Lgauge);
+  } else {
+    // 3-level: light (root, coarsest) / strange (middle) / gauge+tail (deepest).
+    const int n_light   = mdsteps;
+    const int n_strange = 2 * strange_mult * n_light;
+    const int n_gauge   = 2 * gauge_mult   * n_strange;
+    std::cout << GridLogMessage
+              << "Integrator: 3-level light/strange/gauge+tail  MDSTEPS(light)="
+              << mdsteps << "  STRANGE_INNER_MULT=" << strange_mult
+              << "  GAUGE_INNER_MULT=" << gauge_mult << std::endl;
+    std::cout << GridLogMessage << "[3-level] steps/traj: light=" << n_light
+              << "  strange=" << n_strange << "  gauge=" << n_gauge << std::endl;
+    Llight.push_back(LightLogDetPtr);
+    Llight.push_back(StrangeLogDetPtr);   // negligible force -> cheapest (coarsest) slot
+    for (auto &pf : RatioPF) Llight.push_back(pf.get());
+    if (tail_level == "inner") Lgauge.push_back(LightTailSchur);
+    else                       Llight.push_back(LightTailSchur);
+    Lstrange.push_back(&StrangeSchurPF);
+    Lgauge.push_back(&GaugeAction);
+    Aset.push_back(Llight);     // coarsest pushed first
+    Aset.push_back(Lstrange);
+    Aset.push_back(Lgauge);
+  }
 
   // ── Stout smearing ────────────────────────────────────────────────────────
   Smear_Stout<PeriodicGimplR> Stout(stout_rho_inv);
@@ -925,12 +1030,12 @@ int main(int argc, char **argv) {
 
   // ── Force norm observer ───────────────────────────────────────────────────
   ForceNormObserver ForceObs;
-  ForceObs.refs.push_back({"LightLogDet", &LightLogDet});
+  ForceObs.refs.push_back({"LightLogDet", LightLogDetPtr});
   for (int k = 0; k < n_pf; ++k)
     ForceObs.refs.push_back({"PF" + std::to_string(k), RatioPF[k].get()});
   ForceObs.refs.push_back({"LightSchurPF", LightTailSchur});
   ForceObs.refs.push_back({"Strange",       &StrangeSchurPF});
-  ForceObs.refs.push_back({"StrangeLogDet", &StrangeLogDet});
+  ForceObs.refs.push_back({"StrangeLogDet", StrangeLogDetPtr});
   ForceObs.refs.push_back({"Gauge",         &GaugeAction});
 
   // ── Forces-only mode (fast Hasenbusch mass tuning) ────────────────────────
