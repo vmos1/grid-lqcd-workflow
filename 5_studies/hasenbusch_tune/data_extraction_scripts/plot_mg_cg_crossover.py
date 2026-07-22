@@ -68,9 +68,9 @@ fig.suptitle("Shared-MG vs QUDA-CG per-rung deriv cost, 48$^3$ cfg_2000 "
 fig.tight_layout()
 
 outdir = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else \
-    pathlib.Path(__file__).resolve().parents[4].parent / "docs" / "figs"
+    pathlib.Path(__file__).resolve().parents[4] / "docs" / "figs"
 outdir.mkdir(parents=True, exist_ok=True)
 for ext in ("png", "pdf"):
-    fig.savefig(outdir / f"2026_7_10_mg_cg_crossover.{ext}", dpi=160)
+    fig.savefig(outdir / f"2026_7_10_mg_cg_crossover.{ext}", dpi=300)
 print(f"wrote {outdir}/2026_7_10_mg_cg_crossover.png/.pdf; "
       f"crossings: 1e-6 m*={crossing(TOL6):.4f}, 1e-11 m*={crossing(TOL11):.4f}")
