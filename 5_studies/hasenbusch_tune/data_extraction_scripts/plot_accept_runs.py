@@ -49,7 +49,7 @@ PALETTE = [
 # Poster-facing display labels (legend text only) -- internal run names above
 # (from accept_run_tables.py's run_name()) stay as-is so PALETTE/style_map
 # keying and every other doc that reads these CSVs are unaffected.
-DISPLAY = {"base+G": "1_baseline", "u1": "2_thin-ladder", "3-level": "3_threelevel"}
+DISPLAY = {"base+G": "1_baseline", "u1": "2_sparse-ladder", "3-level": "3_threelevel"}
 INK, MUTED, GRID = "#1a1a1a", "#5a5a5a", "#d9d9d9"
 
 def style_map(runs):
