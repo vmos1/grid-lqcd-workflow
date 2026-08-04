@@ -508,7 +508,7 @@ int main(int argc, char **argv) {
     // failure is precision-INDEPENDENT (pure-Grid converges with the SAME shifts);
     // the cause is in the QUDA operator/shift setup (kappa-form normalization of the
     // Remez shifts / matpc), not sloppy precision.  See
-    // docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
+    // __docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
     if (std::getenv("QUDA_FORCE_SLOPPY_DP") != nullptr)
       qp.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
     // QUDA_FORCE_RECON_NO=1 → reconstruct_sloppy = NO (full links).  REQUIRED at
@@ -722,7 +722,7 @@ int main(int argc, char **argv) {
   // Tests that the MD force (notably the QUDA strange force) is a *deterministic,
   // reversible* function of U — the property HMC exactness requires of the force
   // independent of its magnitude (see
-  // docs/2026_6_22_quda_grid_normalization_mismatch.md, caveat 3).  A reversible,
+  // __docs/2026_6_22_quda_grid_normalization_mismatch.md, caveat 3).  A reversible,
   // deterministic force returns U to U_0 at ~solver tolerance even if it is the
   // gradient of a slightly different operator (the ~4% case); a nondeterministic
   // solver force does not.  REV_THERM>0 first roughens U with that many plain

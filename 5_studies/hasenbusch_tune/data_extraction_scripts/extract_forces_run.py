@@ -7,7 +7,7 @@ run_hmc16.sh``) holds six logs, one per (code, mode)::
     {2plus1,compact,schur}_{GRID,QUDA}.log
 
 This script parses all six with ``hmc_log_parser`` and emits, as Markdown ready
-to paste into ``docs/2026_6_24_test_results.md``:
+to paste into ``__docs/2026_6_24_test_results.md``:
 
   * Table 3  — dH / H-after / acceptance / steady wall-per-trajectory / speedup
   * Table 3b — unsmeared plaquette + Polyakov loop (per trajectory)

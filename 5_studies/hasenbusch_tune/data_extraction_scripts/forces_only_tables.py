@@ -29,7 +29,7 @@ Modes::
     python forces_only_tables.py single <log> [--ladder=m1,m2,...] [--samples]
 
     # candidate dirs (each holding scan_<dirname>.log) -> the interleaved
-    # mass+force table of docs/2026_7_8_hasen_tail_force_scan.md section 1,
+    # mass+force table of __docs/2026_7_8_hasen_tail_force_scan.md section 1,
     # plus refresh-seconds and deriv-seconds tables
     python forces_only_tables.py scan <dir> [<dir> ...] \\
         [--cands <file>] [--ladder name=m1,m2,...] [--eps X]
