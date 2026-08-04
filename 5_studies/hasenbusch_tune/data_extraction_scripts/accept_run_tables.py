@@ -59,7 +59,7 @@ SMEAR   = re.compile(r"Smearing in ([0-9.eE+-]+) ms")
 # lands on "tail" when tail co-occupies level 1 with gauge, but lands on
 # "gauge" when gauge is alone at that level (different ladders put tail at
 # different levels), making cross-ladder gauge/tail comparisons meaningless
-# unless it's split out. See docs/2026_7_16_accept_baseG_u1_10traj_tables.md
+# unless it's split out. See __docs/2026_7_16_accept_baseG_u1_10traj_tables.md
 # "Reading it" note under the single-trajectory table for the log evidence.
 SMEARKEY = ("SM", "SM")
 

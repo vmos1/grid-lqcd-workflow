@@ -5,14 +5,14 @@ Single-panel companion to plot_mg_cg_crossover.py: same crossover-plot design
 (donor diamond, crossing annotation) but for the ONE tolerance this scan
 covers — production (deriv 1e-11, action 1e-12) — with the QUDA
 force-assembly path on (HASEN_QUDA_FORCE_RUNGS=all), i.e. the numbers in
-docs/2026_7_11_mg_cg_crossover_qforce_tables.md.
+__docs/2026_7_11_mg_cg_crossover_qforce_tables.md.
 
 Data = 48^3 FORCES_ONLY crossover scan on cfg_2000 (3-sample mean deriv
 seconds per force evaluation; same seeds in both arms), job 55783709 (array
 of 8) covering base/e1/x1 ladders plus the -0.2260/-0.2240/-0.2220 refinement.
-Companion doc: docs/2026_7_11_mg_cg_crossover_qforce_tables.md
+Companion doc: __docs/2026_7_11_mg_cg_crossover_qforce_tables.md
 Usage: module load python && python3 plot_mg_cg_crossover_qforce.py [outdir]
-Writes 2026_7_11_mg_cg_crossover_qforce.{png,pdf} to outdir (default docs/figs).
+Writes 2026_7_11_mg_cg_crossover_qforce.{png,pdf} to outdir (default __docs/figs).
 """
 import sys, pathlib
 import matplotlib

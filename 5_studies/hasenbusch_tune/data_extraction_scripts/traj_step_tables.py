@@ -5,7 +5,7 @@ plus a sector-totals summary and the trajectory's H_before/H_after/dH/
 Metropolis outcome when available.
 
 Built for the diagnostic workflow used on the compact_schur 48^3 runaway
-investigation (docs/2026_7_3_compact_schur_48cube_optimized_traj_timing_forces.md):
+investigation (__docs/2026_7_3_compact_schur_48cube_optimized_traj_timing_forces.md):
 "is a rung's force/solve-time blowing up over the course of a trajectory, and
 which sector actually dominates wall time." Works on any of the hasenbusch_tune
 drivers (2plus1 / compact / compact_schur) and any Hasenbusch ladder length --
@@ -35,7 +35,7 @@ it doesn't distort the per-step numbers/percentages):
   - Heatbath (refresh) per action, from the log's ``refresh [L][I]
     ActionName`` markers -- the pseudofermion draw at the start of the
     trajectory. Governed by a normal-equation CG solve for a Hasenbusch ratio
-    rung (see docs/2026_7_2_hasenbusch_heatbath_solve_derivation.md), so it
+    rung (see __docs/2026_7_2_hasenbusch_heatbath_solve_derivation.md), so it
     can be substantial for a near-critical rung even though it's a one-time
     cost.
   - Initial action eval (S()) per action, from ``S [L][I] action eval``

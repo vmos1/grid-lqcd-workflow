@@ -7,9 +7,9 @@ seconds per force evaluation; same seeds in both arms of each pair):
   tol 1e-11 : runs/2026_7_10_mgshare_tol11_crossover_48 (job 55747239)
               + refinement points -0.2260/-0.2240/-0.2220 from
               runs/2026_7_10_mgshare_tol11_refine_48 (job 55752081)
-Companion doc: docs/2026_7_10_mg_cg_crossover_tables.md
+Companion doc: __docs/2026_7_10_mg_cg_crossover_tables.md
 Usage: module load python && python3 plot_mg_cg_crossover.py [outdir]
-Writes 2026_7_10_mg_cg_crossover.{png,pdf} to outdir (default docs/figs).
+Writes 2026_7_10_mg_cg_crossover.{png,pdf} to outdir (default __docs/figs).
 """
 import sys, pathlib
 import matplotlib

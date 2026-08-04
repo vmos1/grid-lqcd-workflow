@@ -3,7 +3,7 @@
 // LEAN + FAST variant: compact-clover storage (CompactWilsonCloverFermion, ~6x
 // smaller host footprint → fits 48^3x96 on 2 nodes) AND an EO-Schur light sector
 // (vs the unpreconditioned full-operator "Tail" in gen_qcd_hasenbusch_tune_compact.cc).
-// The two axes are orthogonal — see docs/2026_6_21_compact_vs_eoschur.md.  The light
+// The two axes are orthogonal — see __docs/2026_6_21_compact_vs_eoschur.md.  The light
 // det(M_l)^2 is represented in the SAME EO-Schur form the production 2+1 driver uses
 // (TwoFlavourSchurCloverAction monomial + QCDLogDetCompactCloverEOAction, plus
 // TwoFlavourEvenOddRatio levels when HASEN_LADDER is set).  Forked from
@@ -857,7 +857,7 @@ int main(int argc, char **argv) {
     // failure is precision-INDEPENDENT (pure-Grid converges with the SAME shifts);
     // the cause is in the QUDA operator/shift setup (kappa-form normalization of the
     // Remez shifts / matpc), not sloppy precision.  See
-    // docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
+    // __docs/2026_6_19_quda_single_precision_issues_multishift_cg_strange.md.
     if (std::getenv("QUDA_FORCE_SLOPPY_DP") != nullptr)
       qp.cuda_prec_sloppy = QUDA_DOUBLE_PRECISION;
     // QUDA_FORCE_RECON_NO=1 → reconstruct_sloppy = NO (full links). REQUIRED at
@@ -931,7 +931,7 @@ int main(int argc, char **argv) {
   // factor -- no multiplier setting avoids it), i.e. 2x the light-sector
   // force solves for nothing Chroma needs.  Re-add later, if profiling ever
   // justifies it, by giving the light actions their own ActionLevel again.
-  // See docs/2026_7_6_integrator_step_accounting_summary.md.
+  // See __docs/2026_7_6_integrator_step_accounting_summary.md.
   //
   // Correctness: each action term is in exactly one level; the Metropolis
   // test keeps the sampled distribution exact for any multipliers -- only
@@ -949,7 +949,7 @@ int main(int argc, char **argv) {
   // expensive sector, so it MUST be the root; strange (its child) then inherits
   // the intrinsic 2x refinement its larger force wants.  The 2026-07-06 3-level
   // was dropped for the OPPOSITE order (strange/light/gauge), which ran the
-  // light 2x too fine.  See docs/2026_7_11_three_level_integrator_plan.md.
+  // light 2x too fine.  See __docs/2026_7_11_three_level_integrator_plan.md.
   const char *strange_level_env = std::getenv("HASEN_STRANGE_LEVEL");
   const bool three_level = (strange_level_env && std::string(strange_level_env) == "middle");
   int strange_mult = 1;

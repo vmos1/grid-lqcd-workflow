@@ -3,7 +3,7 @@
 Pull H / ΔH / acceptance / per-trajectory timing / plaquette / Polyakov loop out
 of the HMC logs produced by the force-validation drivers in
 `5_studies/hasenbusch_tune`, and assemble the grid-vs-quda comparison tables used
-in `docs/2026_6_24_test_results.md` (Tables 3 and 3b).
+in `__docs/2026_6_24_test_results.md` (Tables 3 and 3b).
 
 Every physics number is copied **verbatim** from the logs (Grid computes them in
 double precision). The only quantity these scripts *compute* is the steady-state
@@ -82,7 +82,7 @@ sector-per-step table, and a sector-totals/percentage summary. `--traj N ...`
 restricts to specific 0-based trajectory indices (default: all trajectories in
 the log). Built for and validated against the compact_schur 48³ runaway
 investigation, see
-`docs/2026_7_3_compact_schur_48cube_optimized_traj_timing_forces.md`.
+`__docs/2026_7_3_compact_schur_48cube_optimized_traj_timing_forces.md`.
 
 FORCES_ONLY logs (the ladder force-balance scans, `submit_scripts/hmc48_compact/
 hasen_tail_force_scan_48.sh` and friends) — three sub-modes:
@@ -94,7 +94,7 @@ hasen_tail_force_scan_48.sh` and friends) — three sub-modes:
 python forces_only_tables.py single <run_dir>/scan_base.log [--ladder=m1,...] [--samples]
 
 # candidate dirs (each holding scan_<dirname>.log) → the interleaved
-# mass+max-force table of docs/2026_7_8_hasen_tail_force_scan.md §1 plus
+# mass+max-force table of __docs/2026_7_8_hasen_tail_force_scan.md §1 plus
 # heatbath-refresh and deriv-time tables. --cands takes any file with
 # "name m1,m2,..." lines — the CANDS=( ... ) block of the scan submit
 # script works verbatim. --eps adds a tail F·ε column.
