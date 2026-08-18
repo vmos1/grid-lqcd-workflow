@@ -21,6 +21,13 @@ print the tail mass, so either pass the ladder explicitly or (better) have the
 submit script echo ``HASEN_LADDER=...`` as the log's first line — this parser
 picks that up automatically (droprung_evensplit_debug.sh onward does this).
 
+That same ``ENV`` header line should also carry the ROUTING knobs
+(``FORCES_SKIP_RUNGS=``, ``HASEN_MG_HEATBATH_RUNGS=``, ``none`` when unset;
+forces_only_sop_48.sh consumers do this from 2026-08-11).  They contribute no
+number to any table, but scan and ab modes print a ⚠ block when the runs being
+compared disagree on one — skipping changes which levels exist at all, and the
+MG-vs-CG heatbath choice changes refresh seconds without changing forces.
+
 Modes::
 
     # one log -> per-level table (+ per-sample detail with --samples)
@@ -60,6 +67,23 @@ TOL_RE = re.compile(r'CG tol: (.+)')
 EXIT_RE = re.compile(r'^exit=(\d+)')
 STATS = ('avg', 'max', 'refresh', 'time')
 
+# Routing knobs the submit script echoes on the ENV header line.  These do not
+# enter any number in the tables, but two runs compared side by side must share
+# them or the comparison is apples-to-oranges: FORCES_SKIP_RUNGS changes WHICH
+# levels exist, and HASEN_MG_HEATBATH_RUNGS changes the refresh timings (never
+# the forces).  Value 'none' = knob unset in that run.
+ROUTING_RE = {
+    'FORCES_SKIP_RUNGS': re.compile(r'FORCES_SKIP_RUNGS=(\S+)'),
+    'HASEN_MG_HEATBATH_RUNGS': re.compile(r'HASEN_MG_HEATBATH_RUNGS=(\S+)'),
+    # Tolerances are the ONE knob that changes force VALUES rather than just
+    # timings -- everything else here (skip lists, MG-vs-CG heatbath routing)
+    # was validated bit-identical.  Run w0 was compared against 1e-12/1e-11
+    # runs for days before anyone spotted it had run at 1e-8/1e-6, so a
+    # mismatch on these two is the most important thing this block can catch.
+    'TUNE_CG_TOL_ACTION': re.compile(r'TUNE_CG_TOL_ACTION=(\S+)'),
+    'TUNE_CG_TOL_DERIV': re.compile(r'TUNE_CG_TOL_DERIV=(\S+)'),
+}
+
 
 def parse_forces_log(path):
     """Parse one FORCES_ONLY log.
@@ -74,15 +98,24 @@ def parse_forces_log(path):
       nsamples : sample count (from summary, else max seen)
       rung_solver / rung_mass : {rung_index: str/float} from [Ladder] lines
       ladder   : [m1..mN] if a HASEN_LADDER= echo line is present, else None
+      routing  : {knob: value} for the ROUTING_RE knobs found on the ENV header
+                 line (absent key = the submit script didn't record it, which is
+                 NOT the same as the knob being unset — that echoes 'none')
       cg_tol   : the 'CG tol: ...' line text (or None);  exit : int or None
     """
     levels, samples = [], {}
     summary = {}
     rung_solver, rung_mass = {}, {}
+    routing = {}
     ladder = cg_tol = exit_code = None
     nsamples = 0
     with open(path, errors='replace') as fh:
         for line in fh:
+            if line.startswith('ENV'):
+                for key, rx in ROUTING_RE.items():
+                    mm = rx.search(line)
+                    if mm:
+                        routing[key] = mm.group(1)
             m = SAMPLE_RE.search(line)
             if m:
                 lvl, s = m.group(1), int(m.group(2))
@@ -125,7 +158,8 @@ def parse_forces_log(path):
     return {'path': str(path), 'levels': levels, 'samples': samples,
             'summary': summary, 'complete': complete, 'nsamples': nsamples,
             'rung_solver': rung_solver, 'rung_mass': rung_mass,
-            'ladder': ladder, 'cg_tol': cg_tol, 'exit': exit_code}
+            'ladder': ladder, 'routing': routing, 'cg_tol': cg_tol,
+            'exit': exit_code}
 
 
 def level_masses(run, ladder=None):
@@ -164,6 +198,50 @@ def run_status(run):
     return tag
 
 
+def routing_str(run):
+    """One-line rendering of the recorded routing knobs ('' if none recorded)."""
+    return ' '.join(f'{k}={run["routing"][k]}'
+                    for k in ROUTING_RE if k in run['routing'])
+
+
+def routing_mismatch(named_runs):
+    """[(knob, {value: [names]})] for knobs that DIFFER across the given runs.
+
+    Only knobs recorded in every run are checked — an older log that predates
+    the ENV echo simply can't be compared, and silently pretending it matches
+    would be worse than saying nothing.  Returns [] when everything agrees.
+    """
+    out = []
+    for knob in ROUTING_RE:
+        vals = {}
+        for name, run in named_runs:
+            if knob not in run['routing']:
+                vals = {}
+                break
+            vals.setdefault(run['routing'][knob], []).append(name)
+        if len(vals) > 1:
+            out.append((knob, vals))
+    return out
+
+
+def print_routing_warning(named_runs):
+    """Emit a warning block when the runs being compared were not run under the
+    same routing.  FORCES_SKIP_RUNGS changes which levels were computed at all;
+    HASEN_MG_HEATBATH_RUNGS changes refresh timings but not forces."""
+    bad = routing_mismatch(named_runs)
+    if not bad:
+        return
+    print('> ⚠ **ROUTING MISMATCH — these runs are not directly comparable:**')
+    for knob, vals in bad:
+        detail = '; '.join(f'`{v}` ({", ".join(names)})'
+                           for v, names in vals.items())
+        note = ('different levels were computed'
+                if knob == 'FORCES_SKIP_RUNGS'
+                else 'heatbath timings differ by solver, not by physics')
+        print(f'> - `{knob}`: {detail} — {note}')
+    print()
+
+
 # ---------------------------------------------------------------- single mode
 
 def print_single(run, ladder=None, show_samples=False):
@@ -172,6 +250,8 @@ def print_single(run, ladder=None, show_samples=False):
     print(f"# {run['path']}  ({run_status(run)})")
     if run['cg_tol']:
         print(f"# CG tol: {run['cg_tol']}")
+    if routing_str(run):
+        print(f"# routing: {routing_str(run)}")
     print()
     print('| level | mass | solver | F avg | F max | refresh s | deriv s |')
     print('|---|---|---|---|---|---|---|')
@@ -234,6 +314,7 @@ def print_scan(runs, ladders, eps=None):
     hdr += ['m_tail', 'F(tail)']
     if eps:
         hdr.append(f'tail F·ε (ε={eps:g})')
+    print_routing_warning(runs)
     print('#### max force per rung (summary over samples)\n')
     print('| ' + ' | '.join(hdr) + ' |')
     print('|---' * len(hdr) + '|')
@@ -281,6 +362,10 @@ def print_ab(ra, rb, la, lb, tol):
     print(f"# A = {la}: {ra['path']}  ({run_status(ra)})")
     print(f"# B = {lb}: {rb['path']}  ({run_status(rb)})")
     print(f"# force PASS threshold: rel diff < {tol:g} on avg and max\n")
+    # An MG-vs-CG heatbath A/B is EXPECTED to differ here -- that is the point of
+    # the test -- but an unnoticed difference silently reinterprets the speedup
+    # column, so say it out loud either way.
+    print_routing_warning([(la, ra), (lb, rb)])
     lvls = [l for l in ra['levels'] if l in rb['levels']]
     only = [l for l in ra['levels'] + rb['levels'] if l not in lvls]
     if only:
