@@ -30,6 +30,21 @@ driver format; it does not touch the notebook-facing code.
 | `integrator_time_split.py` | paired grid-vs-quda per-sector MD time split, averaged over steady trajectories — one table per driver's known level layout (hardcoded per code) |
 | `traj_step_tables.py` | single-log, per-MD-step timing + force-max tables (see below) — driver-agnostic, no hardcoded level layout |
 | `forces_only_tables.py` | `FORCES_ONLY`-mode logs (heatbath + one force eval per piece, no MD): per-level force/timing table for one log, candidate-scan comparison tables, and same-seed A/B diff (see below) |
+| `forces_only_ladder_cost.py` | **decision layer on top of the above**: applies a per-rung calibration `k = realFdt/screenedF` to turn screened forces into predicted real `F·dt`, then into the minimum integer MDSTEPS a candidate supports and the resulting trajectory seconds. Also fits `F_PFk ~ gap_k^a` across a candidate set (`--exponents`). Answers "is this candidate worth a trajectory run", which the raw table cannot |
+
+`forces_only_tables.py` reports *what was measured*; `forces_only_ladder_cost.py`
+reports *what it is worth*. The distinction matters because the two disagree:
+ranking on raw screened force scored a 49% regression as a 1% one (C2 round 1),
+and a candidate can cut the calibrated peak 10% while being worth **0 seconds**
+because MDSTEPS is an integer. Its defaults are calibrated to w3@MDSTEPS=5 and
+are **not portable to another ladder family** — pass `--k`, or `--real-fdt` +
+`--calib-log` + `--baseline`, to recalibrate. The calibration in force is
+printed on every run.
+
+```bash
+python3 forces_only_ladder_cost.py runs/<scan>/{cand1,cand2,...} --baseline <ref>
+python3 forces_only_ladder_cost.py runs/<scan>/* --baseline <ref> --exponents
+```
 
 ## Environment
 
