@@ -18,10 +18,25 @@ that cost is shared per-half-step integrator overhead, not any one monomial's,
 and which bucket would otherwise absorb it depends only on which monomial
 happens to co-occupy that integrator level in a given ladder -- splitting it
 out is what makes gauge/tail costs comparable across ladders that place tail
-differently. Wall = H-before -> H-after. Max kick = max of the per-step
-"[lv][ix] Fdt max" lines over the trajectory. Trajectory 1 is the cold one
-(its gauge bucket carries the ~650 s one-time stencil/QUDA-autotune init) and
-is flagged, not dropped.
+differently. Max kick = max of the per-step "[lv][ix] Fdt max" lines over the
+trajectory. Trajectory 1 is the cold one (its gauge bucket carries the ~650 s
+one-time stencil/QUDA-autotune init) and is flagged, not dropped.
+
+TIMING -- TWO CONVENTIONS, BOTH EMITTED. Never divide one by the other.
+  wall (s)  = MD-ONLY: 'Total H before trajectory' -> 'Total H after
+              trajectory'. The molecular-dynamics sweep alone -- the part
+              MDSTEPS and the Hasenbusch ladder actually control. This is the
+              campaign's PRIMARY metric: every headline speedup in the C1/C2/C3
+              docs is in this convention.
+  cycle (s) = TTT: Grid's own 'Total time for trajectory (s):' field. The full
+              production cycle -- also covers checkpoint write, measurement,
+              momentum refresh and the pseudofermion heatbath (itself a set of
+              solves). Runs ~100-190 s longer than wall. This is the real cost
+              of producing one configuration, and the only basis comparable
+              with an external code (Chroma emits no MD-only interval).
+Because the extra ~180 s is roughly candidate-independent, it is added to both
+sides of any ratio and pulls speedups toward 1: base+G/C2 is 1.63x in wall but
+1.59x in cycle. Report both; quote wall first. See __docs/README.md.
 
 The monomial->column map is built AUTOMATICALLY from the update_P action names, so
 this works for any Hasenbusch ladder (base+G, u1, and future mass-scan ladders):
@@ -44,6 +59,7 @@ FDTMAX  = re.compile(r"\[(\d)\]\[(\d)\] Fdt max\s*:\s*([0-9.eE+-]+)")
 FDTAVG  = re.compile(r"\[(\d)\]\[(\d)\] Fdt average\s*:\s*([0-9.eE+-]+)")
 HBEF    = re.compile(r"Total H before trajectory")
 HAFT    = re.compile(r"Total H after trajectory\s*=\s*[0-9.eE+-]+\s+dH = ([0-9.eE+-]+)")
+TTOT    = re.compile(r"Total time for trajectory \(s\):\s*([0-9.eE+-]+)")
 TSANY   = re.compile(r": ([0-9.]+) s :")
 EXPDH   = re.compile(r"exp\(-dH\) = ([0-9.eE+-]+)")
 METROP  = re.compile(r"Metropolis_test -- (\w+)")
@@ -62,6 +78,18 @@ SMEAR   = re.compile(r"Smearing in ([0-9.eE+-]+) ms")
 # unless it's split out. See __docs/2026_7_16_accept_baseG_u1_10traj_tables.md
 # "Reading it" note under the single-trajectory table for the log evidence.
 SMEARKEY = ("SM", "SM")
+
+# Printed above Table 1 so that every doc which pastes this output is
+# self-labelling by construction -- the cross-convention mistake this guards
+# against is dividing a `cycle` number by a `wall` baseline.
+TIMING_BANNER = (
+    "Timing conventions (do not mix): **wall (s)** = MD-only, `Total H before "
+    "trajectory` → `Total H after trajectory` — the MD sweep alone, and the "
+    "campaign's primary metric. **cycle (s)** = Grid's `Total time for "
+    "trajectory (s):` — the full production cycle, additionally covering "
+    "checkpoint write, measurement, momentum refresh and the pseudofermion "
+    "heatbath (~100–190 s more). Quote speedups as `wall` first, `cycle` "
+    "alongside; never form a ratio across the two. See `__docs/README.md`.\n")
 
 def parse(path):
     """Return (list-of-traj-dicts, {(lv,ix): action_name})."""
@@ -97,6 +125,11 @@ def parse(path):
             if mh:
                 t = TSANY.search(line)
                 cur["t1"] = float(t.group(1)); cur["dH"] = float(mh.group(1)); continue
+            mt = TTOT.search(line)
+            if mt:
+                # Grid prints this AFTER Metropolis but BEFORE the Plaquette /
+                # Polyakov lines that close the trajectory, so `cur` is still open.
+                cur["ttt"] = float(mt.group(1)); continue
             me = EXPDH.search(line)
             if me and "exp" not in cur: cur["exp"] = float(me.group(1))
             mm = METROP.search(line)
@@ -156,18 +189,21 @@ def render(path):
     print("monomial map: " + ", ".join(f"[{k[0]}][{k[1]}]={h}" for k, h in cols))
     ch = [h for _, h in cols]
     print("\n## Table 1: physics + force-time split\n")
+    print(TIMING_BANNER)
     print("| traj | dH | e^(-dH) | Metrop. | plaquette | smeared | Polyakov | wall (s) | "
-          + " | ".join(ch) + " | Σforce |")
-    print("|---:|---:|---:|:--:|" + "---:|" * 4 + "--:|" * (len(cols) + 1))
+          "cycle (s) | " + " | ".join(ch) + " | Σforce |")
+    print("|---:|---:|---:|:--:|" + "---:|" * 5 + "--:|" * (len(cols) + 1))
     for i, tr in enumerate(trajs, 1):
         b = buckets(tr); wall = tr["t1"] - tr["t0"]
+        cyc = tr.get("ttt")
         pl = sorted(tr["plaq"]); poly = tr["poly"]
         sig = sum(b.get(k, 0.0) for k, _ in cols)
         fc = " | ".join(f"{b.get(k,0.0):.0f}" for k, _ in cols)
         star = "*" if i == 1 else ""
         print(f"| {i}{star} | {tr['dH']:+.4f} | {tr.get('exp',float('nan')):.3f} | "
               f"{tr.get('metrop','?')[:3]} | {pl[0]:.7f} | {pl[-1]:.7f} | "
-              f"({poly[0]:+.4f}, {poly[1]:+.4f}) | {wall:.0f} | {fc} | {sig:.0f} |")
+              f"({poly[0]:+.4f}, {poly[1]:+.4f}) | {wall:.0f} | "
+              f"{'—' if cyc is None else f'{cyc:.0f}'} | {fc} | {sig:.0f} |")
     cols2 = [c for c in cols if c[0] != SMEARKEY]  # smearing has no Fdt kick -- drop it here
     ch2 = [h for _, h in cols2]
     print("\n## Table 2: kick (Fdt) per action piece — max / avg\n")
@@ -188,9 +224,14 @@ def render(path):
     dHs = [t["dH"] for t in trajs]; exps = [t.get("exp", float('nan')) for t in trajs]
     acc = sum(1 for t in trajs if t.get("metrop") == "ACCEPTED")
     warm = [t["t1"] - t["t0"] for t in trajs][1:] or [0]
+    warmc = [t["ttt"] for t in trajs[1:] if t.get("ttt") is not None]
+    cyc = (f", warm cycle {min(warmc):.0f}-{max(warmc):.0f}s "
+           f"(mean {sum(warmc)/len(warmc):.0f})") if warmc else ""
     print(f"\n-- summary: mean dH={sum(dHs)/len(dHs):+.3f}, "
           f"<e^-dH>={sum(exps)/len(exps):.3f}, accepted={acc}/{len(trajs)}, "
-          f"warm wall {min(warm):.0f}-{max(warm):.0f}s (mean {sum(warm)/len(warm):.0f})")
+          f"warm wall {min(warm):.0f}-{max(warm):.0f}s "
+          f"(mean {sum(warm)/len(warm):.0f}){cyc}"
+          "   [wall = MD-only; cycle = full trajectory]")
 
 def run_name(path):
     """Infer a short run label from the log filename (extend as ladders grow)."""
@@ -204,13 +245,18 @@ def write_csv(paths, out, start=2000):
     """Tidy one-row-per-(run,traj) CSV of the plot-relevant scalars.
 
     Columns: run, traj, traj_abs, accepted, cold, dH, exp_dH, plaquette,
-    plaquette_smeared, poly_re, poly_im, wall_s, sigma_force_s, limiter_kick.
+    plaquette_smeared, poly_re, poly_im, wall_s, sigma_force_s, limiter_kick,
+    cycle_s.
     limiter_kick = the trajectory's single largest |F·dt| across all monomials.
+    wall_s = MD-only; cycle_s = full trajectory (see TIMING_BANNER). cycle_s is
+    APPENDED last so existing by-name consumers (plot_accept_runs.py) are
+    unaffected; it is empty for logs predating the 'Total time for trajectory'
+    line.
     """
     import csv
     cols_hdr = ["run", "traj", "traj_abs", "accepted", "cold", "dH", "exp_dH",
                 "plaquette", "plaquette_smeared", "poly_re", "poly_im",
-                "wall_s", "sigma_force_s", "limiter_kick"]
+                "wall_s", "sigma_force_s", "limiter_kick", "cycle_s"]
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(cols_hdr)
         for p in paths:
@@ -229,7 +275,8 @@ def write_csv(paths, out, start=2000):
                     f"{tr['dH']:.6f}", f"{tr.get('exp', float('nan')):.6f}",
                     f"{pl[0]:.8f}", f"{pl[-1]:.8f}",
                     f"{poly[0]:.6f}", f"{poly[1]:.6f}",
-                    f"{tr['t1'] - tr['t0']:.1f}", f"{sig:.1f}", f"{lim:.4f}"])
+                    f"{tr['t1'] - tr['t0']:.1f}", f"{sig:.1f}", f"{lim:.4f}",
+                    "" if tr.get("ttt") is None else f"{tr['ttt']:.1f}"])
     print(f"wrote {out}  ({sum(len(parse(p)[0]) for p in paths)} rows)")
 
 def main(argv):
