@@ -50,6 +50,23 @@ PALETTE = [
 # (from accept_run_tables.py's run_name()) stay as-is so PALETTE/style_map
 # keying and every other doc that reads these CSVs are unaffected.
 DISPLAY = {"base+G": "1_baseline", "u1": "2_sparse-ladder", "3-level": "3_threelevel"}
+# Figure title. Module-level so a caller that imports this as a module can
+# override it (together with PALETTE/DISPLAY) for a different run set without
+# forking the whole plotting routine -- e.g. runs that share a seed and start
+# config but are NOT a matched draw, where "matched draw" would be wrong. The
+# default is unchanged, so every existing CLI invocation renders identically.
+TITLE = "HMC run comparison — per-trajectory diagnostics (matched draw, seed 300)"
+# Panel C y-scale. "symlog" is right when a run blows up (the 2_sparse-ladder
+# comparison had dH to +1022, which a linear axis flattens the rest against);
+# "linear" is right when every run stays O(1), where symlog's linthresh=1
+# instead squashes the entire signal into the linear stub around zero.
+DH_SCALE = "symlog"
+# Panel D shaded reference band, 0 -> KICK_BAND. Default 0.10 is the nominal
+# healthy max|F.dt|. Set to a specific run's own proven-safe maximum (and give
+# KICK_BAND_LABEL) when the point of the figure is "does this candidate stay
+# inside what the baseline already demonstrated".
+KICK_BAND = 0.10
+KICK_BAND_LABEL = None
 INK, MUTED, GRID = "#1a1a1a", "#5a5a5a", "#d9d9d9"
 
 def style_map(runs):
@@ -135,16 +152,30 @@ def main(csv_path, out_png):
     pad = max(pspread * 3, 0.0003)
     axB.set_ylim(pmean - pad, pmean + pad)
 
-    # (C) dH with accept/reject marker fill + symlog
+    # (C) dH with accept/reject marker fill; see DH_SCALE for why the scale is
+    # a knob rather than always symlog.
     _line_acc_rej(axC, df, sty, "dH")
     axC.axhline(0.0, color=MUTED, lw=0.8, ls="--", alpha=0.6, zorder=1)
-    axC.set_yscale("symlog", linthresh=1.0)
-    axC.set_ylim(-3, df["dH"].max() * 3)   # headroom so the largest reject marker isn't clipped
-    _finish(axC, "(C) ΔH  (symlog; open marker = rejected)", "dH")
+    if DH_SCALE == "symlog":
+        axC.set_yscale("symlog", linthresh=1.0)
+        axC.set_ylim(-3, df["dH"].max() * 3)  # headroom so the largest reject marker isn't clipped
+        _finish(axC, "(C) ΔH  (symlog; open marker = rejected)", "dH")
+    else:
+        lo, hi = df["dH"].min(), df["dH"].max()
+        pad = max((hi - lo) * 0.15, 1e-6)
+        axC.set_ylim(lo - pad, hi + pad)
+        _finish(axC, "(C) ΔH  (open marker = rejected)", "dH")
 
     # (D) max kick |F.dt| per trajectory (the integrator limiter); same acc/rej fill
     _line_acc_rej(axD, df, sty, "limiter_kick")
-    axD.axhspan(0.0, 0.10, color=GRID, alpha=0.35, zorder=0)  # nominal ~0.10 healthy band
+    axD.axhspan(0.0, KICK_BAND, color=GRID, alpha=0.35, zorder=0)
+    if KICK_BAND_LABEL:
+        # Sit the label halfway DOWN the band, not on its top edge: the top edge
+        # is exactly where the runs being compared against it cluster, so a label
+        # there lands on the data. The band's interior is empty by construction.
+        axD.annotate(KICK_BAND_LABEL, xy=(0.99, KICK_BAND * 0.5),
+                     xycoords=("axes fraction", "data"),
+                     fontsize=8, color=MUTED, ha="right", va="center")
     _finish(axD, "(D) Max kick  max|F·dt|  (open = rejected)", "max |F·dt|")
 
     # ring + annotate the cold trajectory on the wall-time panel only
@@ -174,8 +205,7 @@ def main(csv_path, out_png):
     # one figure-level legend (colour + marker = run)
     handles = [Line2D([0], [0], color=sty[r][0], marker=sty[r][1], lw=1.8, ms=7,
                       markeredgecolor="white", label=DISPLAY.get(r, r)) for r in runs]
-    fig.text(0.01, 0.98, "HMC run comparison — per-trajectory diagnostics (matched draw, seed 300)",
-             fontsize=13, color=INK, ha="left", va="top")
+    fig.text(0.01, 0.98, TITLE, fontsize=13, color=INK, ha="left", va="top")
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.945),
                frameon=False, fontsize=10, ncol=len(runs))
 
