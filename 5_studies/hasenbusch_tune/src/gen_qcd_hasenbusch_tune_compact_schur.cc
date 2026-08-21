@@ -529,7 +529,13 @@ int main(int argc, char **argv) {
   // TwoFlavourSchurCloverRatioActionQuda.h for why QudaCGSchurSolver (no
   // extra code) is the right tool: it already solves exactly the
   // M^dag M x = b, then apply M problem HeatbathSolver poses.
-  std::vector<std::unique_ptr<QudaCGSchurSolver>> HeatbathQudaSolver(n_pf);
+  // Base-pointer (not QudaCGSchurSolver) so a rung's heatbath can be EITHER
+  // plain QUDA-CG (HASEN_QUDA_CG_HEATBATH_RUNGS) or shared-MG GCR off the
+  // deriv donor (HASEN_MG_HEATBATH_RUNGS).  Both satisfy the same
+  // (Mpc^dag Mpc)^-1 contract refresh() needs, and
+  // TwoFlavourSchurCloverRatioActionQuda already holds the heatbath behind a
+  // QudaRungSolverBase* (dynamic_cast in its ctor), so nothing downstream cares.
+  std::vector<std::unique_ptr<QudaRungSolverBase>> HeatbathQudaSolver(n_pf);
 #endif
   auto parse_rung_list = [](const char *env) {
     std::set<int> out;
@@ -544,6 +550,21 @@ int main(int argc, char **argv) {
   std::set<int> mg_shared_rungs = parse_rung_list("HASEN_MG_SHARED_RUNGS");
   std::set<int> quda_cg_rungs = parse_rung_list("HASEN_QUDA_CG_RUNGS");
   std::set<int> quda_cg_heatbath_rungs = parse_rung_list("HASEN_QUDA_CG_HEATBATH_RUNGS");
+  // HASEN_MG_HEATBATH_RUNGS=<csv> -- route these rungs' heatbath (refresh())
+  // through shared-MG GCR at the NumOp mass (ladder[k+1]) instead of plain
+  // QUDA-CG, borrowing the SAME MG subspace the deriv donor already built.
+  // Rationale (measured on the base+G ladder, 3-sample FORCES_ONLY reference):
+  // the heatbath is 90.4 of 136 s per sample (66%), and PF0's refresh alone is
+  // 52.6 s vs its 9.4 s MG deriv -- refresh cost climbs steeply toward the
+  // critical mass (1.7 -> 52.6 s down the ladder) precisely because it is CG,
+  // while the MG deriv column stays flat (8-11 s).  The shared-MG constructor
+  // builds NO setup of its own, so on any rung where the deriv already runs MG
+  // the setup is already sunk and the marginal cost of this routing is ~zero.
+  // Takes precedence over HASEN_QUDA_CG_HEATBATH_RUNGS when a rung is in both.
+  // Needs an MG donor (HASEN_MG_RUNG) at a LOWER-OR-EQUAL index; falls back to
+  // CG with a warning if none exists by the time the rung is built.
+  // DEFAULT OFF -- unset reproduces the historical plain-CG heatbath exactly.
+  std::set<int> mg_heatbath_rungs = parse_rung_list("HASEN_MG_HEATBATH_RUNGS");
   // HASEN_QUDA_FORCE_RUNGS=<csv|all> -- these rungs' force ASSEMBLY (the four
   // hopping derivs + eight clover Cmunu derivs, the ~20 s/monomial floor at
   // 48^3) runs on QUDA fused kernels (TwoFlavourSchurCloverRatioQudaForceAction,
@@ -556,6 +577,48 @@ int main(int argc, char **argv) {
       for (int k = 0; k < n_pf; ++k) quda_force_rungs.insert(k);
     } else {
       quda_force_rungs = parse_rung_list("HASEN_QUDA_FORCE_RUNGS");
+    }
+  }
+  // ── FORCES_ONLY: de-route skipped rungs, and promote the MG donor ───────────
+  // FORCES_SKIP_RUNGS omits whole ratio rungs from the FORCES_ONLY sweep.  Two
+  // consequences must be handled HERE, before any solver is constructed:
+  //  (1) A skipped rung needs no QUDA solver -- drop it from every routing list
+  //      so none is built, and so the "not QUDA-routed" guard below (which
+  //      exit(1)s under the common HASEN_QUDA_FORCE_RUNGS=all) never fires on it.
+  //  (2) The MG donor is the lowest-index own-MG rung and builds its subspace
+  //      LAZILY, on its own first solve.  A skipped donor therefore never builds
+  //      it and every sharee asserts on a null handle (QudaMGSchurSolver.h:114,
+  //      reproduced 2026-08-11 with FORCES_SKIP_RUNGS=0 + MG_SHARED_RUNGS=1,2).
+  //      Keeping the donor's solver object alive does NOT help -- only running
+  //      it does -- so promote the lowest-index SURVIVING MG-capable rung to
+  //      own-MG donor and re-point the remaining survivors at it.
+  if (std::getenv("FORCES_ONLY") != nullptr) {
+    std::set<int> fo_skip = parse_rung_list("FORCES_SKIP_RUNGS");
+    if (std::getenv("FORCES_SKIP_LIGHT") != nullptr)
+      for (int k = 0; k < n_pf; ++k) fo_skip.insert(k);
+    if (!fo_skip.empty()) {
+      const bool donor_skipped = !mg_rungs.empty() && fo_skip.count(*mg_rungs.begin());
+      std::set<int> mg_capable;   // survivors that asked for MG, own or shared
+      for (int k : mg_rungs)        if (!fo_skip.count(k)) mg_capable.insert(k);
+      for (int k : mg_shared_rungs) if (!fo_skip.count(k)) mg_capable.insert(k);
+      auto drop = [&](std::set<int> &s) { for (int k : fo_skip) s.erase(k); };
+      drop(mg_rungs); drop(mg_shared_rungs); drop(quda_cg_rungs);
+      drop(quda_cg_heatbath_rungs); drop(quda_force_rungs); drop(mg_heatbath_rungs);
+      if (donor_skipped && !mg_capable.empty()) {
+        const int new_donor = *mg_capable.begin();
+        mg_rungs.clear();
+        mg_rungs.insert(new_donor);
+        mg_shared_rungs = mg_capable;
+        mg_shared_rungs.erase(new_donor);
+        std::cout << GridLogMessage
+                  << "[FORCES_ONLY] MG donor rung was skipped -- promoted rung "
+                  << new_donor << " to own-MG donor (sharees:";
+        for (int k : mg_shared_rungs) std::cout << " " << k;
+        std::cout << " )" << std::endl;
+      }
+      std::cout << GridLogMessage << "[FORCES_ONLY] de-routed skipped rungs:";
+      for (int k : fo_skip) std::cout << " " << k;
+      std::cout << std::endl;
     }
   }
 #ifdef GRID_HAVE_QUDA
@@ -659,7 +722,18 @@ int main(int argc, char **argv) {
       // a QUDA deriv/action solver (this loop branch) -- no infrastructure
       // exists yet to attach a QUDA heatbath solver to a plain-Grid-CG rung.
       OperatorFunction<LatticeFermion> *heatbath_solver_ptr = &CG_action;
-      if (quda_cg_heatbath_rungs.count(k)) {
+      // HASEN_MG_HEATBATH_RUNGS wins over HASEN_QUDA_CG_HEATBATH_RUNGS, but
+      // only if a donor actually exists by now (the donor is set when the
+      // lowest own-MG rung's solver is built, above, and this loop ascends).
+      bool want_mg_hb = mg_heatbath_rungs.count(k) != 0;
+      if (want_mg_hb && mg_donor == nullptr) {
+        std::cout << GridLogWarning << "[Ladder] rung " << k
+                  << " requested HASEN_MG_HEATBATH_RUNGS but no MG donor exists yet"
+                     " (HASEN_MG_RUNG must name a lower-or-equal rung) -- falling back"
+                     " to the plain QUDA-CG heatbath" << std::endl;
+        want_mg_hb = false;
+      }
+      if (want_mg_hb || quda_cg_heatbath_rungs.count(k)) {
         QudaCloverParams qp_hb;
         qp_hb.mass = ladder[k+1];  // NumOp mass -- refresh solves M_1^dag M_1
         qp_hb.csw  = csw;
@@ -667,13 +741,28 @@ int main(int argc, char **argv) {
         qp_hb.tol = cg_tol_act;  // heatbath sets phi for the whole trajectory -- match CG_action's tol
         qp_hb.max_iter = cg_max;
         qp_hb.gamma_basis = QUDA_DEGRAND_ROSSI_GAMMA_BASIS;
+        // false in BOTH branches: the shared-MG ctor asserts on it, because a
+        // sharee borrows the donor's setup rather than building its own.
         qp_hb.use_multigrid = false;
         if (std::getenv("QUDA_FORCE_RECON_NO") != nullptr)
           qp_hb.recon_sloppy = QUDA_RECONSTRUCT_NO;
-        HeatbathQudaSolver[k] = std::make_unique<QudaCGSchurSolver>(LightOps[k+1]->GaugeGrid(), qp_hb, Odd);
+        if (want_mg_hb) {
+          // GCR at ladder[k+1], preconditioned by the donor's subspace at
+          // ladder[donor].  Note ladder[k+1] is EXACTLY rung k+1's deriv mass,
+          // so for every rung but the last this is a mass the shared-MG path is
+          // already proven to solve well in the deriv column.
+          HeatbathQudaSolver[k] = std::make_unique<QudaMGSchurSolver>(
+              LightOps[k+1]->GaugeGrid(), qp_hb, Odd, mg_donor);
+        } else {
+          HeatbathQudaSolver[k] = std::make_unique<QudaCGSchurSolver>(
+              LightOps[k+1]->GaugeGrid(), qp_hb, Odd);
+        }
         heatbath_solver_ptr = HeatbathQudaSolver[k].get();
         std::cout << GridLogMessage << "[Ladder] rung " << k
-                  << " HeatbathSolver = QUDA CG, mass=" << ladder[k+1] << std::endl;
+                  << " HeatbathSolver = "
+                  << (want_mg_hb ? "QUDA MG-shared (GCR at own mass, donor's setup)"
+                                 : "QUDA CG")
+                  << ", mass=" << ladder[k+1] << std::endl;
       }
       if (quda_force_rungs.count(k)) {
         // Force-assembly Path B: same solver wiring, deriv assembly on QUDA.
@@ -972,19 +1061,43 @@ int main(int argc, char **argv) {
   // HASEN_TAIL_LEVEL=inner puts the bare-det tail on the fine gauge level —
   // Chroma's actual has_cancel_2flav placement (the cfg_2000 XML integrates it
   // in the inner n_steps=2 sub-integrator WITH lw_tree_gauge); default/outer =
-  // the historical placement with the ladder rungs.  Level membership only
-  // changes the integrator (discretization) error, not the sampled
-  // distribution: Metropolis stays exact either way (see Correctness above).
+  // the historical placement with the ladder rungs.  HASEN_TAIL_LEVEL=middle
+  // (3-level only) puts it on strange's level instead -- a 4x cut in tail
+  // evaluations vs inner (STRANGE_INNER_MULT-scaled cadence instead of
+  // gauge's), the lever the x5a-family mass-split campaign was built to
+  // unlock.  Level membership only changes the integrator (discretization)
+  // error, not the sampled distribution: Metropolis stays exact either way
+  // (see Correctness above).
   const char *tail_level_env = std::getenv("HASEN_TAIL_LEVEL");
   std::string tail_level = (tail_level_env && *tail_level_env) ? tail_level_env : "outer";
-  if (tail_level != "outer" && tail_level != "inner") {
-    std::cerr << "HASEN_TAIL_LEVEL must be 'outer' or 'inner', got '"
+  if (tail_level != "outer" && tail_level != "inner" && tail_level != "middle") {
+    std::cerr << "HASEN_TAIL_LEVEL must be 'outer', 'inner', or 'middle', got '"
               << tail_level << "'\n";
     exit(1);
   }
+  // HASEN_STRANGE_RUNGS=<csv> (3-level only) routes the listed ratio rungs
+  // (0-based, matching the k in "PF<k>") to strange's level instead of
+  // light's -- same mechanism as tail_level=middle, for a rung whose force
+  // needs strange's finer dt but whose solve is cheap enough that the extra
+  // evaluations (strange's cadence vs light's) are worth paying.  Empty/unset
+  // = every rung stays on light, today's behavior.  Orthogonal to SOLVER
+  // routing (HASEN_MG_RUNG / HASEN_QUDA_CG_RUNGS / etc.) -- this only picks
+  // which INTEGRATOR level a rung's already-built solver gets evaluated at.
+  std::set<int> strange_rungs = parse_rung_list("HASEN_STRANGE_RUNGS");
+  // Lstrange is declared at function scope but only wired into Aset in the
+  // 3-level branch below -- accepting either knob outside that branch would
+  // silently drop the routed action term from the integrator entirely (never
+  // evaluated, not even a crash).  Fail loudly instead.
+  if ((tail_level == "middle" || !strange_rungs.empty()) && !three_level) {
+    std::cerr << "HASEN_TAIL_LEVEL=middle / HASEN_STRANGE_RUNGS require the "
+                 "3-level integrator (HASEN_STRANGE_LEVEL=middle) -- strange "
+                 "is not a distinct level in 2-level mode.\n";
+    exit(1);
+  }
   std::cout << GridLogMessage << "[Ladder] tail level = " << tail_level
-            << (tail_level == "inner" ? " (with gauge — Chroma has_cancel placement)"
-                                      : " (with the ladder rungs)")
+            << (tail_level == "inner"    ? " (with gauge — Chroma has_cancel placement)"
+                : tail_level == "middle" ? " (with strange)"
+                                         : " (with the ladder rungs)")
             << std::endl;
 
   if (!three_level) {
@@ -1013,9 +1126,13 @@ int main(int argc, char **argv) {
               << "  strange=" << n_strange << "  gauge=" << n_gauge << std::endl;
     Llight.push_back(LightLogDetPtr);
     Llight.push_back(StrangeLogDetPtr);   // negligible force -> cheapest (coarsest) slot
-    for (auto &pf : RatioPF) Llight.push_back(pf.get());
-    if (tail_level == "inner") Lgauge.push_back(LightTailSchur);
-    else                       Llight.push_back(LightTailSchur);
+    for (int k = 0; k < n_pf; ++k) {
+      if (strange_rungs.count(k)) Lstrange.push_back(RatioPF[k].get());
+      else                        Llight.push_back(RatioPF[k].get());
+    }
+    if      (tail_level == "inner")  Lgauge.push_back(LightTailSchur);
+    else if (tail_level == "middle") Lstrange.push_back(LightTailSchur);
+    else                              Llight.push_back(LightTailSchur);
     Lstrange.push_back(&StrangeSchurPF);
     Lgauge.push_back(&GaugeAction);
     Aset.push_back(Llight);     // coarsest pushed first
@@ -1045,24 +1162,146 @@ int main(int argc, char **argv) {
   // norm (the Hasenbusch tuning signal), averaged over FORCES_SAMPLES draws.
   // FORCES_SKIP_STRANGE=1 omits the expensive strange RHMC force.  Combine with
   // TUNE_CG_TOL_* for fast tuning iterations (no full trajectory needed).
+  // FORCES_SKIP_RUNGS=i,j,...  omits specific PF ratio rungs by 0-based index.
+  // FORCES_SKIP_TAIL=1         omits the bare-det tail (LightSchurPF).
+  // Use when only a subset of rungs changed vs the previous scan: the forces on
+  // unchanged rungs are identical (same gauge config, same seeds), so recomputing
+  // them wastes time.  E.g. scanning only mid-ladder rungs 2,3:
+  //   FORCES_SKIP_RUNGS=0,1,4 FORCES_SKIP_TAIL=1  (skip unchanged light+heavy end)
+  //   FORCES_SKIP_RUNGS=0,1   (skip near-critical end, keep tail in the output)
+  // LightLogDet is NOT covered (use FORCES_SKIP_LIGHT); each PF rung index
+  // matches the k in "PF<k>" printed in the log.
+  // CAVEAT 1 (pRNG coupling): refresh() draws from ONE shared pRNG stream, in ref
+  // order, ACROSS samples.  A skipped rung does not consume its draw, so every
+  // level after it -- including the next SAMPLE's early levels -- sees different
+  // noise than in a full run.  Measured 2026-08-11 (base+G, seed 300): sample 0
+  // reproduced the full run bit-for-bit, samples 1-2 drifted ~2% on avg and ~5%
+  // on max.  Consequence: only compare scans that share the SAME skip set.  To
+  // compare against an older ladder, re-run that ladder as a control INSIDE the
+  // skipped scan rather than quoting its numbers from a full scan.
+  // CAVEAT 2 (MG donor): do not skip the rung named by HASEN_MG_RUNG while any
+  // HASEN_MG_SHARED_RUNGS rung is still live -- the donor builds its MG subspace
+  // only when it solves.  Enforced with a fatal error below.
   if (std::getenv("FORCES_ONLY") != nullptr) {
     int nsamp = 1;
     if (const char *ns = std::getenv("FORCES_SAMPLES"); ns && *ns) nsamp = std::atoi(ns);
     const bool skip_strange = std::getenv("FORCES_SKIP_STRANGE") != nullptr;
     const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
     const bool skip_light   = std::getenv("FORCES_SKIP_LIGHT")   != nullptr;  // LogDet + PF ladder + Schur PF
+    const bool skip_tail    = std::getenv("FORCES_SKIP_TAIL")    != nullptr;  // bare-det tail (LightSchurPF) only
+    std::set<int> skip_rungs;
+    if (const char *sr = std::getenv("FORCES_SKIP_RUNGS"); sr && *sr) {
+      std::stringstream ss(sr); std::string tok;
+      while (std::getline(ss, tok, ',')) if (!tok.empty()) skip_rungs.insert(std::atoi(tok.c_str()));
+    }
     auto skip = [&](const std::string &nm) {
-      return (skip_strange && (nm == "Strange" || nm == "StrangeLogDet")) ||
-             (skip_gauge && nm == "Gauge") ||
-             (skip_light && (nm == "LightLogDet" || nm == "LightSchurPF" || nm.rfind("PF", 0) == 0));
+      if (skip_strange && (nm == "Strange" || nm == "StrangeLogDet")) return true;
+      if (skip_gauge   && nm == "Gauge") return true;
+      if (skip_light   && (nm == "LightLogDet" || nm == "LightSchurPF" || nm.rfind("PF", 0) == 0)) return true;
+      if (skip_tail    && nm == "LightSchurPF") return true;
+      if (!skip_rungs.empty() && nm.rfind("PF", 0) == 0) {
+        int k = std::atoi(nm.c_str() + 2);
+        if (skip_rungs.count(k)) return true;
+      }
+      return false;
     };
+    // ── pRNG compensation for skipped rungs ──────────────────────────────────
+    // Each ratio rung's refresh() draws EXACTLY one gaussian on the full fermion
+    // grid (TwoFlavourSchurCloverRatioAction.h), the bare-det tail draws exactly
+    // one too (TwoFlavourSchurCloverAction.h), and LightLogDet draws none (empty
+    // refresh).  Grid's GridParallelRNG is per-site, so replaying that single
+    // draw and discarding it advances the RNG state exactly as the real refresh
+    // would have.  A skipped run is then bit-identical to a full run on every
+    // rung it DOES compute, for EVERY sample -- not just sample 0 -- so skipped
+    // and full scans stay paired draw-for-draw.  Cost is one gaussian fill
+    // (~tens of ms) in place of a 10-90 s solve.
+    // Scope is deliberately limited to the rungs/tail skipped via the two NEW
+    // knobs (FORCES_SKIP_RUNGS / FORCES_SKIP_TAIL), so every pre-existing env
+    // combination -- FORCES_SKIP_LIGHT / _STRANGE / _GAUGE -- still reproduces
+    // its historical numbers untouched.  FORCES_SKIP_NO_RNG_COMPENSATE=1 opts
+    // out (restores the raw stream-shifting behaviour).
+    const bool rng_compensate = (!skip_rungs.empty() || skip_tail) && !skip_light
+                             && std::getenv("FORCES_SKIP_NO_RNG_COMPENSATE") == nullptr;
+    auto skipped_by_new_knobs = [&](const std::string &nm) {
+      if (skip_tail && nm == "LightSchurPF") return true;
+      if (!skip_rungs.empty() && nm.rfind("PF", 0) == 0)
+        return skip_rungs.count(std::atoi(nm.c_str() + 2)) != 0;
+      return false;
+    };
+    std::unique_ptr<WCF::FermionField> rng_eta;
+    if (rng_compensate) {
+      rng_eta = std::make_unique<WCF::FermionField>(LightOps[0]->FermionGrid());
+      std::cout << GridLogMessage
+                << "[FORCES_ONLY] pRNG compensation ON: skipped rungs/tail still "
+                   "consume their heatbath draw -- computed rungs match a full run"
+                << std::endl;
+    }
     LatticeGaugeField force(&Grid_);
     const int nref = (int)ForceObs.refs.size();
     std::vector<double> acc_avg(nref, 0.0), acc_max(nref, 0.0), acc_time(nref, 0.0), acc_refresh(nref, 0.0);
+#ifdef GRID_HAVE_QUDA
+    // Everything that BORROWS the donor's MG handle: shared-MG deriv rungs AND
+    // shared-MG heatbath rungs.  The heatbath borrowers matter for the donor's
+    // lifetime exactly as much as the deriv ones -- e.g. HASEN_MG_RUNG=0
+    // HASEN_MG_SHARED_RUNGS=1,2 HASEN_MG_HEATBATH_RUNGS=0,1,2,3 would otherwise
+    // free the donor after rung 2's last sample and leave rung 3's heatbath a
+    // dangling donor (the same null-handle abort seen 2026-07-09).
+    std::set<int> mg_borrowers = mg_shared_rungs;
+    mg_borrowers.insert(mg_heatbath_rungs.begin(), mg_heatbath_rungs.end());
+    const bool have_shared = !mg_borrowers.empty() && !mg_rungs.empty();
+    const int  donor_rung  = have_shared ? *mg_rungs.begin() : -1;
+    // Highest-index shared rung that is actually EVALUATED.  A skipped sharee
+    // never reaches the in-loop free path, so the donor's deferred free must
+    // key off the last LIVE sharee, not the nominal last one.  -1 => no live
+    // sharee at all, so nothing borrows the donor's MG handle.
+    int last_live_sharee = -1;
+    if (have_shared && !skip_light)
+      for (int r : mg_borrowers)
+        if (!skip_rungs.count(r)) last_live_sharee = std::max(last_live_sharee, r);
+    // Free QUDA solvers for any rungs that will be entirely skipped -- they
+    // will never reach the end-of-last-sample free path in the loop below, so
+    // we release them here to keep peak GPU memory bounded.  EXCEPTION: the MG
+    // donor, if a live sharee still borrows its handle (FORCES_SKIP_RUNGS=0
+    // with HASEN_MG_SHARED_RUNGS=1,2 is exactly this case) -- freeing it here
+    // would leave the sharee a dangling donor (null-handle assert, 2026-07-09).
+    // The in-loop path frees it after the last live sharee instead.
+    // HARD ERROR: skipping the MG donor while a sharee still runs cannot work.
+    // The donor's MG subspace is BUILT lazily, by the donor's own first solve --
+    // so a skipped donor never builds it and the sharee hits
+    // "shared-MG solve before donor built its MG" (QudaMGSchurSolver.h:114,
+    // reproduced 2026-08-11 with FORCES_SKIP_RUNGS=0 + HASEN_MG_SHARED_RUNGS=1,2).
+    // Retaining the donor's solver object does NOT help; only running it does.
+    // Fail here with the fix spelled out rather than mid-run with a raw assert.
+    if (have_shared && skip_rungs.count(donor_rung) && last_live_sharee >= 0) {
+      std::cout << GridLogError
+                << "[FORCES_ONLY] FATAL: FORCES_SKIP_RUNGS skips rung " << donor_rung
+                << ", which is the MG donor (HASEN_MG_RUNG), but shared rung "
+                << last_live_sharee << " is still live and borrows its MG subspace.\n"
+                << "  The donor builds its MG only when it solves, so a skipped donor "
+                << "leaves the sharee a null handle.\n"
+                << "  Fix: either also skip every HASEN_MG_SHARED_RUNGS rung, or point "
+                << "HASEN_MG_RUNG at a rung you are NOT skipping\n"
+                << "  (e.g. skipping 0,1 -> HASEN_MG_RUNG=2 with HASEN_MG_SHARED_RUNGS=3)."
+                << std::endl;
+      assert(0 && "FORCES_SKIP_RUNGS skips the MG donor while a sharee is live");
+    }
+    for (int k : skip_rungs) {
+      if (k >= 0 && k < (int)QudaRungSolver.size() && QudaRungSolver[k]) {
+        QudaRungSolver[k].reset();
+        std::cout << GridLogMessage << "[FORCES_ONLY] freed QUDA solver for skipped rung " << k << std::endl;
+      }
+    }
+#endif
     Smear.set_Field(Umu);   // smear the fixed config once (deterministic)
     for (int s = 0; s < nsamp; ++s)
       for (int i = 0; i < nref; ++i) {
-        if (skip(ForceObs.refs[i].name)) continue;
+        if (skip(ForceObs.refs[i].name)) {
+          // Consume the heatbath draw this level would have taken, so the rungs
+          // we DO evaluate see the same noise they would in a full run.
+          if (rng_compensate && skipped_by_new_knobs(ForceObs.refs[i].name))
+            gaussian(pRNG, *rng_eta);
+          continue;
+        }
         Action<LatticeGaugeField> *act = ForceObs.refs[i].act;
         double ftime, rtime = 0.0;
         if (act->is_smeared) {
@@ -1131,14 +1370,13 @@ int main(int argc, char **argv) {
           // assert, 2026-07-09).  Defer the donor's free to the last
           // sharee; everything else frees as before.  No memory-cap change:
           // the donor is alive through every earlier sweep regardless.
-          const bool have_shared = !mg_shared_rungs.empty() && !mg_rungs.empty();
-          const int  donor_rung  = have_shared ? *mg_rungs.begin() : -1;
-          const int  last_sharee = have_shared ? *mg_shared_rungs.rbegin() : -1;
-          if (have_shared && k == donor_rung && k < last_sharee) {
-            // sharees still pending in this final sweep -- keep the donor
+          // have_shared / donor_rung / last_live_sharee are computed once before
+          // the sample loop (see the skipped-rung free block above).
+          if (have_shared && k == donor_rung && k < last_live_sharee) {
+            // live sharees still pending in this final sweep -- keep the donor
           } else {
             free_rung(k);
-            if (have_shared && k == last_sharee) free_rung(donor_rung);
+            if (have_shared && k == last_live_sharee) free_rung(donor_rung);
           }
         }
 #endif
