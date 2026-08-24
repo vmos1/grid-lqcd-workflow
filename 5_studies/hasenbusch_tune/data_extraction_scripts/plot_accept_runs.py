@@ -67,6 +67,12 @@ DH_SCALE = "symlog"
 # inside what the baseline already demonstrated".
 KICK_BAND = 0.10
 KICK_BAND_LABEL = None
+# Legend columns. None = auto: one row while it fits, two columns past three
+# runs. These labels carry the integrator config ("C3 = w3 + tail on strange
+# level (3-level, MDSTEPS=6)"), so four of them on one row overrun the 11"
+# canvas and get clipped at BOTH edges -- and fig.legend gives no warning when
+# it does. Wrapping costs one row of top margin, which main() reserves.
+LEGEND_NCOL = None
 INK, MUTED, GRID = "#1a1a1a", "#5a5a5a", "#d9d9d9"
 
 def style_map(runs):
@@ -131,9 +137,12 @@ def main(csv_path, out_png):
     # overlap the title/legend in the PDF from the very same figure object.
     # Fixed figure-fraction margins below render byte-for-byte identically
     # across every output format.
+    ncol = LEGEND_NCOL or (len(runs) if len(runs) <= 3 else 2)
+    legend_rows = -(-len(runs) // ncol)
+
     fig, axes = plt.subplots(2, 2, figsize=(11, 8.6))
-    fig.subplots_adjust(top=0.84, bottom=0.08, left=0.07, right=0.97,
-                         hspace=0.55, wspace=0.28)
+    fig.subplots_adjust(top=0.84 - 0.03 * (legend_rows - 1), bottom=0.08,
+                         left=0.07, right=0.97, hspace=0.55, wspace=0.28)
     (axA, axB), (axC, axD) = axes
 
     # (A) wall time in seconds
@@ -207,7 +216,7 @@ def main(csv_path, out_png):
                       markeredgecolor="white", label=DISPLAY.get(r, r)) for r in runs]
     fig.text(0.01, 0.98, TITLE, fontsize=13, color=INK, ha="left", va="top")
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.945),
-               frameon=False, fontsize=10, ncol=len(runs))
+               frameon=False, fontsize=10, ncol=ncol)
 
     # No bbox_inches="tight": that crops to a per-backend-recomputed tight
     # bounding box (raster vs vector renderers measure text extents

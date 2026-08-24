@@ -48,7 +48,7 @@ python3 forces_only_ladder_cost.py runs/<scan>/* --baseline <ref> --exponents
 
 ## Acceptance-run family (real HMC trajectories, not FORCES_ONLY)
 
-Everything above reads `FORCES_ONLY` screening logs. These four read **real
+Everything above reads `FORCES_ONLY` screening logs. These read **real
 acceptance-run logs** — full trajectories with a Metropolis step — and answer a
 different question: "did this candidate actually work, and how fast was it".
 
@@ -56,8 +56,9 @@ different question: "did this candidate actually work, and how fast was it".
 |---|---|
 | `accept_run_tables.py` | the log parser for acceptance runs, importable (`parse`, `build_columns`, `buckets`) and a CLI. Per-trajectory physics + force-time split (Table 1) and per-piece `max/avg` `\|F·dt\|` (Table 2). `--csv` writes a tidy CSV |
 | `compare_runs_multiwindow.py` | **N-run cross-comparison**, each run spanning several checkpoint-resumed log windows. Imports the parser above — no parsing is reimplemented. Emits config / summary / efficiency / observable / per-sector tables plus every run's Table 1 + Table 2 |
-| `obs_autocorr_compare.py` | autocorrelation-corrected observable comparison from that CSV: `τ_int` (Madras–Sokal automatic windowing), corrected errors, block errors, and pairwise z-scores vs the first run |
+| `obs_autocorr_compare.py` | autocorrelation-corrected observable comparison from that CSV: `τ_int` (Madras–Sokal automatic windowing), corrected errors, block errors, and pairwise z-scores vs the first run. `--pooled` adds a second report that averages ρ(t) **across** runs before windowing (see below) |
 | `plot_accept_runs.py` | the 2×2 per-trajectory figure (wall time / plaquette / ΔH / max kick) from the tidy CSV. Writes PNG + PDF |
+| `regen_c1c2c3_comparison.sh` | **one command that rebuilds the whole base+G / C1 / C2 / C3 comparison** — tables, pooled-τ report and figure — from the raw logs. It *is* the run manifest: which log windows make up each run and which ladder each ran, which nothing else records in executable form |
 
 Two things worth knowing before reaching for these:
 
@@ -72,14 +73,32 @@ Two things worth knowing before reaching for these:
   chains that sample the same distribution. This is not hypothetical: it put
   C1's smeared plaquette at +3.28σ from the baseline, versus +1.69σ once
   corrected. Run `obs_autocorr_compare.py` and quote its corrected column.
+* **`--pooled` when — and only when — the runs share an action.** At N=20 the
+  per-run τ_int is itself noisy, and it is noisy in a way *correlated* with the
+  mean it corrects, so it can inflate one arm's error more than another's for no
+  physical reason. If the runs share an action and trajectory length they share
+  one true τ_int, so pooling ρ(t) over them is less noisy and applies a single
+  inflation factor to every arm. That holds for C1/C2/C3 vs base+G (same action,
+  different integrator); it does **not** hold across codebases, so the
+  Grid-vs-Chroma comparison uses the per-run mode.
 
 `plot_accept_runs.py` exposes module-level knobs so a caller can retarget it
 without forking: `PALETTE`, `DISPLAY`, `TITLE`, `DH_SCALE` (`"symlog"` default,
 set `"linear"` when no run blows up — symlog's `linthresh=1` squashes O(1) ΔH
-into the linear stub around zero) and `KICK_BAND` / `KICK_BAND_LABEL` (panel D's
+into the linear stub around zero), `KICK_BAND` / `KICK_BAND_LABEL` (panel D's
 shaded reference, default the nominal 0.10; set it to a specific run's own
-proven-safe max when that is the comparison being made). `plot_c1c2_baseline.py`
-is a worked example of such a driver.
+proven-safe max when that is the comparison being made) and `LEGEND_NCOL`
+(default auto: one row up to 3 runs, 2 columns past that — four of these labels
+on one row overrun the canvas and are silently clipped at both edges).
+`plot_c1c2c3_baseline.py` is a worked example of such a driver.
+
+The whole four-run comparison, in one command:
+
+```bash
+./regen_c1c2c3_comparison.sh              # tables + pooled-τ report + figure
+```
+
+or step by step, if only one piece is needed:
 
 ```bash
 python3 compare_runs_multiwindow.py \
@@ -87,15 +106,41 @@ python3 compare_runs_multiwindow.py \
     --run 'C1 (u1a)=<parent.log>,<ext.log>' \
     --ladder 'base+G=-0.2416,-0.2400,-0.2320,-0.2180,-0.1870' \
     --csv out.csv
-python3 obs_autocorr_compare.py out.csv
-python3 plot_c1c2_baseline.py out.csv <fig>.png
+python3 obs_autocorr_compare.py out.csv --pooled
+python3 plot_c1c2c3_baseline.py out.csv <fig>.png
 ```
 
-Worked output: `__docs/2026_8_20_c1_c2_vs_baseg_comparison.md`.
+Worked output: `__docs/2026_8_20_c1_c2_c3_vs_baseg_comparison.md`.
 
 Only `plot_accept_runs.py` (and drivers over it) needs third-party packages —
-`pandas` + `matplotlib`, via `module load python/3.12-26.1.0`. The other three
-are stdlib-only like everything above.
+`pandas` + `matplotlib`, via `module load python/3.12-26.1.0`. Everything else
+is stdlib-only, which is why `regen_c1c2c3_comparison.sh` skips just the figure
+step with a warning if they are missing rather than failing.
+
+## GPU memory traces (not a log parser)
+
+`memtrace_peaks.py` reads the `nvidia-smi` polling traces written by
+`submit_scripts/hasenbusch_tune/2026_8_20_mem_wrapper.sh` — one
+`memtrace_<node>.log` per node, one GPU sampled per node at a 2 s poll. With
+`--gpus-per-task=1` and 4 ranks/node the sampled GPU's usage *is* one rank's
+exclusive usage, so the peak it reports is a clean per-rank figure.
+
+```bash
+python3 memtrace_peaks.py <run_dir> [<run_dir> ...]
+```
+
+Prints per node: peak MiB used, card total, seconds-into-run at which the peak
+landed, and headroom left. Written for the x5a2b 4-node OOM diagnosis, where it
+established that memory climbs ~5667 MiB per Hasenbusch rung and that the
+device-memory pool costs a flat ~10.4 GiB regardless of ladder — see
+`__docs/2026_8_21_x5a2b_oom_diagnosis.md`.
+
+Two traps it encodes, both of which produced plausible-looking wrong answers
+first: the node label must come from `os.path.basename` (the string
+`memtrace_` appears in both the run-dir name and the file name, so a naive
+`split` collapses every node onto one key), and a **host**-RAM OOM never says
+"out of memory" in the log — it surfaces as an OFI transport cascade, and only
+`sacct` reveals it.
 
 ## Environment
 
