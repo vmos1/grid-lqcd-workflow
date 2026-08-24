@@ -29,8 +29,20 @@ not a precision one. It is used here only to answer "is the difference
 resolvable at all", which is robust to that noise -- not to quote a final
 uncertainty on the plaquette.
 
+`--pooled` adds a second report that pools rho(t) across ALL runs in the CSV.
+Justification: if the runs share an action and a trajectory length they share
+one true tau_int, so each run's rho(t) is an independent estimate of the same
+quantity and averaging them is 4x less noisy than any single-run estimate. It
+then applies ONE inflation factor sqrt(2*tau_pooled) to every run, which keeps
+the comparison symmetric -- the per-run estimator can otherwise inflate one
+arm's error more than another's purely from tau noise, which is exactly the
+failure mode the CAVEAT above warns about. Also prints the tau implied by the
+binned errors alone (no autocorrelation model at all) as an independent
+cross-check. Use pooled when the runs are same-action variants (C1/C2/C3 vs
+base+G); use per-run when they are not (Grid vs Chroma).
+
 Usage:
-  obs_autocorr_compare.py <csv> [obs_column ...]
+  obs_autocorr_compare.py <csv> [--pooled] [obs_column ...]
 """
 import sys
 from math import sqrt
@@ -71,6 +83,20 @@ def tau_int(v, c=5.0):
     return max(tau, 0.5), w
 
 
+def tau_from_rho(rs, c=5.0):
+    """Same Madras-Sokal windowing as tau_int, but from a precomputed rho list
+    (so a POOLED rho, averaged over runs, can be fed in)."""
+    tau, w = 0.5, 0
+    for t in range(1, len(rs) + 1):
+        tau += rs[t - 1]
+        w = t
+        if tau <= 0:
+            return 0.5, w
+        if t >= c * tau:
+            break
+    return max(tau, 0.5), w
+
+
 def binned_err(v, b):
     """SEM of non-overlapping block means of length b (drops a short tail)."""
     nb = len(v) // b
@@ -80,7 +106,8 @@ def binned_err(v, b):
     return sqrt(var(blocks) / nb)
 
 
-def main(csv_path, obs_cols):
+def load(csv_path, obs_cols):
+    """Tidy CSV -> ({run: {obs: [values]}}, [run order as first seen])."""
     import csv as _csv
     data = {}
     order = []
@@ -92,6 +119,68 @@ def main(csv_path, obs_cols):
                 order.append(run)
             for c in obs_cols:
                 data[run][c].append(float(r[c]))
+    return data, order
+
+
+def pooled_report(data, order, obs_cols, nlag=9):
+    """Pool rho(t) over all runs -> one tau_int, one inflation factor for all.
+
+    Only defensible when the runs share an action and trajectory length, so
+    that one true tau_int exists. See the module docstring."""
+    ref = order[0]
+    print("\n## Pooled ρ(t), averaged over the %d runs (each an independent estimate)\n"
+          % len(order))
+    print("| observable | " + " | ".join("ρ(%d)" % t for t in range(1, 7))
+          + " | pooled τ_int (W) |")
+    print("|:---|" + "---:|" * 7)
+    pooled_tau = {}
+    for c in obs_cols:
+        rs = [mean([autocorr(data[run][c], t) for run in order])
+              for t in range(1, nlag + 1)]
+        t, w = tau_from_rho(rs)
+        pooled_tau[c] = t
+        print("| %s | " % c + " | ".join("%+.3f" % x for x in rs[:6])
+              + " | **%.2f (%d)** |" % (t, w))
+
+    print("\n## Independent cross-check: τ_int implied by the BINNED errors")
+    print("   (no autocorrelation model at all)  τ_implied = (err_binned/err_naive)²/2\n")
+    print("| observable | run | naive | binned b=4 | binned b=5 "
+          "| τ implied (b=4) | (b=5) |")
+    print("|:---|:---|---:|---:|---:|---:|---:|")
+    for c in obs_cols:
+        for run in order:
+            v = data[run][c]
+            nv = sqrt(var(v) / len(v))
+            b4, b5 = binned_err(v, 4), binned_err(v, 5)
+            if b4 is None or b5 is None or nv == 0:
+                continue
+            print("| %s | %s | %.2e | %.2e | %.2e | %.2f | %.2f |"
+                  % (c, run, nv, b4, b5, (b4 / nv) ** 2 / 2, (b5 / nv) ** 2 / 2))
+
+    print("\n## z-scores vs %s under three error models\n" % ref)
+    for c in obs_cols:
+        f = sqrt(2 * pooled_tau[c])
+        print("### %s   (pooled τ_int = %.2f ⇒ one inflation factor √(2τ) = %.2f "
+              "for every run)\n" % (c, pooled_tau[c], f))
+        print("| candidate | Δ | z naive | z per-run τ | **z POOLED τ** |")
+        print("|:---|---:|---:|---:|---:|")
+        vr = data[ref][c]
+        nr = sqrt(var(vr) / len(vr))
+        tr, _ = tau_int(vr)
+        for run in order[1:]:
+            v = data[run][c]
+            nv = sqrt(var(v) / len(v))
+            tv, _ = tau_int(v)
+            d = mean(v) - mean(vr)
+            zn = d / sqrt(nr ** 2 + nv ** 2)
+            zi = d / sqrt((nr * sqrt(2 * tr)) ** 2 + (nv * sqrt(2 * tv)) ** 2)
+            zp = d / (f * sqrt(nr ** 2 + nv ** 2))
+            print("| %s | %+.2e | %+.2f | %+.2f | **%+.2f** |" % (run, d, zn, zi, zp))
+        print()
+
+
+def main(csv_path, obs_cols, pooled=False):
+    data, order = load(csv_path, obs_cols)
 
     ref = order[0]
     for c in obs_cols:
@@ -122,7 +211,15 @@ def main(csv_path, obs_cols):
             zc = d / sqrt(c0 ** 2 + c1 ** 2)
             print(f"| {run} | {d:+.2e} | {zn:+.2f}σ | **{zc:+.2f}σ** |")
 
+    if pooled:
+        pooled_report(data, order, obs_cols)
+
 
 if __name__ == "__main__":
-    cols = sys.argv[2:] or ["plaquette", "plaquette_smeared", "poly_re", "poly_im"]
-    main(sys.argv[1], cols)
+    argv = sys.argv[1:]
+    want_pooled = "--pooled" in argv
+    argv = [a for a in argv if a != "--pooled"]
+    if not argv:
+        sys.exit(__doc__)
+    cols = argv[1:] or ["plaquette", "plaquette_smeared", "poly_re", "poly_im"]
+    main(argv[0], cols, pooled=want_pooled)
