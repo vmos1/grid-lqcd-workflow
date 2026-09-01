@@ -59,6 +59,8 @@ grid_qcd/                              ← top-level working directory
 │   │   ├── hmc_obs                    ← CLI: extract / autocorr / summary
 │   │   ├── requirements.txt
 │   │   └── README.md
+│   ├── 6_benchmarks/                   ← controlled implementation comparisons
+│   │   └── grid_quda_wilson_clover/   ← stock Grid vs stock QUDA Wilson(-clover)
 │   └── common/
 │       └── run_exec.sh                ← general MPI runner (macOS)
 │
@@ -234,6 +236,14 @@ cd 5_studies/hasenbusch_tune && bash perlmutter/build_driver_puregrid.sh
 
 Submit via that machine's sbatch scripts (on lq: `$BASE_DIR/submit_scripts/`; on
 Perlmutter: `5_studies/hasenbusch_tune/perlmutter/`).
+
+---
+
+## Step 6 — Controlled benchmarks
+
+`6_benchmarks/` contains implementation comparisons kept separate from physics-tuning
+campaigns. See the [Grid versus QUDA Wilson/Wilson-clover protocol](6_benchmarks/grid_quda_wilson_clover/2026_8_25_README.md)
+for the stock-code fixed-work and matched-CG study.
 
 ---
 
