@@ -47,6 +47,7 @@
 
 #include <Grid/Grid.h>
 #include "quda_grid_bridge.h"
+#include "grid_wilson_clover_operator.h"
 
 #include <algorithm>
 #include <cmath>
@@ -104,6 +105,17 @@ double read_double(int argc, char **argv, const std::string &option, double fall
 
 struct BenchmarkOptions {
   std::string action = "both";       // wilson | clover | both
+  // Grid clover representation. QUDA is compact-only, so `standard` (non-compact
+  // WilsonCloverFermion) is NOT apples-to-apples with QUDA on the clover term;
+  // `compact` (CompactWilsonCloverFermion) is. Default standard preserves the
+  // historical benchmark. Ignored for action=wilson.
+  std::string clover_impl = "standard";  // standard | compact
+  // Number of right-hand sides for the OPTIONAL multi-RHS pass. nrhs<=1 disables
+  // it entirely, so every existing run and every archived number is unchanged.
+  // When >1 the harness additionally runs Grid's CompactWilsonCloverFermion5D
+  // (batched, N sources at once) against QUDA's single-RHS solver run N times.
+  // That is a THROUGHPUT comparison, not a backend ratio -- see run_multirhs.
+  int nrhs = 1;
   std::string input = "hot";         // hot | physical
   double mass = -0.2416;
   double csw = 1.20536588031793;
@@ -145,6 +157,8 @@ BenchmarkOptions parse_options(int argc, char **argv)
 {
   BenchmarkOptions o;
   o.action        = read_string(argc, argv, "--benchmark-action", o.action);
+  o.clover_impl   = read_string(argc, argv, "--benchmark-clover-impl", o.clover_impl);
+  o.nrhs          = read_int(argc, argv, "--benchmark-nrhs", o.nrhs);
   o.input         = read_string(argc, argv, "--benchmark-input", o.input);
   o.mass          = read_double(argc, argv, "--benchmark-mass", o.mass);
   o.csw           = read_double(argc, argv, "--benchmark-csw", o.csw);
@@ -166,6 +180,10 @@ BenchmarkOptions parse_options(int argc, char **argv)
 
   if (o.action != "wilson" && o.action != "clover" && o.action != "both")
     fail("--benchmark-action must be wilson|clover|both");
+  if (o.clover_impl != "standard" && o.clover_impl != "compact")
+    fail("--benchmark-clover-impl must be standard|compact");
+  if (o.nrhs < 1)
+    fail("--benchmark-nrhs must be >= 1 (1 disables the multi-RHS pass)");
   if (o.input != "hot" && o.input != "physical")
     fail("--benchmark-input must be hot|physical");
   if (o.precision != "strict" && o.precision != "production")
@@ -423,6 +441,7 @@ void add_case_fields(JsonlWriter::Record &record, const BenchmarkOptions &opt,
       .add("mass", opt.mass)
       .add("csw", opt.csw)
       .add("action", action)
+      .add("clover_impl", opt.clover_impl)
       .add("op", op)
       .add("precision", opt.precision)
       // The resolved knobs, not just the preset name: a record must say what
@@ -501,10 +520,9 @@ void measure_op(MeasureContext &ctx, const std::string &op_name,
 // Per-action benchmark: Dslash, full matrix, preconditioned normal operator,
 // (clover only) local clover multiply/inverse, and the matched CG solve.
 //
-// FermionAction is WilsonFermionD (Wilson control) or a WilsonFermionD&
-// reference bound to a WilsonCloverFermionD object (WilsonCloverFermion
-// derives from WilsonFermion, so Dhop/DhopOE/DhopEO/M/Mooee/MooeeInv all
-// resolve correctly through the base reference).
+// The Grid operator is owned by `gridop` (GridWilsonCloverOperator); the harness
+// only ever calls its apply_*/solve_* methods, mirroring the QudaOperator calls
+// so the two backends are compared op-for-op on identical sources.
 // ---------------------------------------------------------------------
 
 // The two knobs that decompose QUDA's speedup. `precise` deliberately stays
@@ -543,19 +561,21 @@ const std::vector<int> kSourceSeeds({11, 22, 33, 44});
 // that actually needs 100 restarts will show it in restarts_all.
 constexpr int kMixedOuterIterations = 100;
 
-// Dw_f / UrbGrid_f are the single-precision counterparts, non-null only when
-// --benchmark-grid-solver=mixed. They exist because Grid's
-// MixedPrecisionConjugateGradient needs a linear operator in BOTH precisions
-// at construction; there is no way to derive the single-precision one from the
-// double. The single-precision grid is genuinely separate, not a view: vComplexF
-// has a different SIMD width from vComplexD.
-void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
-                WilsonFermionF *Dw_f, GridRedBlackCartesian *UrbGrid_f,
+// The Grid operator (Wilson / standard clover / compact clover, plus its
+// optional single-precision twin for the mixed solve) is owned by `gridop`; this
+// harness sees only its apply_*/solve_* methods and never a Grid fermion class
+// directly. The QUDA counterpart is constructed below and the two are compared
+// op-for-op on identical sources. The single-precision twin exists because Grid's
+// MixedPrecisionConjugateGradient needs a linear operator in BOTH precisions at
+// construction, on a genuinely separate single-precision grid (vComplexF has a
+// different SIMD width from vComplexD).
+void run_action(const std::string &action_name, GridWilsonCloverOperator &gridop,
                 GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
                 LatticeGaugeField &Umu, GridParallelRNG &pRNG,
                 const BenchmarkOptions &opt, JsonlWriter &writer)
 {
   const bool boss = UGrid->IsBoss();
+  const bool clover = gridop.is_clover();
   MeasureContext ctx{writer, UGrid, opt, action_name, boss};
 
   if (boss) std::cout << GridLogMessage << "=== action " << action_name << " ===" << std::endl;
@@ -599,8 +619,6 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
   }
   if (!plaquette_passed) fail(action_name + "/gauge_upload plaquette correctness gate failed");
 
-  SchurDiagMooeeOperator<WilsonFermionD, LatticeFermion> HermOpEO(Dw);
-
   // ---- Preconditioned Dslash, Even -> Odd. Wilson has A=constant and the
   // benchmark uses the raw DhopOE on both sides. Clover's dslashQuda applies
   // A_oo^-1 D_oe, so compose the same operations explicitly in Grid. ----
@@ -615,17 +633,9 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     grid_out.Checkerboard() = Odd;
     LatticeFermion quda_out(UrbGrid);
     quda_out.Checkerboard() = Odd;
-    LatticeFermion hop_out(UrbGrid);
-    hop_out.Checkerboard() = Odd;
 
     measure_op(ctx, "pc_dslash",
-               [&]() {
-                 Dw.DhopOE(src_even, hop_out, DaggerNo);
-                 if (clover)
-                   Dw.MooeeInv(hop_out, grid_out);
-                 else
-                   grid_out = hop_out;
-               },
+               [&]() { gridop.apply_pc_dslash(src_even, grid_out); },
                [&]() { qop.apply_pc_dslash(src_even, quda_out, QUDA_ODD_PARITY); },
                grid_out, quda_out, 1e-8);
   }
@@ -638,7 +648,7 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     LatticeFermion quda_out(UGrid);
 
     measure_op(ctx, "mat",
-               [&]() { Dw.M(src, grid_out); },
+               [&]() { gridop.apply_mat(src, grid_out); },
                [&]() { qop.apply_mat(src, quda_out); },
                grid_out, quda_out, 1e-8);
   }
@@ -657,7 +667,7 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     quda_out.Checkerboard() = Odd;
 
     measure_op(ctx, "normal_pc",
-               [&]() { HermOpEO.MpcDagMpc(src_odd, grid_out); },
+               [&]() { gridop.apply_normal(src_odd, grid_out); },
                [&]() { qop.apply_normal(src_odd, quda_out); },
                grid_out, quda_out, 1e-6);
   }
@@ -693,7 +703,7 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
       LatticeFermion quda_out(UrbGrid);
       quda_out.Checkerboard() = Odd;
       measure_op(ctx, "clover_inv",
-                 [&]() { Dw.MooeeInv(src_odd, grid_out); },
+                 [&]() { gridop.apply_clover_inv(src_odd, grid_out); },
                  [&]() { qop.apply_clover(src_odd, quda_out, QUDA_ODD_PARITY, /*inverse=*/true); },
                  grid_out, quda_out, 1e-6);
     }
@@ -728,9 +738,8 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     // Untimed warm solves trigger any first-use setup. They are also the
     // correctness gate, so no measured solve is run unless both solutions are
     // independently valid under Grid's Schur operator.
-    ConjugateGradient<LatticeFermion> warm_grid_cg(opt.tol, opt.maxiter, false);
     grid_sol = Zero();
-    warm_grid_cg(HermOpEO, src_odd, grid_sol);
+    const GridSolveResult warm_grid = gridop.solve_double(src_odd, grid_sol);
     qop.solve(src_odd, quda_sol);
 
     LatticeFermion diff(UrbGrid);
@@ -741,11 +750,11 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     const double rel_dev = solution_norm2 > 0.0 ? std::sqrt(diff_norm2 / solution_norm2) : std::sqrt(diff_norm2);
     LatticeFermion residual(UrbGrid);
     residual.Checkerboard() = Odd;
-    HermOpEO.MpcDagMpc(grid_sol, residual);
+    gridop.apply_normal(grid_sol, residual);
     residual = residual - src_odd;
     const double source_norm2 = norm2(src_odd);
     const double grid_independent_residual = std::sqrt(norm2(residual) / source_norm2);
-    HermOpEO.MpcDagMpc(quda_sol, residual);
+    gridop.apply_normal(quda_sol, residual);
     residual = residual - src_odd;
     const double quda_independent_residual = std::sqrt(norm2(residual) / source_norm2);
 
@@ -753,7 +762,7 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     // multiple of the requested tolerance for cross-backend solution agreement.
     const double solve_tolerance = std::max(1e-8, 100.0 * opt.tol);
     const double residual_tolerance = std::max(1e-8, 100.0 * opt.tol);
-    const bool warm_iterations_match = warm_grid_cg.IterationsToComplete == qop.invert_param().iter;
+    const bool warm_iterations_match = warm_grid.iterations == qop.invert_param().iter;
     const bool passed = rel_dev <= solve_tolerance
                         && grid_independent_residual <= residual_tolerance
                         && quda_independent_residual <= residual_tolerance;
@@ -770,7 +779,7 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
         .add("grid_independent_residual", grid_independent_residual)
         .add("quda_independent_residual", quda_independent_residual)
         .add("residual_tolerance", residual_tolerance)
-        .add("grid_iterations", static_cast<long long>(warm_grid_cg.IterationsToComplete))
+        .add("grid_iterations", static_cast<long long>(warm_grid.iterations))
         .add("quda_iterations", static_cast<long long>(qop.invert_param().iter))
         .add("iterations_match", warm_iterations_match)
         .add("passed", passed);
@@ -783,26 +792,25 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     auto independent_residual_of = [&](const LatticeFermion &solution) {
       LatticeFermion check_residual(UrbGrid);
       check_residual.Checkerboard() = Odd;
-      HermOpEO.MpcDagMpc(solution, check_residual);
+      gridop.apply_normal(solution, check_residual);
       check_residual = check_residual - src_odd;
       return std::sqrt(norm2(check_residual) / source_norm2);
     };
 
     for (int r = 0; r < opt.solve_repeats; ++r) {
-      ConjugateGradient<LatticeFermion> CG(opt.tol, opt.maxiter, false);
       grid_sol = Zero();
       accelerator_barrier();
       UGrid->Barrier();
       double t0 = usecond();
-      CG(HermOpEO, src_odd, grid_sol);
+      const GridSolveResult res = gridop.solve_double(src_odd, grid_sol);
       accelerator_barrier();
       UGrid->Barrier();
       double t1 = usecond();
       const double seconds = (t1 - t0) / 1.0e6;
-      const long long iterations = static_cast<long long>(CG.IterationsToComplete);
+      const long long iterations = res.iterations;
       grid_seconds.push_back(seconds);
       grid_iters.push_back(iterations);
-      grid_solver_residuals.push_back(CG.TrueResidual);
+      grid_solver_residuals.push_back(res.true_residual);
       grid_measured_residuals.push_back(independent_residual_of(grid_sol));
       if (iterations > 0) grid_seconds_per_iteration.push_back(seconds / static_cast<double>(iterations));
     }
@@ -938,21 +946,15 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
     // to the double CG -- the mixed solver reports inner iterations, restarts,
     // and a final-step count separately -- so all three are recorded and
     // "iterations" carries the inner total, which is the work that dominates.
-    if (opt.grid_solver == "mixed" && Dw_f != nullptr && UrbGrid_f != nullptr) {
-      SchurDiagMooeeOperator<WilsonFermionF, LatticeFermionF> HermOpEO_f(*Dw_f);
-
+    if (opt.grid_solver == "mixed" && gridop.has_mixed()) {
       std::vector<double> mixed_seconds, mixed_residuals, mixed_solver_residuals;
       std::vector<long long> mixed_inner, mixed_outer, mixed_final;
       LatticeFermion mixed_sol(UrbGrid);
       mixed_sol.Checkerboard() = Odd;
 
       // Warm solve doubles as the correctness gate, exactly as above.
-      {
-        MixedPrecisionConjugateGradient<LatticeFermion, LatticeFermionF> warm_mpcg(
-            opt.tol, opt.maxiter, kMixedOuterIterations, UrbGrid_f, HermOpEO_f, HermOpEO);
-        mixed_sol = Zero();
-        warm_mpcg(src_odd, mixed_sol);
-      }
+      mixed_sol = Zero();
+      gridop.solve_mixed(src_odd, mixed_sol, kMixedOuterIterations);
       const double mixed_warm_residual = independent_residual_of(mixed_sol);
       LatticeFermion mixed_diff(UrbGrid);
       mixed_diff.Checkerboard() = Odd;
@@ -975,21 +977,19 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
       if (!mixed_passed) fail(action_name + "/solve_mixed correctness gate failed");
 
       for (int r = 0; r < opt.solve_repeats; ++r) {
-        MixedPrecisionConjugateGradient<LatticeFermion, LatticeFermionF> mpcg(
-            opt.tol, opt.maxiter, kMixedOuterIterations, UrbGrid_f, HermOpEO_f, HermOpEO);
         mixed_sol = Zero();
         accelerator_barrier();
         UGrid->Barrier();
         double t0 = usecond();
-        mpcg(src_odd, mixed_sol);
+        const GridMixedSolveResult mres = gridop.solve_mixed(src_odd, mixed_sol, kMixedOuterIterations);
         accelerator_barrier();
         UGrid->Barrier();
         double t1 = usecond();
         mixed_seconds.push_back((t1 - t0) / 1.0e6);
-        mixed_inner.push_back(static_cast<long long>(mpcg.TotalInnerIterations));
-        mixed_outer.push_back(static_cast<long long>(mpcg.TotalOuterIterations));
-        mixed_final.push_back(static_cast<long long>(mpcg.TotalFinalStepIterations));
-        mixed_solver_residuals.push_back(mpcg.TrueResidual);
+        mixed_inner.push_back(mres.inner_iterations);
+        mixed_outer.push_back(mres.outer_iterations);
+        mixed_final.push_back(mres.final_step_iterations);
+        mixed_solver_residuals.push_back(mres.true_residual);
         mixed_residuals.push_back(independent_residual_of(mixed_sol));
       }
 
@@ -1036,6 +1036,250 @@ void run_action(const std::string &action_name, bool clover, WilsonFermionD &Dw,
       writer.emit(r);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// OPTIONAL multi-RHS pass (--benchmark-nrhs N, N>1). Runs only when explicitly
+// requested, so every existing invocation is untouched.
+//
+// WHAT IS COMPARED, and how it must be labelled:
+//   G5D  = Grid CompactWilsonCloverFermion5D, double, N sources in ONE batched solve
+//   Q1xN = QUDA double / no reconstruction, single-RHS solver run N times in sequence
+//
+// This answers "given N sources, which route finishes first" -- the question a
+// valence workflow actually asks. But the two sides differ ALGORITHMICALLY
+// (batched vs sequential), so iteration counts cannot be matched and this is a
+// THROUGHPUT number, analogous to the G2/Q2 rows, NOT a per-iteration backend
+// ratio like G1/Q1. It must never be tabulated alongside G1/Q1. QUDA's own
+// multi-RHS interface is not wired into the bridge, so nothing here supports a
+// statement of the form "Grid's multi-RHS is Nx off QUDA's".
+//
+// The primary reported quantity is SECONDS PER RHS. Raw per-solve time is
+// meaningless across the two sides: an N=12 batched solve at 8x a single 4D
+// solve is a 1.5x win, but looks like an 8x loss.
+void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
+                  LatticeGaugeField &Umu, GridParallelRNG &pRNG,
+                  const BenchmarkOptions &opt, JsonlWriter &writer)
+{
+  const int N = opt.nrhs;
+  const bool boss = UGrid->IsBoss();
+  if (boss)
+    std::cout << GridLogMessage << "=== multi-RHS pass (nrhs=" << N << ") ===" << std::endl;
+
+  // Same seeds as the single-RHS path so the first source is literally the same
+  // vector, which makes the validation below a direct comparison.
+  pRNG.SeedFixedIntegers(kSourceSeeds);
+
+  GridCompactClover5DOperator op5(UGrid, UrbGrid, Umu, opt.mass, opt.csw, N, opt.tol, opt.maxiter);
+  GridWilsonCloverOperator op4(GridWilsonCloverOperator::Action::CloverCompact,
+                               UGrid, UrbGrid, Umu, opt.mass, opt.csw, /*mixed=*/false,
+                               nullptr, nullptr, nullptr, opt.tol, opt.maxiter);
+  QudaOperator qop(UGrid, Umu, /*clover=*/true, opt.mass, opt.csw,
+                   QUDA_DOUBLE_PRECISION, sloppy_precision(opt.sloppy_precision),
+                   precise_gauge_reconstruct(opt.precision),
+                   sloppy_gauge_reconstruct(opt.sloppy_reconstruct), opt.tol, opt.maxiter,
+                   /*antiperiodic_time=*/true);
+
+  // N independent full 4D sources, drawn in a fixed order so the run reproduces.
+  std::vector<LatticeFermion> src_full(N, LatticeFermion(UGrid));
+  for (int s = 0; s < N; ++s) random(pRNG, src_full[s]);
+
+  std::vector<LatticeFermion> src_odd(N, LatticeFermion(UrbGrid));
+  for (int s = 0; s < N; ++s) pickCheckerboard(Odd, src_odd[s], src_full[s]);
+
+  LatticeFermion src5(op5.five_dim_rb_grid());
+  LatticeFermion sol5(op5.five_dim_rb_grid());
+  src5.Checkerboard() = Odd;
+  sol5.Checkerboard() = Odd;
+
+  auto emit = [&](const std::string &kind, const std::string &op_name) {
+    JsonlWriter::Record r;
+    r.add("kind", kind);
+    add_case_fields(r, opt, "clover_mrhs", op_name);
+    r.add("nrhs", static_cast<long long>(N));
+    return r;
+  };
+
+  // ---- Validation A: N IDENTICAL sources -------------------------------------
+  // Grid's 5D red-black grid is built with checkerboard mask {0,1,1,1,1}, i.e.
+  // the RHS index does not enter the parity, so the batched odd problem is N
+  // independent copies of the 4D odd problem. With identical sources the batched
+  // solve must therefore reproduce the single 4D solve exactly: same iteration
+  // count (identical conditioning), same true residual, and norm2 scaling by N.
+  {
+    std::vector<LatticeFermion> same(N, LatticeFermion(UGrid));
+    for (int s = 0; s < N; ++s) same[s] = src_full[0];
+    op5.batch_sources(same, src5);
+    sol5 = Zero();
+    const GridSolveResult r5 = op5.solve_double(src5, sol5);
+
+    LatticeFermion sol4(UrbGrid);
+    sol4.Checkerboard() = Odd;
+    sol4 = Zero();
+    const GridSolveResult r4 = op4.solve_double(src_odd[0], sol4);
+
+    const double n5 = norm2(sol5);
+    const double n4 = norm2(sol4);
+    const double expected = static_cast<double>(N) * n4;
+    const double rel = (expected > 0.0) ? std::abs(n5 - expected) / expected : 0.0;
+    const bool iters_match = (r5.iterations == r4.iterations);
+    // 1e-10 is loose relative to the 1e-10 CG tolerance but tight enough to catch
+    // any cross-talk between RHS slices, which would change the norm at O(1).
+    const bool passed = iters_match && (rel < 1.0e-10);
+
+    JsonlWriter::Record c = emit("correctness", "mrhs_identical_sources");
+    c.add("batched_iterations", r5.iterations)
+        .add("single_iterations", r4.iterations)
+        .add("iterations_match", iters_match)
+        .add("batched_norm2", n5)
+        .add("single_norm2", n4)
+        .add("expected_norm2", expected)
+        .add("rel_deviation", rel)
+        .add("batched_true_residual", r5.true_residual)
+        .add("single_true_residual", r4.true_residual)
+        .add("tolerance", 1.0e-10)
+        .add("passed", passed);
+    writer.emit(c);
+    if (boss)
+      std::cout << GridLogMessage << "mrhs identical-source check: iters " << r5.iterations
+                << " vs " << r4.iterations << ", norm2 rel dev " << rel
+                << (passed ? " -> PASSED" : " -> FAILED") << std::endl;
+  }
+
+  // ---- Validation B: N DISTINCT sources ---------------------------------------
+  // Solve the N distinct sources both ways and compare norms. Because the slices
+  // are independent, norm2 of the batched solution must equal the sum of the N
+  // individual solution norms; cross-talk between slices would break it.
+  {
+    op5.batch_sources(src_full, src5);
+    sol5 = Zero();
+    const GridSolveResult r5 = op5.solve_double(src5, sol5);
+
+    double sum_n4 = 0.0;
+    long long max_iters = 0;
+    LatticeFermion sol4(UrbGrid);
+    sol4.Checkerboard() = Odd;
+    for (int s = 0; s < N; ++s) {
+      sol4 = Zero();
+      const GridSolveResult r4 = op4.solve_double(src_odd[s], sol4);
+      sum_n4 += norm2(sol4);
+      max_iters = std::max(max_iters, r4.iterations);
+    }
+
+    const double n5 = norm2(sol5);
+    const double rel = (sum_n4 > 0.0) ? std::abs(n5 - sum_n4) / sum_n4 : 0.0;
+    const bool passed = (rel < 1.0e-8);
+
+    JsonlWriter::Record c = emit("correctness", "mrhs_distinct_sources");
+    c.add("batched_iterations", r5.iterations)
+        .add("max_single_iterations", max_iters)
+        .add("batched_norm2", n5)
+        .add("sum_single_norm2", sum_n4)
+        .add("rel_deviation", rel)
+        .add("tolerance", 1.0e-8)
+        .add("passed", passed);
+    writer.emit(c);
+    if (boss)
+      std::cout << GridLogMessage << "mrhs distinct-source check: norm2 rel dev " << rel
+                << (passed ? " -> PASSED" : " -> FAILED")
+                << " (batched iters " << r5.iterations << ", worst single " << max_iters << ")"
+                << std::endl;
+  }
+
+  // ---- Timing ------------------------------------------------------------------
+  op5.batch_sources(src_full, src5);
+  sol5 = Zero();
+  op5.solve_double(src5, sol5);   // warm-up, untimed (tunes kernels, populates caches)
+
+  std::vector<double> g5_seconds, g4_seconds, q_seconds;
+  std::vector<long long> g5_iters;
+  LatticeFermion quda_sol(UrbGrid);
+  quda_sol.Checkerboard() = Odd;
+
+  for (int r = 0; r < opt.solve_repeats; ++r) {
+    sol5 = Zero();
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double t0 = usecond();
+    const GridSolveResult res = op5.solve_double(src5, sol5);
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double t1 = usecond();
+    g5_seconds.push_back((t1 - t0) / 1.0e6);
+    g5_iters.push_back(res.iterations);
+  }
+
+  // Grid's OWN sequential path over the same N sources. This is the cleanest
+  // measure of what batching actually buys, because both sides are Grid running
+  // the same compact clover operator -- the only difference is batched vs one at
+  // a time. Unlike G5D/Q1xN it is not confounded by a second backend.
+  {
+    LatticeFermion sol4(UrbGrid);
+    sol4.Checkerboard() = Odd;
+    for (int r = 0; r < opt.solve_repeats; ++r) {
+      accelerator_barrier();
+      UGrid->Barrier();
+      const double t0 = usecond();
+      for (int s = 0; s < N; ++s) {
+        sol4 = Zero();
+        op4.solve_double(src_odd[s], sol4);
+      }
+      accelerator_barrier();
+      UGrid->Barrier();
+      const double t1 = usecond();
+      g4_seconds.push_back((t1 - t0) / 1.0e6);
+    }
+  }
+
+  // Q1xN: the SAME N sources, solved one at a time. The timed region covers all
+  // N solves, because that is the wall clock a valence workflow would see.
+  for (int r = 0; r < opt.solve_repeats; ++r) {
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double t0 = usecond();
+    for (int s = 0; s < N; ++s) qop.solve(src_odd[s], quda_sol);
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double t1 = usecond();
+    q_seconds.push_back((t1 - t0) / 1.0e6);
+  }
+
+  const Stat g5 = summarize(g5_seconds);
+  const Stat g4 = summarize(g4_seconds);
+  const Stat qn = summarize(q_seconds);
+  const double dN = static_cast<double>(N);
+  const double g5_per_rhs = g5.median / dN;
+  const double g4_per_rhs = g4.median / dN;
+  const double q_per_rhs = qn.median / dN;
+
+  JsonlWriter::Record r = emit("solve", "mrhs_batched");
+  r.add("backend", std::string("grid_5d"))
+      .add("timing_scope", std::string("throughput_not_backend_ratio"))
+      .add("solve_repeats", static_cast<long long>(opt.solve_repeats))
+      // Grid batched (G5D)
+      .add("g5d_median_s", g5.median)
+      .add("g5d_seconds_all", g5_seconds)
+      .add("g5d_seconds_per_rhs", g5_per_rhs)
+      .add("g5d_iterations_all", g5_iters)
+      // Grid sequential over the same N sources -- the clean Grid-vs-Grid control
+      .add("grid_seq_median_s", g4.median)
+      .add("grid_seq_seconds_all", g4_seconds)
+      .add("grid_seq_seconds_per_rhs", g4_per_rhs)
+      // QUDA sequential over the same N sources
+      .add("quda_seq_median_s", qn.median)
+      .add("quda_seq_seconds_all", q_seconds)
+      .add("quda_seq_seconds_per_rhs", q_per_rhs)
+      // What batching buys Grid: >1 means the 5D batched path is faster
+      .add("batching_speedup_vs_grid_seq", (g5_per_rhs > 0.0) ? g4_per_rhs / g5_per_rhs : 0.0)
+      // Throughput ratio vs QUDA run one source at a time (NOT a backend ratio)
+      .add("g5d_over_quda_seq_per_rhs", (q_per_rhs > 0.0) ? g5_per_rhs / q_per_rhs : 0.0);
+  writer.emit(r);
+
+  if (boss)
+    std::cout << GridLogMessage << "mrhs N=" << N << " s/RHS: Grid batched " << g5_per_rhs
+              << ", Grid sequential " << g4_per_rhs << " (batching "
+              << ((g5_per_rhs > 0.0) ? g4_per_rhs / g5_per_rhs : 0.0) << "x), QUDA sequential "
+              << q_per_rhs << std::endl;
 }
 
 } // namespace
@@ -1120,40 +1364,35 @@ int main(int argc, char **argv)
     }
 
     if (do_wilson) {
-      std::vector<Complex> phases(Nd, 1.0);
-      phases[Nd - 1] = -1.0;
-      WilsonFermionD::ImplParams implParams;
-      implParams.boundary_phases = phases;
-      WilsonFermionD Dw(Umu, *UGrid, *UrbGrid, opt.mass, implParams);
-
-      std::unique_ptr<WilsonFermionF> Dw_f;
-      if (do_mixed) {
-        WilsonFermionF::ImplParams implParamsF;
-        implParamsF.boundary_phases = phases;
-        Dw_f.reset(new WilsonFermionF(*Umu_f, *UGrid_f, *UrbGrid_f, opt.mass, implParamsF));
-      }
-      run_action("wilson", /*clover=*/false, Dw, Dw_f.get(), UrbGrid_f.get(),
-                 UGrid, UrbGrid, Umu, pRNG, opt, writer);
+      GridWilsonCloverOperator gridop(GridWilsonCloverOperator::Action::Wilson,
+                                      UGrid, UrbGrid, Umu, opt.mass, opt.csw, do_mixed,
+                                      UGrid_f.get(), UrbGrid_f.get(), Umu_f.get(),
+                                      opt.tol, opt.maxiter);
+      run_action("wilson", gridop, UGrid, UrbGrid, Umu, pRNG, opt, writer);
     }
 
     if (do_clover) {
-      std::vector<Complex> phases(Nd, 1.0);
-      phases[Nd - 1] = -1.0;
-      WilsonCloverFermionD::ImplParams implParams;
-      implParams.boundary_phases = phases;
-      WilsonAnisotropyCoefficients anisotropy;
-      WilsonCloverFermionD Dwc(Umu, *UGrid, *UrbGrid, opt.mass, opt.csw, opt.csw, anisotropy, implParams);
+      const GridWilsonCloverOperator::Action clover_action =
+          (opt.clover_impl == "compact") ? GridWilsonCloverOperator::Action::CloverCompact
+                                         : GridWilsonCloverOperator::Action::CloverStandard;
+      GridWilsonCloverOperator gridop(clover_action,
+                                      UGrid, UrbGrid, Umu, opt.mass, opt.csw, do_mixed,
+                                      UGrid_f.get(), UrbGrid_f.get(), Umu_f.get(),
+                                      opt.tol, opt.maxiter);
+      run_action("clover", gridop, UGrid, UrbGrid, Umu, pRNG, opt, writer);
+    }
 
-      std::unique_ptr<WilsonCloverFermionF> Dwc_f;
-      if (do_mixed) {
-        WilsonCloverFermionF::ImplParams implParamsF;
-        implParamsF.boundary_phases = phases;
-        WilsonAnisotropyCoefficients anisotropyF;
-        Dwc_f.reset(new WilsonCloverFermionF(*Umu_f, *UGrid_f, *UrbGrid_f, opt.mass, opt.csw, opt.csw,
-                                             anisotropyF, implParamsF));
+    // Optional, opt-in, and always last so it cannot perturb the established
+    // measurements above. nrhs<=1 skips it entirely.
+    if (opt.nrhs > 1) {
+      if (!do_clover) {
+        if (boss)
+          std::cout << GridLogMessage
+                    << "--benchmark-nrhs>1 requires a clover action; skipping multi-RHS pass"
+                    << std::endl;
+      } else {
+        run_multirhs(UGrid, UrbGrid, Umu, pRNG, opt, writer);
       }
-      run_action("clover", /*clover=*/true, Dwc, Dwc_f.get(), UrbGrid_f.get(),
-                 UGrid, UrbGrid, Umu, pRNG, opt, writer);
     }
     } // QudaSession torn down here, after all QudaOperator instances are gone
 
