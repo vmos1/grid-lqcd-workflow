@@ -56,7 +56,11 @@ if [[ ! -f "${GRID_PREFIX}/include/Grid/Grid.h" ]]; then
   GRID_EXTRA_CXXFLAGS="-I${GRID_SOURCE} -I${GRID_BUILD}/Grid"
   GRID_EXTRA_LDFLAGS="-L${GRID_BUILD}/Grid"
 fi
-CXXFLAGS="$(${GRID_CONFIG} --cxxflags) ${GRID_EXTRA_CXXFLAGS} -DGRID_HAVE_QUDA -I${QUDA_PREFIX}/include -I${BENCH_DIR}/src"
+# Extra compile flags for variant binaries, empty by default so the standard
+# build is unchanged. Used for -DBENCH_NVTX (harness NVTX ranges); pair it with
+# a distinct BIN so the untraced binary stays available for clean timing.
+BENCH_EXTRA_CXXFLAGS=${BENCH_EXTRA_CXXFLAGS:-}
+CXXFLAGS="$(${GRID_CONFIG} --cxxflags) ${GRID_EXTRA_CXXFLAGS} -DGRID_HAVE_QUDA -I${QUDA_PREFIX}/include -I${BENCH_DIR}/src ${BENCH_EXTRA_CXXFLAGS}"
 LDFLAGS="$(${GRID_CONFIG} --ldflags) ${GRID_EXTRA_LDFLAGS} -L${QUDA_PREFIX}/${QUDA_LIBDIR} -Xlinker -rpath -Xlinker ${QUDA_PREFIX}/${QUDA_LIBDIR}"
 LIBS="-lquda $(${GRID_CONFIG} --libs)"
 

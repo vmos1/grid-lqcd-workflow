@@ -217,7 +217,7 @@ public:
   GridCompactClover5DOperator(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
                               LatticeGaugeField &Umu, double mass, double csw,
                               int nrhs, double tol, int maxiter)
-      : nrhs_(nrhs), tol_(tol), maxiter_(maxiter)
+      : nrhs_(nrhs), tol_(tol), maxiter_(maxiter), UGrid_(UGrid)
   {
     if (nrhs_ < 1) throw std::runtime_error("GridCompactClover5DOperator: nrhs must be >= 1");
 
@@ -255,6 +255,34 @@ public:
     pickCheckerboard(Odd, src5_odd, src5_full);
   }
 
+  // Inverse of batch_sources: unpack one 5D odd-checkerboard field back into N
+  // separate 4D odd-checkerboard fields, sol4[s] <- slice s.
+  //
+  // Needed because the cross-backend correctness gate compares QUDA's batched
+  // solution against GRID's batched solution slice by slice, and grades both on
+  // independently evaluated Grid-side residuals. Comparing only against the 4D
+  // sequential path would leave the two batched routes never directly checked
+  // against each other.
+  //
+  // Mirrors batch_sources in reverse: the checkerboard is undone first, because
+  // ExtractSlice (like InsertSlice) requires the orthogonal direction to be
+  // undistributed and operates on full grids. Zeroing src5_full first matters --
+  // setCheckerboard writes only the odd sites, so the even half would otherwise
+  // be uninitialised garbage that ExtractSlice would faithfully carry across.
+  void unbatch_solutions(const LatticeFermion &sol5_odd, std::vector<LatticeFermion> &sol4_odd)
+  {
+    if (static_cast<int>(sol4_odd.size()) != nrhs_)
+      throw std::runtime_error("GridCompactClover5DOperator: solution count != nrhs");
+    LatticeFermion sol5_full(FGrid_.get());
+    sol5_full = Zero();
+    setCheckerboard(sol5_full, sol5_odd);
+    LatticeFermion sol4_full(UGrid_);
+    for (int s = 0; s < nrhs_; ++s) {
+      ExtractSlice(sol4_full, sol5_full, s, 0);
+      pickCheckerboard(Odd, sol4_odd[s], sol4_full);
+    }
+  }
+
   // Preconditioned normal operator on the 5D odd checkerboard -- the same
   // Mpc^dag Mpc the 4D path solves, applied to all N right-hand sides at once.
   void apply_normal(const LatticeFermion &src5_odd, LatticeFermion &out) { herm_->MpcDagMpc(src5_odd, out); }
@@ -275,6 +303,9 @@ private:
   int nrhs_;
   double tol_;
   int maxiter_;
+  // Borrowed, not owned -- the 4D grid the harness built. Needed by
+  // unbatch_solutions to stage each extracted slice on a full 4D grid.
+  GridCartesian *UGrid_;
   // Declared before op_/herm_ so they outlive the operator that references them
   // (members are destroyed in reverse declaration order).
   std::unique_ptr<GridCartesian> FGrid_;

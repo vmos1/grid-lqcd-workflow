@@ -47,11 +47,51 @@ GRID_SOLVER=${GRID_SOLVER:-double}
 # the binary default" (standard), so this is backward-compatible. Ignored for
 # ACTION=wilson.
 CLOVER_IMPL=${CLOVER_IMPL:-}
-# Number of right-hand sides for the OPTIONAL multi-RHS pass (Grid's
-# CompactWilsonCloverFermion5D, batched, vs QUDA's single-RHS solver run N times).
+# Number of right-hand sides for the OPTIONAL multi-RHS pass, which runs four
+# routes over the same N sources: Grid batched (5D), Grid sequential, QUDA
+# batched (invertMultiSrcQuda, unsplit) and QUDA sequential.
 # Empty or 1 = not passed / disabled, so this is backward-compatible and no
 # existing run changes. Requires a clover ACTION.
 NRHS=${NRHS:-}
+# Source population for that pass: gaussian (default) | mixed. Both batched
+# routes converge until their SLOWEST source converges, so gaussian sources --
+# being spectrally alike -- flatter both backends' batching gains. `mixed` is the
+# heterogeneous row that measures how much. Empty = let the binary default.
+MRHS_SOURCES=${MRHS_SOURCES:-}
+# Optional profiler wrapper. Empty (default) means the binary is launched
+# directly, so every existing run is byte-for-byte unchanged.
+#   PROFILE=nsys   Nsight Systems timeline (CUDA kernels + NVTX, optionally MPI)
+# nvprof is deliberately not offered: it is absent on this machine and does not
+# support compute capability 8.0 (these are A100s).
+#
+# The wrapper is inserted BETWEEN select_gpu and the binary, so the profiled
+# process already has CUDA_VISIBLE_DEVICES and NUMA binding applied; profiling
+# select_gpu itself would trace numactl rather than the solver.
+#
+# CPU sampling and context-switch tracing are off by default: both need
+# perf_event permissions that are not granted on shared compute nodes, and the
+# question here is GPU-side.  Add mpi to NSYS_TRACE for the communication
+# breakdown (nsys carries its own PMPI interposer, so no rebuild of Grid or
+# QUDA is required for it).
+PROFILE=${PROFILE:-}
+NSYS=${NSYS:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/profilers/Nsight_Systems/bin/nsys}
+NSYS_TRACE=${NSYS_TRACE:-cuda,nvtx}
+NSYS_SAMPLE=${NSYS_SAMPLE:-none}
+NSYS_CPUCTXSW=${NSYS_CPUCTXSW:-none}
+# One report per rank; %q{} is expanded by nsys itself, not by this shell.
+#
+# ⛔ The report MUST NOT be written to CFS.  nsys collects the raw .qdstrm
+# successfully there but fails to create the .nsys-rep, with
+#   Import Failed ... CreateFileException ... errno 524
+# (ENOTSUPP -- GPFS does not support an operation the importer needs).  Lustre
+# is fine, so reports go to PSCRATCH and the run directory keeps only records
+# and logs.  A .qdstrm stranded on CFS can be recovered afterwards with
+#   host-linux-x64/QdstrmImporter --input-file X.qdstrm --output-file <lustre>.nsys-rep
+# NSYS_OUT itself is built after RUN_ID is known, below.
+NSYS_OUT_DIR=${NSYS_OUT_DIR:-${PSCRATCH}/grid_quda_wilson_clover/nsys}
+# QUDA writes profile.tsv / profile_async.tsv instead of only printing its
+# TimeProfile when this is set. Empty = unset = current behaviour.
+QUDA_PROFILE_OUTPUT_BASE=${QUDA_PROFILE_OUTPUT_BASE:-}
 SAMPLES=${SAMPLES:-7}
 WARMUPS=${WARMUPS:-2}
 REPETITIONS=${REPETITIONS:-20}
@@ -99,6 +139,34 @@ exec numactl -m $NUMA -N $NUMA "$@"
 EOF
 chmod +x "${SELECT_GPU}"
 
+profiler=()
+case "${PROFILE}" in
+  "") ;;
+  nsys)
+    [[ -x "${NSYS}" ]] || {
+      printf 'ERROR: nsys not found or not executable: %s\n' "${NSYS}" >&2
+      exit 1
+    }
+    mkdir -p "${NSYS_OUT_DIR}"
+    NSYS_OUT=${NSYS_OUT:-${NSYS_OUT_DIR}/${RUN_ID}_%q{SLURM_PROCID}}
+    profiler=(
+      "${NSYS}" profile
+      --trace="${NSYS_TRACE}"
+      --sample="${NSYS_SAMPLE}"
+      --cpuctxsw="${NSYS_CPUCTXSW}"
+      --output="${NSYS_OUT}"
+      --force-overwrite=true
+    )
+    if [[ "${NSYS_TRACE}" == *mpi* ]]; then
+      profiler+=(--mpi-impl=mpich)
+    fi
+    ;;
+  *) printf 'ERROR: PROFILE must be empty or nsys\n' >&2; exit 2 ;;
+esac
+if [[ -n "${QUDA_PROFILE_OUTPUT_BASE}" ]]; then
+  export QUDA_PROFILE_OUTPUT_BASE
+fi
+
 case "${PRECISION}" in
   strict|production) ;;
   *) printf 'ERROR: PRECISION must be strict or production\n' >&2; exit 2 ;;
@@ -138,12 +206,15 @@ write_provenance() {
     printf 'ENV ITERATION_TOLERANCE=%s\n' "${ITERATION_TOLERANCE}"
     printf 'ENV SLOPPY_PRECISION=%s SLOPPY_RECONSTRUCT=%s GRID_SOLVER=%s\n' \
       "${SLOPPY_PRECISION:-from-preset}" "${SLOPPY_RECONSTRUCT:-from-preset}" "${GRID_SOLVER}"
-    printf 'ENV CLOVER_IMPL=%s NRHS=%s\n' "${CLOVER_IMPL:-default-standard}" "${NRHS:-disabled}"
+    printf 'ENV CLOVER_IMPL=%s NRHS=%s MRHS_SOURCES=%s\n' \
+      "${CLOVER_IMPL:-default-standard}" "${NRHS:-disabled}" "${MRHS_SOURCES:-default-gaussian}"
     printf 'ENV NODES=%s NTASKS=%s NTPN=%s GPUS_PER_TASK=%s CPUS_PER_TASK=%s\n' \
       "${NODES}" "${NTASKS}" "${NTPN}" "${GPUS_PER_TASK}" "${CPUS_PER_TASK}"
     printf 'ENV BIN=%s DTEST=%s CFG=%s\n' "${BIN}" "${DTEST}" "${CFG}"
     printf 'ENV RECORDS=%s QUDA_RESOURCE_PATH=%s CACHE_STATE=%s\n' \
       "${RECORDS}" "${QUDA_RESOURCE_PATH}" "${cache_state}"
+    printf 'ENV PROFILE=%s NSYS_TRACE=%s QUDA_PROFILE_OUTPUT_BASE=%s\n' \
+      "${PROFILE:-off}" "${NSYS_TRACE}" "${QUDA_PROFILE_OUTPUT_BASE:-unset}"
     printf 'ENV GRID_SHA=%s QUDA_SHA=%s\n' \
       "$(git -C "${ROOT}/Grid" rev-parse HEAD)" "$(git -C "${ROOT}/quda" rev-parse HEAD)"
     printf 'ENV MODULES=%s\n' "$(module -t list 2>&1 | tr '\n' ',')"
@@ -207,14 +278,19 @@ run_shared() {
   if [[ -n "${NRHS}" ]]; then
     args+=(--benchmark-nrhs "${NRHS}")
   fi
+  if [[ -n "${MRHS_SOURCES}" ]]; then
+    args+=(--benchmark-mrhs-sources "${MRHS_SOURCES}")
+  fi
   {
     printf '%s\n' '--- provenance ---'
     while IFS= read -r line; do printf '%s\n' "${line}"; done < "${RUN_DIR}/provenance.env"
     printf '%s\n' '--- command ---'
-    printf '%q ' "${common_srun[@]}" "${SELECT_GPU}" "${BIN}" "${args[@]}"
+    printf '%q ' "${common_srun[@]}" "${SELECT_GPU}" \
+      ${profiler[@]+"${profiler[@]}"} "${BIN}" "${args[@]}"
     printf '\n--- output ---\n'
   } > "${LOG}"
-  "${common_srun[@]}" "${SELECT_GPU}" "${BIN}" "${args[@]}" 2>&1 | tee -a "${LOG}"
+  "${common_srun[@]}" "${SELECT_GPU}" \
+    ${profiler[@]+"${profiler[@]}"} "${BIN}" "${args[@]}" 2>&1 | tee -a "${LOG}"
 }
 
 run_dslash() {

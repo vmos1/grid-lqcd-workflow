@@ -17,6 +17,20 @@ GRID_SRC=${GRID_SRC:-${ROOT}/Grid}
 GRID_SHA=${GRID_SHA:-$(git -C "${GRID_SRC}" rev-parse HEAD)}
 JOBS=${JOBS:-4}
 
+# Grid's compile-time tracing: none|nvtx|roctx|timer. Empty (default) leaves the
+# flag off the configure line entirely, so the standard build is unchanged.
+#
+# ⛔ --enable-tracing=nvtx DOES NOT BUILD ON CUDA 12.9 as shipped. Two breaks:
+#   1. Grid/perfmon/Tracing.h includes <nvToolsExt.h>, but 12.9 ships that header
+#      only under nvtx3/.  Worked around below with an extra -I; the upstream fix
+#      is to include <nvtx3/nvToolsExt.h>.
+#   2. configure.ac appends -lnvToolsExt, but that library no longer exists in the
+#      toolkit at all -- NVTX has been header-only since CUDA 10 and the
+#      compatibility shim was removed in 12.9.  The `patch-tracing` action below
+#      strips it from the generated configure.
+# Both affect any CUDA >= 12.9, and are worth reporting upstream.
+GRID_TRACING=${GRID_TRACING:-}
+
 : "${PSCRATCH:?PSCRATCH must be set on Perlmutter}"
 STAGE_ROOT=${STAGE_ROOT:-${PSCRATCH}/grid_quda_wilson_clover/stock-grid/${GRID_SHA}}
 STAGE_SRC=${STAGE_SRC:-${STAGE_ROOT}/Grid}
@@ -94,17 +108,60 @@ prepare() {
   printf '%s\n' "${GRID_SHA}" > "${PREPARED_MARKER}"
 }
 
+# Strip the dead -lnvToolsExt from the generated configure. Idempotent, and a
+# no-op unless tracing is requested. See the GRID_TRACING comment above.
+patch_tracing() {
+  [[ -n "${GRID_TRACING}" ]] || { printf 'GRID_TRACING unset; nothing to patch\n'; return; }
+  local cfg="${STAGE_SRC}/configure"
+  [[ -f "${cfg}" ]] || { printf 'ERROR: %s not found; run prepare first\n' "${cfg}" >&2; exit 1; }
+  if grep -q -- '-lnvToolsExt' "${cfg}"; then
+    sed -i 's/ -lnvToolsExt//' "${cfg}"
+    printf 'patched: removed -lnvToolsExt from %s\n' "${cfg}"
+  else
+    printf 'already patched: no -lnvToolsExt in %s\n' "${cfg}"
+  fi
+}
+
 configure_grid() {
   [[ -x "${STAGE_SRC}/configure" ]] || {
     printf 'ERROR: prepared configure script not found; run %s prepare first\n' "$0" >&2
     exit 1
   }
 
+  local tracing_args=()
+  local tracing_cxxflags=
+  if [[ -n "${GRID_TRACING}" ]]; then
+    tracing_args+=("--enable-tracing=${GRID_TRACING}")
+    if [[ "${GRID_TRACING}" == nvtx ]]; then
+      # ⛔ THIRD CUDA >= 12.9 BREAK, and the least obvious one.
+      # CUB emits its own NVTX ranges: cub/detail/nvtx.cuh includes
+      # <nvtx3/nvtx3.hpp>, the C++ wrapper, unless CCCL_DISABLE_NVTX or
+      # NVTX_DISABLE is defined. Grid's Tracing.h uses the NVTX *C* API. Having
+      # both in one translation unit breaks the C++ wrapper, which dies with
+      # ~40 errors inside nvtx3.hpp ("nvtxColorType_t is undefined",
+      # "_domain is not a nonstatic data member", ...) that name neither Grid
+      # nor CUB and so look like a toolkit bug.
+      # Opting CUB out is the minimal fix and costs nothing: CUB's ranges are
+      # not what we are profiling.
+      # ⛔ Do NOT instead put ${CUDA_HOME}/include/nvtx3 on the include path to
+      # satisfy Tracing.h -- that does not avoid the clash (tried; same errors)
+      # and additionally exposes the whole nvtx3 directory. The include is
+      # corrected at source by patch_grid_clover_tracing.py.
+      # Overridable so the need for it can be retested: `${VAR-default}`, not
+      # `${VAR:-default}`, so an explicitly EMPTY value is honoured.
+      # NOTE: with Tracing.h's include hoisted out of namespace Grid
+      # (patch_grid_clover_tracing.py), this may no longer be required --
+      # the namespace bug was the root cause of the CUB clash.
+      tracing_cxxflags=${TRACING_EXTRA_CXXFLAGS-" -DCCCL_DISABLE_NVTX"}
+    fi
+  fi
+
   mkdir -p "${BUILD_DIR}" "${INSTALL_PREFIX}"
   (
     cd "${BUILD_DIR}"
     "${STAGE_SRC}/configure" \
       --prefix="${INSTALL_PREFIX}" \
+      ${tracing_args[@]+"${tracing_args[@]}"} \
       --enable-comms=mpi \
       --enable-simd=GPU \
       --enable-shm=nvlink \
@@ -118,7 +175,7 @@ configure_grid() {
       --with-lime="${CLIME_ROOT}" \
       CXX=nvcc \
       LDFLAGS="-cudart shared" \
-      CXXFLAGS="-ccbin CC -gencode arch=compute_80,code=sm_80 -std=c++17 -cudart shared"
+      CXXFLAGS="-ccbin CC -gencode arch=compute_80,code=sm_80 -std=c++17 -cudart shared${tracing_cxxflags}"
   )
 
   "${BUILD_DIR}/grid-config" --summary
@@ -146,20 +203,23 @@ install_grid() {
 }
 
 print_paths
+printf 'GRID_TRACING=%s\n' "${GRID_TRACING:-off}"
 case "${ACTION}" in
   prepare) prepare ;;
+  patch-tracing) patch_tracing ;;
   configure) configure_grid ;;
   build) build_grid ;;
   install) install_grid ;;
   all)
     prepare
+    patch_tracing
     configure_grid
     build_grid
     install_grid
     ;;
   info) ;;
   *)
-    printf 'usage: %s {prepare|configure|build|install|all|info}\n' "$0" >&2
+    printf 'usage: %s {prepare|patch-tracing|configure|build|install|all|info}\n' "$0" >&2
     exit 2
     ;;
 esac

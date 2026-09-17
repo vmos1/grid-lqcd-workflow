@@ -1,0 +1,34 @@
+diff --git a/Grid/qcd/action/fermion/implementation/CompactWilsonCloverFermionImplementation.h b/Grid/qcd/action/fermion/implementation/CompactWilsonCloverFermionImplementation.h
+index a4f32850..15a0288f 100644
+--- a/Grid/qcd/action/fermion/implementation/CompactWilsonCloverFermionImplementation.h
++++ b/Grid/qcd/action/fermion/implementation/CompactWilsonCloverFermionImplementation.h
+@@ -126,18 +126,21 @@ void CompactWilsonCloverFermion<Impl, CloverHelpers>::Mdag(const FermionField& i
+ 
+ template<class Impl, class CloverHelpers>
+ void CompactWilsonCloverFermion<Impl, CloverHelpers>::Meooe(const FermionField& in, FermionField& out) {
++  GRID_TRACE("CloverMeooe");
+   WilsonBase::Meooe(in, out);
+   if(fixedBoundaries) ApplyBoundaryMask(out);
+ }
+ 
+ template<class Impl, class CloverHelpers>
+ void CompactWilsonCloverFermion<Impl, CloverHelpers>::MeooeDag(const FermionField& in, FermionField& out) {
++  GRID_TRACE("CloverMeooeDag");
+   WilsonBase::MeooeDag(in, out);
+   if(fixedBoundaries) ApplyBoundaryMask(out);
+ }
+ 
+ template<class Impl, class CloverHelpers>
+ void CompactWilsonCloverFermion<Impl, CloverHelpers>::Mooee(const FermionField& in, FermionField& out) {
++  GRID_TRACE("CloverMooee");
+   if(in.Grid()->_isCheckerBoarded) {
+     if(in.Checkerboard() == Odd) {
+       MooeeInternal(in, out, DiagonalOdd, TriangleOdd);
+@@ -157,6 +160,7 @@ void CompactWilsonCloverFermion<Impl, CloverHelpers>::MooeeDag(const FermionFiel
+ 
+ template<class Impl, class CloverHelpers>
+ void CompactWilsonCloverFermion<Impl, CloverHelpers>::MooeeInv(const FermionField& in, FermionField& out) {
++  GRID_TRACE("CloverMooeeInv");
+   if(in.Grid()->_isCheckerBoarded) {
+     if(in.Checkerboard() == Odd) {
+       MooeeInternal(in, out, DiagonalInvOdd, TriangleInvOdd);

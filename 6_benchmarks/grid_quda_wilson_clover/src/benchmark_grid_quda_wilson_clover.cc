@@ -48,6 +48,7 @@
 #include <Grid/Grid.h>
 #include "quda_grid_bridge.h"
 #include "grid_wilson_clover_operator.h"
+#include "bench_nvtx.h"
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +60,7 @@
 #include <sstream>
 #include <string>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace Grid;
@@ -116,6 +118,15 @@ struct BenchmarkOptions {
   // (batched, N sources at once) against QUDA's single-RHS solver run N times.
   // That is a THROUGHPUT comparison, not a backend ratio -- see run_multirhs.
   int nrhs = 1;
+  // Source population for the multi-RHS pass.
+  //   gaussian = N independent random Gaussian draws (the default, and what
+  //              every archived multi-RHS number was measured on)
+  //   mixed    = qualitatively different source types, cycled over the batch
+  // Both batched routes converge in lock-step -- each runs until its SLOWEST
+  // source converges -- so spectrally alike sources flatter both backends'
+  // batching gains. `mixed` is what measures how much. It is its own row, not a
+  // correction to the main table.
+  std::string mrhs_sources = "gaussian";  // gaussian | mixed
   std::string input = "hot";         // hot | physical
   double mass = -0.2416;
   double csw = 1.20536588031793;
@@ -159,6 +170,7 @@ BenchmarkOptions parse_options(int argc, char **argv)
   o.action        = read_string(argc, argv, "--benchmark-action", o.action);
   o.clover_impl   = read_string(argc, argv, "--benchmark-clover-impl", o.clover_impl);
   o.nrhs          = read_int(argc, argv, "--benchmark-nrhs", o.nrhs);
+  o.mrhs_sources  = read_string(argc, argv, "--benchmark-mrhs-sources", o.mrhs_sources);
   o.input         = read_string(argc, argv, "--benchmark-input", o.input);
   o.mass          = read_double(argc, argv, "--benchmark-mass", o.mass);
   o.csw           = read_double(argc, argv, "--benchmark-csw", o.csw);
@@ -184,6 +196,8 @@ BenchmarkOptions parse_options(int argc, char **argv)
     fail("--benchmark-clover-impl must be standard|compact");
   if (o.nrhs < 1)
     fail("--benchmark-nrhs must be >= 1 (1 disables the multi-RHS pass)");
+  if (o.mrhs_sources != "gaussian" && o.mrhs_sources != "mixed")
+    fail("--benchmark-mrhs-sources must be gaussian|mixed");
   if (o.input != "hot" && o.input != "physical")
     fail("--benchmark-input must be hot|physical");
   if (o.precision != "strict" && o.precision != "production")
@@ -279,6 +293,29 @@ double median_of(const std::vector<double> &values)
 double max_of(const std::vector<double> &values)
 {
   return values.empty() ? 0.0 : *std::max_element(values.begin(), values.end());
+}
+
+// Device memory in MiB as {used, total} for THIS rank's GPU.
+//
+// The multi-RHS pass scales its working set with N on both backends, and the
+// device side is the ceiling that bites first at production volume. Recording it
+// turns "the large-N point crashed" into a number that says how close the
+// smaller points were to the edge. Reported per route, because the two routes do
+// not hit the ceiling at the same N.
+//
+// Returns {0,0} where no accelerator query is available, so the field is always
+// present and a zero reads as "not measured" rather than "no memory used".
+std::pair<double, double> device_memory_used_total_mib()
+{
+#ifdef GRID_CUDA
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return {0.0, 0.0};
+  const double mib = 1024.0 * 1024.0;
+  return {static_cast<double>(total_bytes - free_bytes) / mib, static_cast<double>(total_bytes) / mib};
+#else
+  return {0.0, 0.0};
+#endif
 }
 
 // Every call to a Grid collective (Dhop/M/Mooee/CG/...) and every QUDA call
@@ -802,7 +839,12 @@ void run_action(const std::string &action_name, GridWilsonCloverOperator &gridop
       accelerator_barrier();
       UGrid->Barrier();
       double t0 = usecond();
-      const GridSolveResult res = gridop.solve_double(src_odd, grid_sol);
+      // The NVTX range brackets the solve alone -- not the zeroing or the
+      // barriers -- so a profiler attributes exactly what the timer measures.
+      const GridSolveResult res = [&] {
+        BENCH_NVTX_RANGE(action_name + "/grid_solve");
+        return gridop.solve_double(src_odd, grid_sol);
+      }();
       accelerator_barrier();
       UGrid->Barrier();
       double t1 = usecond();
@@ -819,7 +861,10 @@ void run_action(const std::string &action_name, GridWilsonCloverOperator &gridop
       accelerator_barrier();
       UGrid->Barrier();
       double t0 = usecond();
-      qop.solve(src_odd, quda_sol);
+      {
+        BENCH_NVTX_RANGE(action_name + "/quda_solve");
+        qop.solve(src_odd, quda_sol);
+      }
       accelerator_barrier();
       UGrid->Barrier();
       double t1 = usecond();
@@ -1042,21 +1087,48 @@ void run_action(const std::string &action_name, GridWilsonCloverOperator &gridop
 // OPTIONAL multi-RHS pass (--benchmark-nrhs N, N>1). Runs only when explicitly
 // requested, so every existing invocation is untouched.
 //
-// WHAT IS COMPARED, and how it must be labelled:
-//   G5D  = Grid CompactWilsonCloverFermion5D, double, N sources in ONE batched solve
-//   Q1xN = QUDA double / no reconstruction, single-RHS solver run N times in sequence
+// FOUR ROUTES over the SAME N sources, all measured in one run:
+//   G5D   = Grid CompactWilsonCloverFermion5D, N sources in ONE batched solve
+//   G4xN  = Grid CompactWilsonCloverFermionD, the N sources one at a time
+//   Q1xN  = QUDA invertQuda, the N sources one at a time
+//   QMRHS = QUDA invertMultiSrcQuda, N sources at once, UNSPLIT
 //
-// This answers "given N sources, which route finishes first" -- the question a
-// valence workflow actually asks. But the two sides differ ALGORITHMICALLY
-// (batched vs sequential), so iteration counts cannot be matched and this is a
-// THROUGHPUT number, analogous to the G2/Q2 rows, NOT a per-iteration backend
-// ratio like G1/Q1. It must never be tabulated alongside G1/Q1. QUDA's own
-// multi-RHS interface is not wired into the bridge, so nothing here supports a
-// statement of the form "Grid's multi-RHS is Nx off QUDA's".
+// and FOUR quantities, which differ in how far each can be trusted:
+//   1. G5D / G4xN     Grid against itself   -- Grid's batching gain
+//   2. QMRHS / Q1xN   QUDA against itself   -- QUDA's batching gain
+//   3. G5D / QMRHS    batched vs batched    -- the headline
+//   4. G4xN / Q1xN    in-run control        -- must reproduce the v3 sequential
+//                                              ratio, else the run is discarded
 //
-// The primary reported quantity is SECONDS PER RHS. Raw per-solve time is
-// meaningless across the two sides: an N=12 batched solve at 8x a single 4D
-// solve is a 1.5x win, but looks like an 8x loss.
+// Quantities 1 and 2 are each immune to cross-backend differences and are the
+// trustworthy core. Quantity 3 is what this pass exists for; its exposure is LOW
+// because invertQuda is itself a one-element invertMultiSrcQuda -- identical
+// solver body, identical parallelism, only the batch count changed (see
+// QudaOperator::solve_batched). It is still not a pure kernel statement, so the
+// within-backend quantities carry the weight.
+//
+// ⛔ EARLIER RUNS OF THIS PASS MEASURED SOMETHING WEAKER. Before QMRHS existed
+// the only cross-backend number available was G5D/Q1xN, i.e. Grid batched
+// against QUDA run SEQUENTIALLY -- a throughput statement about which route
+// finishes N sources first, not a backend comparison. That ratio is still
+// emitted as g5d_over_quda_seq_per_rhs for continuity with the 09-03 results,
+// and it still must never be tabulated alongside G1/Q1. Quantity 3 above is the
+// one that replaces it.
+//
+// METRIC BASIS. Both batched routes converge in LOCK-STEP: QUDA's
+// Solver::convergenceL2 returns false if any right-hand side is unconverged, and
+// Grid's 5D path solves one block-diagonal system against a combined residual,
+// so each runs until its slowest source converges. Because they share that
+// criterion, a per-iteration comparison is possible -- but only when both
+// batched routes actually converge in the single-solve count. The run decides
+// this from its own measured iteration counts and records the verdict in
+// comparison_basis: "per_iteration" (directly comparable to the single-RHS
+// backend ratio) or "seconds_per_rhs" (NOT comparable, and never to be chained
+// with it). The field exists so the convention lives in the data, not just here.
+//
+// The primary reported quantity is SECONDS PER RHS either way. Raw per-solve
+// time is meaningless across batched and sequential routes: an N=12 batched
+// solve at 8x a single 4D solve is a 1.5x win, but looks like an 8x loss.
 void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
                   LatticeGaugeField &Umu, GridParallelRNG &pRNG,
                   const BenchmarkOptions &opt, JsonlWriter &writer)
@@ -1080,12 +1152,76 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
                    sloppy_gauge_reconstruct(opt.sloppy_reconstruct), opt.tol, opt.maxiter,
                    /*antiperiodic_time=*/true);
 
-  // N independent full 4D sources, drawn in a fixed order so the run reproduces.
+  // N full 4D sources, drawn in a fixed order so the run reproduces. Only the
+  // ODD checkerboard is ever used -- all four routes solve the odd Schur system
+  // -- but the full field is what Grid's 5D batching consumes.
   std::vector<LatticeFermion> src_full(N, LatticeFermion(UGrid));
-  for (int s = 0; s < N; ++s) random(pRNG, src_full[s]);
-
   std::vector<LatticeFermion> src_odd(N, LatticeFermion(UrbGrid));
-  for (int s = 0; s < N; ++s) pickCheckerboard(Odd, src_odd[s], src_full[s]);
+
+  if (opt.mrhs_sources == "gaussian") {
+    // UNCHANGED from the run that produced the archived multi-RHS numbers, down
+    // to the order of the RNG calls, so the Grid batching column this pass still
+    // reports stays directly comparable to them.
+    for (int s = 0; s < N; ++s) random(pRNG, src_full[s]);
+    for (int s = 0; s < N; ++s) pickCheckerboard(Odd, src_odd[s], src_full[s]);
+  } else {
+    // Heterogeneous batch. The OPERATOR is unchanged, so the conditioning of the
+    // system is fixed; what varies is how much weight each source carries along
+    // the small eigenvalues, and hence how many iterations it needs on its own.
+    // Gaussian draws are all spectrally alike, which is exactly why the batched
+    // solves matched the single-solve count -- this mode is what shows how much
+    // that flattered both backends.
+    //
+    // Three qualitatively different types, cycled over the batch:
+    //   0  random Gaussian      -- broad, typical spectral content
+    //   1  point source         -- a delta, spectrally flat, weight on every mode
+    //   2  Mpc^dag Mpc Gaussian -- HIGH-mode enriched: applying the operator
+    //                              suppresses exactly the small eigenvalues that
+    //                              dominate CG's iteration count, so this one
+    //                              converges fastest. One operator application,
+    //                              deterministic, and no eigensolver needed.
+    //
+    // Built odd-checkerboard-first and lifted into a zeroed full field, so the
+    // even half is exactly zero rather than incidental data. Legitimate because
+    // the even half is never read: Grid's 5D path checkerboards these straight
+    // back out again.
+    LatticeFermion gaussian_full(UGrid);
+    LatticeFermion gaussian_odd(UrbGrid);
+    gaussian_odd.Checkerboard() = Odd;
+    for (int s = 0; s < N; ++s) {
+      src_odd[s].Checkerboard() = Odd;
+      const int type = s % 3;
+      if (type == 0) {
+        random(pRNG, src_full[s]);
+        pickCheckerboard(Odd, src_odd[s], src_full[s]);
+        continue;
+      }
+      if (type == 1) {
+        LatticeFermion point_full(UGrid);
+        point_full = Zero();
+        typename LatticeFermion::scalar_object point = Zero();
+        point()(0)(0) = ComplexD(1.0, 0.0);
+        // (1,0,0,0) so the site lands on the ODD checkerboard. A point on the
+        // even half would leave a ZERO odd source, and CG's relative residual
+        // would then divide by zero -- a failure that would show up far from
+        // its cause, so it is checked explicitly below rather than assumed.
+        Coordinate position({1, 0, 0, 0});
+        pokeSite(point, point_full, position);
+        pickCheckerboard(Odd, src_odd[s], point_full);
+        if (norm2(src_odd[s]) == 0.0)
+          fail("multi-RHS point source landed on the even checkerboard, leaving a zero odd "
+               "source; Grid's checkerboard convention is not what this code assumes");
+        src_full[s] = Zero();
+        setCheckerboard(src_full[s], src_odd[s]);
+        continue;
+      }
+      random(pRNG, gaussian_full);
+      pickCheckerboard(Odd, gaussian_odd, gaussian_full);
+      op4.apply_normal(gaussian_odd, src_odd[s]);
+      src_full[s] = Zero();
+      setCheckerboard(src_full[s], src_odd[s]);
+    }
+  }
 
   LatticeFermion src5(op5.five_dim_rb_grid());
   LatticeFermion sol5(op5.five_dim_rb_grid());
@@ -1097,7 +1233,85 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
     r.add("kind", kind);
     add_case_fields(r, opt, "clover_mrhs", op_name);
     r.add("nrhs", static_cast<long long>(N));
+    // On the multi-RHS records only, never in add_case_fields: keeping both nrhs
+    // and mrhs_sources out of the shared field set means no archived JSONL
+    // schema changes and every pre-existing record stays byte-comparable.
+    r.add("mrhs_sources", opt.mrhs_sources);
     return r;
+  };
+
+  // Per-source 4D odd-checkerboard solutions for each route. Held at function
+  // scope so the cross-backend gate can compare the two BATCHED routes directly
+  // against each other rather than each against the sequential path.
+  auto make_odd_fields = [&](int count) {
+    std::vector<LatticeFermion> fields(count, LatticeFermion(UrbGrid));
+    for (auto &field : fields) field.Checkerboard() = Odd;
+    return fields;
+  };
+  std::vector<LatticeFermion> grid_batch_sol = make_odd_fields(N);
+  std::vector<LatticeFermion> quda_batch_sol = make_odd_fields(N);
+  std::vector<LatticeFermion> quda_single_sol = make_odd_fields(N);
+
+  // Iteration counts that decide the metric basis (see the header comment).
+  // Each batched route is compared against the WORST of its own backend's N
+  // single-RHS solves, because a batched solve runs until its slowest source
+  // converges -- so the worst single count, not the mean, is what it should
+  // match if batching costs no extra iterations.
+  long long grid_batched_iterations = 0;
+  long long grid_single_worst_iterations = 0;
+  long long quda_batched_iterations = 0;
+  long long quda_single_worst_iterations = 0;
+
+  // Same thresholds the single-RHS solve gate uses: a converged CG solution is
+  // only unique to O(tol), so cross-backend agreement is allowed a conservative
+  // multiple of the requested tolerance.
+  const double solve_tolerance = std::max(1e-8, 100.0 * opt.tol);
+  const double residual_tolerance = std::max(1e-8, 100.0 * opt.tol);
+
+  // Independently evaluated Grid-side Schur residual of a 4D odd solution
+  // against its own source. Every cross-backend gate below is graded on THIS and
+  // never on a backend's self-reported residual: QUDA's true_res carries a ~1e-9
+  // run-to-run autotuning floor, so a gate reading it would be grading autotune
+  // noise rather than the solution.
+  auto independent_residual = [&](const LatticeFermion &solution, const LatticeFermion &source) {
+    LatticeFermion residual(UrbGrid);
+    residual.Checkerboard() = Odd;
+    op4.apply_normal(solution, residual);
+    residual = residual - source;
+    return std::sqrt(norm2(residual) / norm2(source));
+  };
+  // Sources are passed in rather than assumed to be src_odd: the identical-source
+  // gate solves every slice against src_odd[0], so grading it against src_odd[s]
+  // would compare each solution to a source it never saw and fail for the wrong
+  // reason.
+  auto independent_residuals = [&](const std::vector<LatticeFermion> &solutions,
+                                   const std::vector<LatticeFermion> &sources) {
+    std::vector<double> residuals(solutions.size());
+    for (std::size_t s = 0; s < solutions.size(); ++s)
+      residuals[s] = independent_residual(solutions[s], sources[s]);
+    return residuals;
+  };
+  // Worst per-slice relative L2 deviation. Compared slice by slice rather than
+  // through summed norms because cross-talk between right-hand sides can leave
+  // the aggregate norm intact while corrupting individual slices.
+  auto worst_slice_deviation = [&](const std::vector<LatticeFermion> &measured,
+                                   const std::vector<LatticeFermion> &reference) {
+    double worst = 0.0;
+    LatticeFermion difference(UrbGrid);
+    difference.Checkerboard() = Odd;
+    for (std::size_t s = 0; s < measured.size(); ++s) {
+      difference = measured[s] - reference[s];
+      const double reference_norm2 = norm2(reference[s]);
+      const double deviation = (reference_norm2 > 0.0) ? std::sqrt(norm2(difference) / reference_norm2)
+                                                       : std::sqrt(norm2(difference));
+      worst = std::max(worst, deviation);
+    }
+    return worst;
+  };
+  auto total_norm2 = [&](const std::vector<LatticeFermion> &fields) {
+    double total = 0.0;
+    for (const auto &field : fields) total += norm2(field);
+    return total;
   };
 
   // ---- Validation A: N IDENTICAL sources -------------------------------------
@@ -1154,9 +1368,19 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
     op5.batch_sources(src_full, src5);
     sol5 = Zero();
     const GridSolveResult r5 = op5.solve_double(src5, sol5);
+    // Keep the per-slice 4D form of this solution: it is the Grid side of the
+    // cross-backend batched-vs-batched gate further down. Captured here rather
+    // than read out of sol5 later so that gate does not depend on sol5 still
+    // holding this particular solve.
+    op5.unbatch_solutions(sol5, grid_batch_sol);
+    grid_batched_iterations = r5.iterations;
 
     double sum_n4 = 0.0;
     long long max_iters = 0;
+    // Per-source counts, not just their maximum: with --benchmark-mrhs-sources
+    // mixed the whole point is that the individual counts differ, and a spread
+    // that never appears in the record cannot be checked.
+    std::vector<long long> single_iters;
     LatticeFermion sol4(UrbGrid);
     sol4.Checkerboard() = Odd;
     for (int s = 0; s < N; ++s) {
@@ -1164,15 +1388,18 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
       const GridSolveResult r4 = op4.solve_double(src_odd[s], sol4);
       sum_n4 += norm2(sol4);
       max_iters = std::max(max_iters, r4.iterations);
+      single_iters.push_back(r4.iterations);
     }
 
     const double n5 = norm2(sol5);
     const double rel = (sum_n4 > 0.0) ? std::abs(n5 - sum_n4) / sum_n4 : 0.0;
     const bool passed = (rel < 1.0e-8);
+    grid_single_worst_iterations = max_iters;
 
     JsonlWriter::Record c = emit("correctness", "mrhs_distinct_sources");
     c.add("batched_iterations", r5.iterations)
         .add("max_single_iterations", max_iters)
+        .add("single_iterations_all", single_iters)
         .add("batched_norm2", n5)
         .add("sum_single_norm2", sum_n4)
         .add("rel_deviation", rel)
@@ -1186,15 +1413,187 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
                 << std::endl;
   }
 
+  // ---- Validation C: QUDA batched, N IDENTICAL sources ------------------------
+  // QUDA against ITSELF, which is what makes this the sharpest test of the
+  // batched interface: with identical sources every slice of the batched
+  // solution must reproduce QUDA's own single-RHS solve, and the summed norm2
+  // must be N times the single one. A wrong stride, a mis-set num_src, or the
+  // silently-misread-source-N layout trap all surface here and essentially
+  // nowhere else, because none of them changes the answer in a way that looks
+  // wrong on QUDA's own residual.
+  {
+    std::vector<LatticeFermion> same = make_odd_fields(N);
+    for (int s = 0; s < N; ++s) same[s] = src_odd[0];
+    qop.solve_batched(same, quda_batch_sol);
+    const long long batched_iterations = qop.last_iterations();
+    const std::vector<double> batched_residuals = qop.true_residuals(N);
+
+    LatticeFermion single_sol(UrbGrid);
+    single_sol.Checkerboard() = Odd;
+    qop.solve(src_odd[0], single_sol);
+    const long long single_iterations = qop.last_iterations();
+
+    // Compared against the one reference solution in a loop rather than against
+    // an N-fold copy of it: at production volume an extra N spinors is several
+    // GB of device memory, and the device side is this pass's ceiling.
+    double deviation = 0.0;
+    {
+      LatticeFermion difference(UrbGrid);
+      difference.Checkerboard() = Odd;
+      const double reference_norm2 = norm2(single_sol);
+      for (int s = 0; s < N; ++s) {
+        difference = quda_batch_sol[s] - single_sol;
+        deviation = std::max(deviation, (reference_norm2 > 0.0)
+                                            ? std::sqrt(norm2(difference) / reference_norm2)
+                                            : std::sqrt(norm2(difference)));
+      }
+    }
+
+    const double batched_norm2 = total_norm2(quda_batch_sol);
+    const double single_norm2 = norm2(single_sol);
+    const double expected_norm2 = static_cast<double>(N) * single_norm2;
+    const double norm_deviation =
+        (expected_norm2 > 0.0) ? std::abs(batched_norm2 - expected_norm2) / expected_norm2 : 0.0;
+    // Graded on an independently evaluated Grid-side residual as well, so this
+    // gate cannot pass on a solution that merely agrees with itself. Every slice
+    // was solved against src_odd[0], so that is what each is graded against.
+    const std::vector<double> residuals = independent_residuals(quda_batch_sol, same);
+    const bool passed = deviation <= solve_tolerance && max_of(residuals) <= residual_tolerance
+                        && norm_deviation < 1.0e-8;
+
+    JsonlWriter::Record c = emit("correctness", "mrhs_quda_identical_sources");
+    c.add("batched_iterations", batched_iterations)
+        .add("single_iterations", single_iterations)
+        .add("iterations_match", batched_iterations == single_iterations)
+        .add("rel_deviation", deviation)
+        .add("tolerance", solve_tolerance)
+        .add("batched_norm2", batched_norm2)
+        .add("single_norm2", single_norm2)
+        .add("expected_norm2", expected_norm2)
+        .add("norm2_rel_deviation", norm_deviation)
+        .add("independent_residual", max_of(residuals))
+        .add("independent_residual_all", residuals)
+        .add("residual_tolerance", residual_tolerance)
+        // QUDA's own per-source residuals: recorded for diagnosis, not graded.
+        .add("quda_true_residual_all", batched_residuals)
+        .add("passed", passed);
+    writer.emit(c);
+    if (boss)
+      std::cout << GridLogMessage << "mrhs QUDA identical-source check: iters " << batched_iterations
+                << " vs " << single_iterations << ", worst slice dev " << deviation
+                << ", worst Grid-side residual " << max_of(residuals)
+                << (passed ? " -> PASSED" : " -> FAILED") << std::endl;
+    if (!passed) fail("clover_mrhs/mrhs_quda_identical_sources correctness gate failed");
+  }
+
+  // ---- Validation D: QUDA batched, N DISTINCT sources -------------------------
+  // Cross-talk between right-hand sides is the failure this catches. Compared
+  // slice by slice against QUDA's own single-RHS solves rather than through
+  // summed norms, because cross-talk can leave the aggregate intact while
+  // corrupting individual slices. The N single-RHS solves here also supply the
+  // QUDA iteration counts the metric-basis decision needs.
+  {
+    qop.solve_batched(src_odd, quda_batch_sol);
+    quda_batched_iterations = qop.last_iterations();
+    const std::vector<double> batched_residuals = qop.true_residuals(N);
+
+    long long worst_single = 0;
+    std::vector<long long> single_iters;
+    for (int s = 0; s < N; ++s) {
+      qop.solve(src_odd[s], quda_single_sol[s]);
+      worst_single = std::max(worst_single, qop.last_iterations());
+      single_iters.push_back(qop.last_iterations());
+    }
+    quda_single_worst_iterations = worst_single;
+
+    const double deviation = worst_slice_deviation(quda_batch_sol, quda_single_sol);
+    const double batched_norm2 = total_norm2(quda_batch_sol);
+    const double single_norm2 = total_norm2(quda_single_sol);
+    const double norm_deviation =
+        (single_norm2 > 0.0) ? std::abs(batched_norm2 - single_norm2) / single_norm2 : 0.0;
+    const std::vector<double> residuals = independent_residuals(quda_batch_sol, src_odd);
+    const bool passed = deviation <= solve_tolerance && max_of(residuals) <= residual_tolerance;
+
+    JsonlWriter::Record c = emit("correctness", "mrhs_quda_distinct_sources");
+    c.add("batched_iterations", quda_batched_iterations)
+        .add("max_single_iterations", worst_single)
+        .add("single_iterations_all", single_iters)
+        .add("iterations_match", quda_batched_iterations == worst_single)
+        .add("rel_deviation", deviation)
+        .add("tolerance", solve_tolerance)
+        .add("batched_norm2", batched_norm2)
+        .add("sum_single_norm2", single_norm2)
+        .add("norm2_rel_deviation", norm_deviation)
+        .add("independent_residual", max_of(residuals))
+        .add("independent_residual_all", residuals)
+        .add("residual_tolerance", residual_tolerance)
+        .add("quda_true_residual_all", batched_residuals)
+        .add("passed", passed);
+    writer.emit(c);
+    if (boss)
+      std::cout << GridLogMessage << "mrhs QUDA distinct-source check: worst slice dev " << deviation
+                << ", worst Grid-side residual " << max_of(residuals) << " (batched iters "
+                << quda_batched_iterations << ", worst single " << worst_single << ")"
+                << (passed ? " -> PASSED" : " -> FAILED") << std::endl;
+    if (!passed) fail("clover_mrhs/mrhs_quda_distinct_sources correctness gate failed");
+  }
+
+  // ---- Validation E: CROSS-BACKEND, batched against batched -------------------
+  // The two batched routes compared directly against each other on the same N
+  // distinct sources, graded on independently evaluated GRID-side residuals.
+  //
+  // This is the gate that has to pass before any batched timing is trusted. The
+  // per-RHS 4*kappa^2 source scaling in QudaOperator::solve_batched is the thing
+  // most likely to be wrong, and getting it wrong produces a solution that looks
+  // entirely plausible and converges on QUDA's own residual while solving the
+  // wrong system -- this comparison is what makes that visible.
+  {
+    const std::vector<double> quda_residuals = independent_residuals(quda_batch_sol, src_odd);
+    const std::vector<double> grid_residuals = independent_residuals(grid_batch_sol, src_odd);
+    const double deviation = worst_slice_deviation(quda_batch_sol, grid_batch_sol);
+    const bool passed = deviation <= solve_tolerance && max_of(quda_residuals) <= residual_tolerance
+                        && max_of(grid_residuals) <= residual_tolerance;
+
+    JsonlWriter::Record c = emit("correctness", "mrhs_cross_backend_batched");
+    c.add("rel_deviation", deviation)
+        .add("tolerance", solve_tolerance)
+        .add("quda_independent_residual", max_of(quda_residuals))
+        .add("quda_independent_residual_all", quda_residuals)
+        .add("grid_independent_residual", max_of(grid_residuals))
+        .add("grid_independent_residual_all", grid_residuals)
+        .add("residual_tolerance", residual_tolerance)
+        .add("grid_batched_iterations", grid_batched_iterations)
+        .add("quda_batched_iterations", quda_batched_iterations)
+        .add("passed", passed);
+    writer.emit(c);
+    if (boss)
+      std::cout << GridLogMessage << "mrhs cross-backend batched check: worst slice dev " << deviation
+                << ", worst Grid-side residual quda " << max_of(quda_residuals) << " / grid "
+                << max_of(grid_residuals) << (passed ? " -> PASSED" : " -> FAILED") << std::endl;
+    if (!passed) fail("clover_mrhs/mrhs_cross_backend_batched correctness gate failed");
+  }
+
   // ---- Timing ------------------------------------------------------------------
+  // The gate section above is finished with the per-slice solution buffers, and
+  // at production volume they are several GB of device memory each (one odd
+  // spinor is 12*local_volume doubles, ~64 MB/rank at 48^3x96 on 16 GPU). The
+  // batched CG working sets below are what actually hit the device ceiling, so
+  // release the gate buffers first rather than letting them narrow the largest N
+  // this run can reach.
+  std::vector<LatticeFermion>().swap(grid_batch_sol);
+  std::vector<LatticeFermion>().swap(quda_batch_sol);
+  std::vector<LatticeFermion>().swap(quda_single_sol);
+
   op5.batch_sources(src_full, src5);
   sol5 = Zero();
   op5.solve_double(src5, sol5);   // warm-up, untimed (tunes kernels, populates caches)
+  const std::pair<double, double> memory_after_grid_batched = device_memory_used_total_mib();
 
-  std::vector<double> g5_seconds, g4_seconds, q_seconds;
-  std::vector<long long> g5_iters;
+  std::vector<double> g5_seconds, g4_seconds, q_seconds, q5_seconds;
+  std::vector<long long> g5_iters, q_iters, q5_iters;
   LatticeFermion quda_sol(UrbGrid);
   quda_sol.Checkerboard() = Odd;
+  std::vector<LatticeFermion> quda_batch_out = make_odd_fields(N);
 
   for (int r = 0; r < opt.solve_repeats; ++r) {
     sol5 = Zero();
@@ -1234,23 +1633,73 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
   // Q1xN: the SAME N sources, solved one at a time. The timed region covers all
   // N solves, because that is the wall clock a valence workflow would see.
   for (int r = 0; r < opt.solve_repeats; ++r) {
+    long long worst_iterations = 0;
     accelerator_barrier();
     UGrid->Barrier();
     const double t0 = usecond();
-    for (int s = 0; s < N; ++s) qop.solve(src_odd[s], quda_sol);
+    for (int s = 0; s < N; ++s) {
+      qop.solve(src_odd[s], quda_sol);
+      worst_iterations = std::max(worst_iterations, qop.last_iterations());
+    }
     accelerator_barrier();
     UGrid->Barrier();
     const double t1 = usecond();
     q_seconds.push_back((t1 - t0) / 1.0e6);
+    // Worst over the N sources, so it is the like-for-like counterpart of a
+    // batched count -- a batched solve runs until its slowest source converges.
+    q_iters.push_back(worst_iterations);
+  }
+
+  // QMRHS: the SAME N sources, batched into ONE invertMultiSrcQuda call. This is
+  // the route that makes the comparison batched-vs-batched instead of
+  // batched-vs-sequential.
+  //
+  // The warm-up matters more here than anywhere else in this pass: each batch
+  // size N is a kernel configuration QUDA has not autotuned before, so without
+  // it the first repeat carries the autotuning cost and, at the small
+  // solve_repeats this pass runs with, that can move the median rather than just
+  // widen the spread. The gates above already exercised this size, so this is
+  // belt-and-braces -- but it is what keeps the timing correct if the gates are
+  // ever reordered or made conditional.
+  qop.solve_batched(src_odd, quda_batch_out);
+  const std::pair<double, double> memory_after_quda_batched = device_memory_used_total_mib();
+
+  for (int r = 0; r < opt.solve_repeats; ++r) {
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double t0 = usecond();
+    qop.solve_batched(src_odd, quda_batch_out);
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double t1 = usecond();
+    q5_seconds.push_back((t1 - t0) / 1.0e6);
+    q5_iters.push_back(qop.last_iterations());
   }
 
   const Stat g5 = summarize(g5_seconds);
   const Stat g4 = summarize(g4_seconds);
   const Stat qn = summarize(q_seconds);
+  const Stat q5 = summarize(q5_seconds);
   const double dN = static_cast<double>(N);
   const double g5_per_rhs = g5.median / dN;
   const double g4_per_rhs = g4.median / dN;
   const double q_per_rhs = qn.median / dN;
+  const double q5_per_rhs = q5.median / dN;
+
+  // ---- Metric basis --------------------------------------------------------
+  // Per the header comment: a per-iteration comparison between the two batched
+  // routes is only legitimate when BOTH converge in their own backend's
+  // single-solve count. Decided from this run's own measured counts, and
+  // recorded, so a reader never has to reconstruct which basis applied.
+  const IterationStat g5_iter_stat = summarize_iterations(g5_iters);
+  const IterationStat q5_iter_stat = summarize_iterations(q5_iters);
+  const IterationStat q_iter_stat = summarize_iterations(q_iters);
+  const bool grid_batching_is_iteration_free =
+      (grid_single_worst_iterations > 0) && (g5_iter_stat.median == grid_single_worst_iterations);
+  const bool quda_batching_is_iteration_free =
+      (quda_single_worst_iterations > 0) && (q5_iter_stat.median == quda_single_worst_iterations);
+  const bool per_iteration_basis = grid_batching_is_iteration_free && quda_batching_is_iteration_free;
+  const std::string comparison_basis = per_iteration_basis ? "per_iteration" : "seconds_per_rhs";
 
   JsonlWriter::Record r = emit("solve", "mrhs_batched");
   r.add("backend", std::string("grid_5d"))
@@ -1269,17 +1718,59 @@ void run_multirhs(GridCartesian *UGrid, GridRedBlackCartesian *UrbGrid,
       .add("quda_seq_median_s", qn.median)
       .add("quda_seq_seconds_all", q_seconds)
       .add("quda_seq_seconds_per_rhs", q_per_rhs)
-      // What batching buys Grid: >1 means the 5D batched path is faster
+      .add("quda_seq_iterations_all", q_iters)
+      // QUDA batched (QMRHS), unsplit -- invertMultiSrcQuda over the same N sources
+      .add("qmrhs_median_s", q5.median)
+      .add("qmrhs_seconds_all", q5_seconds)
+      .add("qmrhs_seconds_per_rhs", q5_per_rhs)
+      .add("qmrhs_iterations_all", q5_iters)
+      .add("qmrhs_split_grid", std::string("1.1.1.1"))
+      // --- Quantity 1: what batching buys GRID (Grid against itself) ---
       .add("batching_speedup_vs_grid_seq", (g5_per_rhs > 0.0) ? g4_per_rhs / g5_per_rhs : 0.0)
-      // Throughput ratio vs QUDA run one source at a time (NOT a backend ratio)
-      .add("g5d_over_quda_seq_per_rhs", (q_per_rhs > 0.0) ? g5_per_rhs / q_per_rhs : 0.0);
+      // --- Quantity 2: what batching buys QUDA (QUDA against itself) ---
+      .add("batching_speedup_vs_quda_seq", (q5_per_rhs > 0.0) ? q_per_rhs / q5_per_rhs : 0.0)
+      // --- Quantity 3: THE HEADLINE, batched vs batched ---
+      .add("g5d_over_qmrhs_per_rhs", (q5_per_rhs > 0.0) ? g5_per_rhs / q5_per_rhs : 0.0)
+      // --- Quantity 4: in-run control, must reproduce the v3 sequential ratio ---
+      .add("grid_seq_over_quda_seq_per_rhs", (q_per_rhs > 0.0) ? g4_per_rhs / q_per_rhs : 0.0)
+      // Retained for continuity with the 09-03 results: Grid batched against QUDA
+      // run SEQUENTIALLY. A throughput number, superseded as a backend statement
+      // by g5d_over_qmrhs_per_rhs above. Never tabulate it alongside G1/Q1.
+      .add("g5d_over_quda_seq_per_rhs", (q_per_rhs > 0.0) ? g5_per_rhs / q_per_rhs : 0.0)
+      // Which basis quantity 3 may be read on -- see the header comment. The
+      // supporting counts are recorded too, so the verdict can be rechecked.
+      .add("comparison_basis", comparison_basis)
+      .add("grid_batched_iterations", g5_iter_stat.median)
+      .add("grid_single_worst_iterations", grid_single_worst_iterations)
+      .add("grid_batching_is_iteration_free", grid_batching_is_iteration_free)
+      .add("quda_batched_iterations", q5_iter_stat.median)
+      .add("quda_single_worst_iterations", quda_single_worst_iterations)
+      .add("quda_batching_is_iteration_free", quda_batching_is_iteration_free)
+      .add("quda_seq_iterations", q_iter_stat.median)
+      // Device memory after each batched route's warm-up, so the large-N ceiling
+      // is reported as a number rather than only as a crash. Per route, because
+      // the two routes do not reach the ceiling at the same N.
+      .add("device_mib_used_after_grid_batched", memory_after_grid_batched.first)
+      .add("device_mib_used_after_quda_batched", memory_after_quda_batched.first)
+      .add("device_mib_total", memory_after_quda_batched.second)
+      .add("requested_tol", opt.tol);
   writer.emit(r);
 
-  if (boss)
+  if (boss) {
     std::cout << GridLogMessage << "mrhs N=" << N << " s/RHS: Grid batched " << g5_per_rhs
               << ", Grid sequential " << g4_per_rhs << " (batching "
-              << ((g5_per_rhs > 0.0) ? g4_per_rhs / g5_per_rhs : 0.0) << "x), QUDA sequential "
-              << q_per_rhs << std::endl;
+              << ((g5_per_rhs > 0.0) ? g4_per_rhs / g5_per_rhs : 0.0) << "x), QUDA batched "
+              << q5_per_rhs << ", QUDA sequential " << q_per_rhs << " (batching "
+              << ((q5_per_rhs > 0.0) ? q_per_rhs / q5_per_rhs : 0.0) << "x)" << std::endl;
+    std::cout << GridLogMessage << "mrhs N=" << N << " batched-vs-batched G5D/QMRHS "
+              << ((q5_per_rhs > 0.0) ? g5_per_rhs / q5_per_rhs : 0.0) << " on the "
+              << comparison_basis << " basis; sequential control G4xN/Q1xN "
+              << ((q_per_rhs > 0.0) ? g4_per_rhs / q_per_rhs : 0.0) << std::endl;
+    std::cout << GridLogMessage << "mrhs N=" << N << " iterations: grid batched "
+              << g5_iter_stat.median << " vs worst single " << grid_single_worst_iterations
+              << ", quda batched " << q5_iter_stat.median << " vs worst single "
+              << quda_single_worst_iterations << std::endl;
+  }
 }
 
 } // namespace
