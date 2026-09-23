@@ -44,12 +44,14 @@
 
 // Probe-local FlexibleGCR (Grid's PrecGCRNonHermitian minus four unnecessary costs) and the
 // operator-application counters. See __docs/2026_09_15_grid_mg_fix_plan.md.
+#include "bench_nvtx.h"
 #include "probe_mg_solvers.h"
 
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -196,6 +198,12 @@ public:
   //   check already relies on. Measured cost of the difference: ~11.5 ms of a 145.7 ms V-cycle.
   //   ⛔ Only valid AFTER CoarsenOperator has run. Do not move this call earlier.
   bool fast_project = false;
+  // D7: 0/1 select stock ProjectToSubspace / blockProjectFast; 2 selects the fused
+  // projector in probe_mg_solvers.h. See that file for why.
+  int project_mode = 0;
+  // Gate on the per-region accelerator_barrier(). OFF by default -- see the long
+  // comment at the tick() lambda in operator().
+  bool instrument = false;
   // persistent_temps: hoist the four per-application fields out of the V-cycle (D4). At C3 a
   //   fine rb vector is ~64 MB and a coarse one ~2 MB, and field destruction costs ~0.3 ms
   //   EACH regardless of size.
@@ -278,7 +286,23 @@ public:
     vec1.Checkerboard() = in.Checkerboard();
     vec2.Checkerboard() = in.Checkerboard();
 
-    auto tick = []() { accelerator_barrier(); return usecond(); };
+    // ⛔⛔ THIS BARRIER USED TO BE UNCONDITIONAL. There are 14 tick() calls per
+    // V-cycle, each a full accelerator_barrier() (device synchronise), so every
+    // Grid MG timing this campaign ever produced was measured with ~14 forced
+    // syncs per V-cycle inside the timed region -- while the QUDA probe times its
+    // solve only at the outer boundary and has NO internal barriers. That is not
+    // an apples-to-apples comparison, and the sub-timers sum to only ~62-67% of
+    // the solve's wall time at every volume tested, which is the tell.
+    //
+    // Default is now OFF: no barriers, no breakdown. --probe-instrument-vcycle 1
+    // restores the breakdown, and its total must not be compared against an
+    // uninstrumented run's.
+    const bool instr = instrument;
+    auto tick = [instr]() -> double {
+      if (!instr) return 0.0;
+      accelerator_barrier();
+      return usecond();
+    };
     double t0;
     ++n_apply;
 
@@ -294,7 +318,9 @@ public:
     t_fineop += tick() - t0;
 
     t0 = tick();
-    if (fast_project)
+    if (project_mode == 2)
+      ProbeMG::blockProjectFused(Csrc, vec1, _Aggregates.subspace);
+    else if (fast_project)
       blockProjectFast(Csrc, vec1, _Aggregates.subspace);
     else
       _Aggregates.ProjectToSubspace(Csrc, vec1);
@@ -348,6 +374,17 @@ int read_int(int argc, char **argv, const std::string &option, int fallback)
   return payload.empty() ? fallback : std::stoi(payload);
 }
 
+// Median of the timed repeats, matching what the QUDA probe reports
+// (probe_quda_mg_clover.cc:385). With an odd count the median discards a single
+// slow first solve, which is why it is preferred to the mean here.
+double median_of(std::vector<double> v)
+{
+  if (v.empty()) return 0.0;
+  std::sort(v.begin(), v.end());
+  const std::size_t n = v.size();
+  return (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
 Coordinate parse_block(const std::string &spec)
 {
   Coordinate block(4);
@@ -385,6 +422,42 @@ int main(int argc, char **argv)
   const int maxiter = read_int(argc, argv, "--probe-maxiter", 1000);
   const int cg_maxiter = read_int(argc, argv, "--probe-cg-maxiter", 50000);
   const int run_cg = read_int(argc, argv, "--probe-run-cg", 1);
+  // double | mixed | both. `mixed` is Grid's MixedPrecisionConjugateGradient (fp32 inner CG,
+  // fp64 residual restarts) -- the solver the production driver runs for the light tail and the
+  // strange RHMC (MixedPrecCGWrapper), and the counterpart of QUDA's precise=double /
+  // sloppy=single CG. Needs the fp32 operator, so it requires --probe-mg-precision single.
+  // `both` runs the two back to back after one MG setup.
+  const std::string cg_precision = read_string(argc, argv, "--probe-cg-precision", "double");
+  // Inner fp32 tolerance of the mixed CG. Default = tol, which is what the production driver
+  // uses (it never sets InnerTolerance); Grid's own HMC drivers use 1e-8, and QUDA's nearest
+  // analogue is reliable_delta = 1e-3. A comma-separated list runs one mixed-CG row per value,
+  // all after the SAME MG setup -- at C3 a second launch would repeat a minute of setup.
+  std::vector<double> cg_inner_tols;
+  {
+    std::stringstream ss(read_string(argc, argv, "--probe-cg-inner-tol", ""));
+    for (std::string item; std::getline(ss, item, ',');)
+      if (!item.empty()) cg_inner_tols.push_back(std::stod(item));
+    if (cg_inner_tols.empty()) cg_inner_tols.push_back(tol);
+  }
+  // Restart cap for the mixed CG. 50 = the production driver's value.
+  const int cg_mixed_outer = read_int(argc, argv, "--probe-cg-mixed-outer", 50);
+  // Timed repeats per solver, median reported. Matches the QUDA probe's
+  // --probe-solve-repeats so both sides aggregate the same way.
+  const int solve_repeats = std::max(1, read_int(argc, argv, "--probe-solve-repeats", 3));
+  // Account for the ~27% of the MG solve that the preconditioner's breakdown does
+  // not see, i.e. the outer GCR's own work. ⚠️ Adds an accelerator_barrier() per
+  // sub-region, so the instrumented TOTAL is not comparable with an uninstrumented
+  // one -- read shares, not absolutes.
+  const int instrument_outer = read_int(argc, argv, "--probe-instrument-outer", 0);
+  // Re-enable the V-cycle's per-region barriers and breakdown. ⛔ Costs real time --
+  // that is the point of making it optional.
+  const int instrument_vcycle = read_int(argc, argv, "--probe-instrument-vcycle", 0);
+  // Run the OUTER solver and the reference CG in fp32 as well, not just the MG
+  // hierarchy. Needed because QUDA's MG forces its outer sloppy precision to match
+  // the hierarchy, so Grid-single (fp64 outer) vs QUDA-single was never matched.
+  // Requires --probe-mg-precision single, and a tolerance fp32 can reach (1e-6).
+  const bool outer_single =
+      (read_string(argc, argv, "--probe-outer-precision", "double") == "single");
   // Coarse stencil range, in hops. THIS IS NOT A FREE TUNING KNOB -- it has a
   // correct minimum set by the operator being coarsened, and job 58207223 was run
   // below it.
@@ -460,6 +533,11 @@ int main(int argc, char **argv)
   // Coarse-solver tolerance. Grid's test value is 2e-1; QUDA asks 0.1
   // (quda_grid_bridge.h:491). Was hardcoded until now.
   const double coarse_tol = read_double(argc, argv, "--probe-coarse-tol", 2.0e-1);
+  // Coarse-solver RESTART cap (GCR cycles of coarse_nstep steps each). Was hardcoded 50, i.e.
+  // effectively "solve to coarse_tol". At C3 clover that costs ~113 coarse applications per
+  // V-cycle, where QUDA caps its coarse solve at 12 iterations total (quda_grid_bridge.h:562).
+  // QUDA's budget is coarse_maxiter 1 with coarse_nstep = coarse_mmax = 12.
+  const int coarse_maxiter = read_int(argc, argv, "--probe-coarse-maxiter", 50);
   // Null-vector solve tolerance and inverse-iteration rounds. Grid hardcodes 1e-3 and 3
   // rounds (Aggregates.h:136); QUDA's setup_tol is 5e-6 (quda_grid_bridge.h:479).
   // ⚠️ THE LEADING CANDIDATE for the iteration gap, and the one that also retires the
@@ -497,6 +575,18 @@ int main(int argc, char **argv)
     return 2;
   }
   const bool mg_single = (precision_name == "single");
+
+  if (cg_precision != "double" && cg_precision != "mixed" && cg_precision != "both") {
+    std::cerr << "probe: --probe-cg-precision must be double|mixed|both" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (cg_precision != "double" && !mg_single) {
+    std::cerr << "probe: --probe-cg-precision mixed|both needs the fp32 operator, i.e."
+              << " --probe-mg-precision single" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
 
   const int stencil_hops = read_int(argc, argv, "--probe-stencil-hops", 2);
   if (stencil_hops < 1 || stencil_hops > 4) {
@@ -638,6 +728,36 @@ int main(int argc, char **argv)
   if (boss)
     std::cout << GridLogMessage << "gauge " << (cfg.empty() ? "hot" : cfg) << " plaquette " << plaquette
               << std::endl;
+
+  // ---- Stout smearing ------------------------------------------------------
+  //
+  // The production clover action is DEFINED with stout-smeared links, so an
+  // unsmeared probe inverts a different operator from the one HMC inverts. This
+  // ensemble's own metadata records <STOUT_FERM_STATE> rho=0.125, n_smear=1,
+  // orthog_dir=-1; orthog_dir=-1 means all four directions, which is exactly
+  // Grid's Smear_Stout default.
+  //
+  // Smearing does NOT simply make the problem harder: it sharply reduces the
+  // additive mass renormalisation, so m_c moves toward zero and the SAME bare
+  // mass represents a far lighter quark. That is why m0 = -0.2450 is a light
+  // point for the smeared action and a heavy one unsmeared (75 CG iterations).
+  //
+  // The gate is the smeared plaquette, which the ensemble publishes in
+  // plaquette_sm1_rho0.125_dat_a.xml -- check it before trusting any timing.
+  const int stout_nsmear = read_int(argc, argv, "--probe-stout-nsmear", 0);
+  const double stout_rho = read_double(argc, argv, "--probe-stout-rho", 0.125);
+  if (stout_nsmear > 0) {
+    Smear_Stout<PeriodicGimplD> stout(stout_rho);
+    LatticeGaugeFieldD Usmear(UGrid);
+    for (int n = 0; n < stout_nsmear; ++n) {
+      stout.smear(Usmear, Umu);
+      Umu = Usmear;
+    }
+    const double plaq_smeared = WilsonLoops<PeriodicGimplD>::avgPlaquette(Umu);
+    if (boss)
+      std::cout << GridLogMessage << "stout smearing rho " << stout_rho << " n_smear "
+                << stout_nsmear << " -> smeared plaquette " << plaq_smeared << std::endl;
+  }
 
   // Same operator the benchmark's clover_impl=compact path builds: antiperiodic
   // time via boundary_phases, csw_r = csw_t = csw, cF = 1.0 (bulk boundary).
@@ -883,10 +1003,10 @@ int main(int argc, char **argv)
   // persistent workspace would have quietly removed it from the control and understated the
   // result. Construction is free: both classes only store references until first applied.
   PrecGeneralisedConjugateResidualNonHermitian<CoarseVector> CoarseSolverStock(
-      coarse_tol, 50, CountedCoarse, coarse_trivial, coarse_mmax, coarse_nstep);
+      coarse_tol, coarse_maxiter, CountedCoarse, coarse_trivial, coarse_mmax, coarse_nstep);
   CoarseSolverStock.Level(3);
   ProbeMG::FlexibleGCR<CoarseVector> CoarseSolverFast(
-      coarse_tol, 50, CountedCoarse, coarse_trivial, coarse_mmax, coarse_nstep);
+      coarse_tol, coarse_maxiter, CountedCoarse, coarse_trivial, coarse_mmax, coarse_nstep);
   CoarseSolverFast.Level(3);
   CoarseSolverFast.verify_residual = (verify_residual != 0);
   // The probe zeroes Csol before every coarse solve, so the entry residual is exactly the
@@ -914,6 +1034,8 @@ int main(int argc, char **argv)
   MGPreconditioner<vSpinColourVectorD, vTComplexD, 2 * kNbasis> Precon(
       CombinedUV, CountedSchurOp, fine_trivial, Smoother, LinOpCoarse, CoarseSolver);
   Precon.fast_project = (fast_project != 0);
+  Precon.project_mode = fast_project;
+  Precon.instrument = (instrument_vcycle != 0);
   Precon.persistent_temps = (persistent_temps != 0);
 
   // ---- Single-precision preconditioner hierarchy ---------------------------
@@ -1030,10 +1152,10 @@ int main(int argc, char **argv)
     CountedSchurOpF.reset(
         new ProbeMG::CountingLinearOperator<LatticeFermionF>(*schur_holderF, counts.fine));
     CoarseSolverStockF.reset(new PrecGeneralisedConjugateResidualNonHermitian<CoarseVectorF>(
-        coarse_tol, 50, *CountedCoarseF, *coarse_trivialF, coarse_mmax, coarse_nstep));
+        coarse_tol, coarse_maxiter, *CountedCoarseF, *coarse_trivialF, coarse_mmax, coarse_nstep));
     CoarseSolverStockF->Level(3);
     CoarseSolverFastF.reset(new ProbeMG::FlexibleGCR<CoarseVectorF>(
-        coarse_tol, 50, *CountedCoarseF, *coarse_trivialF, coarse_mmax, coarse_nstep));
+        coarse_tol, coarse_maxiter, *CountedCoarseF, *coarse_trivialF, coarse_mmax, coarse_nstep));
     CoarseSolverFastF->Level(3);
     CoarseSolverFastF->verify_residual = (verify_residual != 0);
     CoarseSolverFastF->zero_guess = true;
@@ -1060,6 +1182,8 @@ int main(int argc, char **argv)
     PreconF.reset(new MGPreconditioner<vSpinColourVectorF, vTComplexF, 2 * kNbasis>(
         *CombinedUVF, *CountedSchurOpF, *fine_trivialF, SmootherFsel, *LinOpCoarseF, CoarseSolverFsel));
     PreconF->fast_project = (fast_project != 0);
+    PreconF->project_mode = fast_project;
+    PreconF->instrument = (instrument_vcycle != 0);
     PreconF->persistent_temps = (persistent_temps != 0);
     PreconMixed.reset(
         new PrecisionChangeAdaptor<LatticeFermionD, LatticeFermionF>(*PreconF, UrbGridF));
@@ -1120,11 +1244,20 @@ int main(int argc, char **argv)
   // computation there would solve the wrong system. FlexibleGCR additionally gates D1 on
   // k == 0; this is the second half of the same guard.
   MGSolverFast.zero_guess = false;
+  MGSolverFast.instrument = (instrument_outer != 0);
   LinearFunction<LatticeFermionD> &MGSolver =
       fast_gcr ? static_cast<LinearFunction<LatticeFermionD> &>(MGSolverFast)
                : static_cast<LinearFunction<LatticeFermionD> &>(MGSolverStock);
 
   // ---- Solve ---------------------------------------------------------------
+  //
+  // ⛔ RESEED IMMEDIATELY BEFORE THE DRAW. Two reasons, both bugs before this line
+  // existed: (1) RNG4 has already been consumed by CreateSubspaceGCR above, so the
+  // source silently depended on how many vectors the setup drew; (2) the QUDA probe
+  // reseeds to these same integers before ITS draw, so without this the two probes
+  // solved DIFFERENT right-hand sides and no Grid-vs-QUDA number was like-for-like.
+  // Keep these seeds identical to probe_quda_mg_clover.cc.
+  RNG4.SeedFixedIntegers(std::vector<int>({11, 22, 33, 44}));
   LatticeFermionD full_src(UGrid);
   random(RNG4, full_src);
   LatticeFermionD src(UrbGrid);
@@ -1136,20 +1269,220 @@ int main(int argc, char **argv)
   mg_sol.Checkerboard() = cb;
   mg_sol = Zero();
 
+  // ---- D7 transfer microbenchmark -----------------------------------------
+  //
+  // Restriction and prolongation are adjoints over the same data and are called
+  // the same number of times per V-cycle, so their costs should be comparable.
+  // They are not (35.1% vs 11.8%). This times the three implementations in
+  // isolation, and checks the fused one against blockProjectFast numerically --
+  // they agree to rounding, not exactly, because the block reduction order differs.
+  const int transfer_bench = read_int(argc, argv, "--probe-transfer-bench", 0);
+  if (transfer_bench > 0) {
+    CoarseVector c_fast(Coarse4d), c_fused(Coarse4d);
+    LatticeFermionD f_tmp(UrbGrid);
+    f_tmp.Checkerboard() = cb;
+    LatticeFermionD f_probe(UrbGrid);
+    f_probe.Checkerboard() = cb;
+    random(RNG4, full_src);
+    pickCheckerboard(cb, f_probe, full_src);
+
+    // Warm every path before timing any of it.
+    blockProjectFast(c_fast, f_probe, CombinedUV.subspace);
+    ProbeMG::blockProjectFused(c_fused, f_probe, CombinedUV.subspace);
+    CombinedUV.PromoteFromSubspace(c_fast, f_tmp);
+    accelerator_barrier();
+    UGrid->Barrier();
+
+    auto time_it = [&](const char *name, auto &&fn) {
+      accelerator_barrier();
+      UGrid->Barrier();
+      const double s = usecond();
+      for (int i = 0; i < transfer_bench; ++i) fn();
+      accelerator_barrier();
+      UGrid->Barrier();
+      const double ms = (usecond() - s) / 1.0e3 / double(transfer_bench);
+      if (boss)
+        std::cout << GridLogMessage << "transfer bench  " << name << "  " << ms << " ms/call"
+                  << std::endl;
+      return ms;
+    };
+
+    const double ms_fast =
+        time_it("blockProjectFast ", [&] { blockProjectFast(c_fast, f_probe, CombinedUV.subspace); });
+    const double ms_fused = time_it(
+        "blockProjectFused", [&] { ProbeMG::blockProjectFused(c_fused, f_probe, CombinedUV.subspace); });
+    const double ms_prom =
+        time_it("blockPromote     ", [&] { CombinedUV.PromoteFromSubspace(c_fast, f_tmp); });
+
+    // Numerical agreement gate: relative difference of the two coarse results.
+    blockProjectFast(c_fast, f_probe, CombinedUV.subspace);
+    ProbeMG::blockProjectFused(c_fused, f_probe, CombinedUV.subspace);
+    CoarseVector c_diff(Coarse4d);
+    c_diff = c_fast - c_fused;
+    const double rel = std::sqrt(norm2(c_diff) / norm2(c_fast));
+    if (boss) {
+      std::cout << GridLogMessage << "transfer bench  fused/fast speedup " << (ms_fast / ms_fused)
+                << "x, project/promote was " << (ms_fast / ms_prom) << "x, now "
+                << (ms_fused / ms_prom) << "x" << std::endl;
+      std::cout << GridLogMessage << "transfer bench  fused-vs-fast relative difference " << rel
+                << (rel < 1.0e-10 ? "  PASSED" : "  FAILED") << std::endl;
+    }
+  }
+
+  // ---- FULLY SINGLE-PRECISION PATH ----------------------------------------
+  //
+  // WHY. `MG_PRECISION=single` alone gives an fp32 HIERARCHY under an fp64 OUTER
+  // solver, while QUDA's MG *requires* the outer sloppy precision to match the
+  // hierarchy (SLOPPY=double + MG aborts, "Precisions 4 8 do not match",
+  // coarse_op_24.cu:115). So Grid-single vs QUDA-single still compared an fp64
+  // outer against an fp32-sloppy one, in QUDA's favour. fp64-vs-fp64 cannot fix
+  // it either: QUDA's fp64 MG is not compiled (multigrid.h:10). The only way to
+  // match both sides is to run EVERYTHING in fp32, which is what this does.
+  //
+  // ⚠️ fp32 cannot reach 1e-10 -- run all four comparisons at TOL=1e-6.
+  // The independent residual is still evaluated in fp64 on the promoted solution,
+  // so the gate stays honest even though the solve is fp32 throughout.
+  if (outer_single) {
+    if (!mg_single) {
+      if (boss)
+        std::cout << GridLogMessage
+                  << "ERROR: --probe-outer-precision single requires --probe-mg-precision single"
+                  << std::endl;
+      Grid_finalize();
+      return 1;
+    }
+    LatticeFermionF srcF(UrbGridF), solF(UrbGridF);
+    srcF.Checkerboard() = cb;
+    solF.Checkerboard() = cb;
+    precisionChange(srcF, src);
+    const double srcF_norm2 = norm2(srcF);
+
+    ProbeMG::FlexibleGCR<LatticeFermionF> MGSolverF(tol, maxiter, *CountedSchurOpF, *PreconF,
+                                                    outer_mmax, outer_nstep);
+    MGSolverF.Level(1);
+    MGSolverF.zero_guess = false;
+
+    // MG: warm, then timed repeats, median -- identical treatment to the fp64 path.
+    solF = Zero();
+    MGSolverF(srcF, solF);
+    std::vector<double> mgF_times;
+    int mgF_steps = 0;
+    long long mgF_fine = 0, mgF_coarse = 0;
+    for (int r = 0; r < solve_repeats; ++r) {
+      solF = Zero();
+      counts.reset();
+      accelerator_barrier();
+      UGrid->Barrier();
+      const double s = usecond();
+      MGSolverF(srcF, solF);
+      accelerator_barrier();
+      UGrid->Barrier();
+      mgF_times.push_back((usecond() - s) / 1.0e6);
+      mgF_steps = MGSolverF.steps;
+      mgF_fine = counts.fine;
+      mgF_coarse = counts.coarse;
+    }
+    // Grade in fp64 on the promoted solution against the fp64 operator.
+    LatticeFermionD promoted(UrbGrid), resid(UrbGrid);
+    promoted.Checkerboard() = cb;
+    resid.Checkerboard() = cb;
+    precisionChange(promoted, solF);
+    SchurOp.Op(promoted, resid);
+    resid = resid - src;
+    const double mgF_residual = std::sqrt(norm2(resid) / source_norm2);
+
+    // CG on Mpc^dag Mpc, also fully fp32.
+    std::vector<double> cgF_times;
+    long long cgF_iters = 0;
+    double cgF_residual = 0.0;
+    if (run_cg) {
+      LatticeFermionF cgF(UrbGridF);
+      cgF.Checkerboard() = cb;
+      ConjugateGradient<LatticeFermionF> CGF(tol, cg_maxiter, false);
+      cgF = Zero();
+      CGF(*CountedSchurOpF, srcF, cgF);
+      for (int r = 0; r < solve_repeats; ++r) {
+        cgF = Zero();
+        accelerator_barrier();
+        UGrid->Barrier();
+        const double s = usecond();
+        CGF(*CountedSchurOpF, srcF, cgF);
+        accelerator_barrier();
+        UGrid->Barrier();
+        cgF_times.push_back((usecond() - s) / 1.0e6);
+        cgF_iters = static_cast<long long>(CGF.IterationsToComplete);
+      }
+      precisionChange(promoted, cgF);
+      SchurOp.HermOp(promoted, resid);
+      resid = resid - src;
+      cgF_residual = std::sqrt(norm2(resid) / source_norm2);
+    }
+
+    if (boss) {
+      std::cout << GridLogMessage << "=== SUMMARY (FULLY fp32: hierarchy + outer + CG) ==="
+                << std::endl;
+      std::cout << GridLogMessage << "action                  " << action_name << std::endl;
+      std::cout << GridLogMessage << "tolerance               " << tol
+                << "  (fp32 cannot reach 1e-10)" << std::endl;
+      std::cout << GridLogMessage << "MG solve (Mpc)          " << median_of(mgF_times) << " s, "
+                << mgF_steps << " outer steps, fp64-graded residual " << mgF_residual << std::endl;
+      if (mgF_steps > 0)
+        std::cout << GridLogMessage << "operator applications   fine " << mgF_fine << " ("
+                  << double(mgF_fine) / double(mgF_steps) << " / V-cycle), coarse " << mgF_coarse
+                  << std::endl;
+      if (run_cg)
+        std::cout << GridLogMessage << "CG solve (Mpc^dag Mpc)  " << median_of(cgF_times) << " s, "
+                  << cgF_iters << " iters, fp64-graded residual " << cgF_residual << std::endl;
+      const bool ok = (mgF_residual <= 1.0e-4) && (!run_cg || cgF_residual <= 1.0e-4);
+      std::cout << GridLogMessage << "PROBE RESULT: " << (ok ? "PASS" : "FAIL") << std::endl;
+    }
+    Grid_finalize();
+    return 0;
+  }
+
   if (boss) std::cout << GridLogMessage << "--- MG-preconditioned GCR solve of Mpc ---" << std::endl;
-  // Reset AFTER setup: CoarsenOperator applies Mpc npoint*2*nbasis times, and
-  // CreateSubspaceGCR far more, neither of which belongs in the per-V-cycle count.
-  counts.reset();
-  accelerator_barrier();
-  UGrid->Barrier();
-  t0 = usecond();
+
+  // ⛔ WARM SOLVE, UNTIMED. Without it the first timed solve carries CUDA autotune
+  // and first-touch allocation. This also removes an asymmetry that used to flatter
+  // CG: the MG solve ran FIRST, so the CG reference below inherited an already-warm
+  // machine while MG paid for warming it. Both are now warmed and both take the
+  // median of `solve_repeats`, matching the QUDA probe.
   MGSolver(src, mg_sol);
-  accelerator_barrier();
-  UGrid->Barrier();
-  const double mg_seconds = (usecond() - t0) / 1.0e6;
-  const long long mg_fine_applies = counts.fine;
-  const long long mg_coarse_applies = counts.coarse;
-  const int mg_steps = fast_gcr ? MGSolverFast.steps : MGSolverStock.steps;
+
+  if (instrument_outer) MGSolverFast.reset_timers();
+  // NVTX scoping for nsys. Setup is 7-10 s against a 0.08 s solve, so whole-run
+  // kernel statistics are useless here -- the range is what makes it possible to
+  // ask "how many kernels, and how much wall time between them" for the SOLVE.
+  // Compiled out unless -DBENCH_NVTX; see bench_nvtx.h.
+  // ⛔ Profiler overhead is NOT backend-neutral (nsys inflated Grid 3.5-5.2% but
+  // QUDA 0.9-1.7% at C2/1 GPU) -- use this for WITHIN-run attribution only, never
+  // for a Grid-vs-QUDA ratio.
+  std::vector<double> mg_times;
+  long long mg_fine_applies = 0;
+  long long mg_coarse_applies = 0;
+  int mg_steps = 0;
+  for (int r = 0; r < solve_repeats; ++r) {
+    mg_sol = Zero();
+    // Reset AFTER setup: CoarsenOperator applies Mpc npoint*2*nbasis times, and
+    // CreateSubspaceGCR far more, neither of which belongs in the per-V-cycle count.
+    counts.reset();
+    accelerator_barrier();
+    UGrid->Barrier();
+    t0 = usecond();
+    {
+      BENCH_NVTX_RANGE("mg_solve");
+      MGSolver(src, mg_sol);
+    }
+    accelerator_barrier();
+    UGrid->Barrier();
+    mg_times.push_back((usecond() - t0) / 1.0e6);
+    // Deterministic across repeats (same source, seeded setup); taking the last is
+    // equivalent to taking any, and a disagreement here would itself be a finding.
+    mg_fine_applies = counts.fine;
+    mg_coarse_applies = counts.coarse;
+    mg_steps = fast_gcr ? MGSolverFast.steps : MGSolverStock.steps;
+  }
+  const double mg_seconds = median_of(mg_times);
 
   // Independent residual, outside every timed region, evaluated with Grid's own
   // Schur operator -- the MG row solves Mpc, so it is graded against Mpc.
@@ -1168,28 +1501,86 @@ int main(int argc, char **argv)
   double cg_residual = 0.0;
   long long cg_iterations = 0;
   long long cg_fine_applies = 0;
-  if (run_cg) {
+  const bool cg_double = (cg_precision == "double" || cg_precision == "both");
+  const bool cg_mixed = (cg_precision == "mixed" || cg_precision == "both");
+  if (run_cg && cg_double) {
     LatticeFermionD cg_sol(UrbGrid);
     cg_sol.Checkerboard() = cb;
     cg_sol = Zero();
     ConjugateGradient<LatticeFermionD> CG(tol, cg_maxiter, false);
     if (boss) std::cout << GridLogMessage << "--- reference CG on Mpc^dag Mpc ---" << std::endl;
-    // Counted too: CG's applications-per-second is the calibration that converts the MG
-    // application COUNT into a time, and it is the only place a bare Mpc cost can be read off.
-    counts.reset();
-    accelerator_barrier();
-    UGrid->Barrier();
-    t0 = usecond();
+    // Warm solve, untimed -- same treatment as the MG row above, so neither solver
+    // is charged for warming the machine on the other's behalf.
     CG(CountedSchurOp, src, cg_sol);
-    accelerator_barrier();
-    UGrid->Barrier();
-    cg_seconds = (usecond() - t0) / 1.0e6;
-    cg_iterations = static_cast<long long>(CG.IterationsToComplete);
-    cg_fine_applies = counts.fine;
+
+    std::vector<double> cg_times;
+    for (int r = 0; r < solve_repeats; ++r) {
+      cg_sol = Zero();
+      // Counted too: CG's applications-per-second is the calibration that converts the MG
+      // application COUNT into a time, and it is the only place a bare Mpc cost can be read off.
+      counts.reset();
+      accelerator_barrier();
+      UGrid->Barrier();
+      t0 = usecond();
+      CG(CountedSchurOp, src, cg_sol);
+      accelerator_barrier();
+      UGrid->Barrier();
+      cg_times.push_back((usecond() - t0) / 1.0e6);
+      cg_iterations = static_cast<long long>(CG.IterationsToComplete);
+      cg_fine_applies = counts.fine;
+    }
+    cg_seconds = median_of(cg_times);
 
     SchurOp.HermOp(cg_sol, residual);
     residual = residual - src;
     cg_residual = std::sqrt(norm2(residual) / source_norm2);
+  }
+
+  // ---- Mixed-precision CG on Mpc^dag Mpc -----------------------------------
+  //
+  // Grid's stock MixedPrecisionConjugateGradient, built exactly as the production driver's
+  // MixedPrecCGWrapper builds it: fp32 inner CG on the fp32 Schur operator, fp64 residual
+  // restarts on the fp64 one, then a final fp64 patch-up CG. Same source, same fp64 grading.
+  struct MixedCGRow {
+    double inner_tol, seconds, residual;
+    long long inner, restarts, final_iters;
+  };
+  std::vector<MixedCGRow> cgm_rows;
+  if (run_cg && cg_mixed) {
+    LatticeFermionD cgm_sol(UrbGrid);
+    cgm_sol.Checkerboard() = cb;
+    for (const double inner_tol : cg_inner_tols) {
+      MixedPrecisionConjugateGradient<LatticeFermionD, LatticeFermionF> MPCG(
+          tol, cg_maxiter, cg_mixed_outer, UrbGridF, *CountedSchurOpF, CountedSchurOp);
+      MPCG.InnerTolerance = inner_tol;
+      if (boss)
+        std::cout << GridLogMessage << "--- mixed-precision CG on Mpc^dag Mpc, inner tol " << inner_tol
+                  << " ---" << std::endl;
+      cgm_sol = Zero();
+      MPCG(src, cgm_sol);  // warm, untimed
+
+      MixedCGRow row{inner_tol, 0.0, 0.0, 0, 0, 0};
+      std::vector<double> cgm_times;
+      for (int r = 0; r < solve_repeats; ++r) {
+        cgm_sol = Zero();
+        accelerator_barrier();
+        UGrid->Barrier();
+        t0 = usecond();
+        MPCG(src, cgm_sol);
+        accelerator_barrier();
+        UGrid->Barrier();
+        cgm_times.push_back((usecond() - t0) / 1.0e6);
+        row.inner = static_cast<long long>(MPCG.TotalInnerIterations);
+        row.restarts = static_cast<long long>(MPCG.TotalOuterIterations);
+        row.final_iters = static_cast<long long>(MPCG.TotalFinalStepIterations);
+      }
+      row.seconds = median_of(cgm_times);
+
+      SchurOp.HermOp(cgm_sol, residual);
+      residual = residual - src;
+      row.residual = std::sqrt(norm2(residual) / source_norm2);
+      cgm_rows.push_back(row);
+    }
   }
 
   // ---- Summary -------------------------------------------------------------
@@ -1223,10 +1614,19 @@ int main(int argc, char **argv)
               << (subspace_seconds + coarsen_seconds + coarsen_f_seconds) << " s" << std::endl;
     std::cout << GridLogMessage << "MG solve (Mpc)          " << mg_seconds << " s, " << mg_steps
               << " outer PGCR steps, independent residual " << mg_residual << std::endl;
-    if (mg_single)
-      PreconF->report_breakdown();
-    else
-      Precon.report_breakdown();
+    if (instrument_vcycle) {
+      if (mg_single)
+        PreconF->report_breakdown();
+      else
+        Precon.report_breakdown();
+    } else {
+      std::cout << GridLogMessage
+                << "  V-cycle breakdown SUPPRESSED (--probe-instrument-vcycle 0): its 14 "
+                   "accelerator_barrier() calls per cycle are inside the timed region"
+                << std::endl;
+    }
+    if (instrument_outer && fast_gcr)
+      std::cout << GridLogMessage << MGSolverFast.timer_report() << std::endl;
 
     // ---- Operator-application census (Stage 0) ----------------------------
     //
@@ -1240,7 +1640,7 @@ int main(int argc, char **argv)
                 << per_cycle_coarse << " / V-cycle)" << std::endl;
     }
 
-    if (run_cg) {
+    if (run_cg && cg_double) {
       std::cout << GridLogMessage << "CG solve (Mpc^dag Mpc)  " << cg_seconds << " s, " << cg_iterations
                 << " iters, independent residual " << cg_residual << std::endl;
       // Bare cost of one Mpc application, the calibration that turns the MG census into a time.
@@ -1249,6 +1649,11 @@ int main(int argc, char **argv)
                   << " Mpc applications, " << (1.0e3 * cg_seconds / double(cg_fine_applies))
                   << " ms each" << std::endl;
     }
+    for (const auto &row : cgm_rows)
+      std::cout << GridLogMessage << "CG mixed solve (Mpc^dag Mpc) " << row.seconds << " s, "
+                << (row.inner + row.final_iters) << " iters (" << row.inner << " fp32 inner, "
+                << row.restarts << " restarts, " << row.final_iters << " fp64 final), inner tol "
+                << row.inner_tol << ", independent residual " << row.residual << std::endl;
     std::cout << GridLogMessage << "Galerkin check          " << (galerkin_passed ? "PASSED" : "FAILED")
               << (stencil_hops >= 2 ? " (gate)" : " (diagnostic only at hops=1)") << std::endl;
     std::cout << GridLogMessage << "MG converged            " << (converged ? "YES" : "NO") << std::endl;

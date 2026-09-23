@@ -108,6 +108,12 @@ int main(int argc, char **argv)
     const int maxiter = read_int(argc, argv, "--probe-maxiter", 5000);
     const int repeats = read_int(argc, argv, "--probe-solve-repeats", 3);
     const int run_cg = read_int(argc, argv, "--probe-run-cg", 1);
+    // ⛔ REQUIRED for a fp64 CG row. QUDA's MG setup asserts that the sloppy
+    // precision matches the hierarchy's ("Precisions 4 8 do not match",
+    // coarse_op_24.cu:115), so --probe-sloppy double ABORTS during MG setup --
+    // before the CG reference is ever reached, since MG is built first. Skipping
+    // MG is the only way to measure QUDA CG in double.
+    const int run_mg = read_int(argc, argv, "--probe-run-mg", 1);
     const int run_verify = read_int(argc, argv, "--probe-mg-verify", 0);
 
     if (cb_name != "even" && cb_name != "odd") throw std::runtime_error("--probe-checkerboard must be even|odd");
@@ -122,6 +128,19 @@ int main(int argc, char **argv)
     // <CudaSloppyReconstruct>). The v3 CG rows used the `strict` preset
     // (double/no), so the MG rows cannot share a precision setting with them --
     // that is recorded rather than silently reconciled.
+    // Outer ("precise") working precision. Default double; `single` makes the
+    // WHOLE QUDA solve fp32, which is what a like-for-like comparison against a
+    // fully-fp32 Grid solve needs -- QUDA's MG forces its sloppy precision to
+    // match the hierarchy, so an fp64 outer is not available to it with MG on.
+    // ⚠️ fp32 cannot reach 1e-10; run these at tol 1e-6.
+    const std::string precise_name = read_string(argc, argv, "--probe-precise", "double");
+    QudaPrecision precise = QUDA_DOUBLE_PRECISION;
+    if (precise_name == "single") {
+      precise = QUDA_SINGLE_PRECISION;
+    } else if (precise_name != "double") {
+      throw std::runtime_error("--probe-precise must be single|double");
+    }
+
     QudaPrecision sloppy = QUDA_SINGLE_PRECISION;
     QudaReconstructType sloppy_recon = QUDA_RECONSTRUCT_12;
     if (sloppy_name == "double") {
@@ -151,7 +170,31 @@ int main(int argc, char **argv)
       reader.readConfiguration(Umu, header);
       reader.close();
     }
-    const double grid_plaquette = WilsonLoops<PeriodicGimplD>::avgPlaquette(Umu);
+    double grid_plaquette = WilsonLoops<PeriodicGimplD>::avgPlaquette(Umu);
+
+    // ---- Stout smearing, applied through GRID's Smear_Stout --------------------
+    //
+    // Deliberately the SAME code path as probe_grid_mg_schur_clover.cc rather than
+    // a QUDA-side equivalent: two independent smearing implementations is exactly
+    // the kind of thing that silently differs and voids the comparison. QUDA is
+    // handed the already-smeared links below.
+    //
+    // This ensemble's metadata records <STOUT_FERM_STATE> rho=0.125, n_smear=1,
+    // orthog_dir=-1 (all four directions, Grid's default).
+    const int stout_nsmear = read_int(argc, argv, "--probe-stout-nsmear", 0);
+    const double stout_rho = read_double(argc, argv, "--probe-stout-rho", 0.125);
+    if (stout_nsmear > 0) {
+      Smear_Stout<PeriodicGimplD> stout(stout_rho);
+      LatticeGaugeField Usmear(UGrid);
+      for (int n = 0; n < stout_nsmear; ++n) {
+        stout.smear(Usmear, Umu);
+        Umu = Usmear;
+      }
+      grid_plaquette = WilsonLoops<PeriodicGimplD>::avgPlaquette(Umu);
+      if (boss)
+        std::cout << GridLogMessage << "stout smearing rho " << stout_rho << " n_smear "
+                  << stout_nsmear << " -> smeared plaquette " << grid_plaquette << std::endl;
+    }
 
     if (boss) {
       std::cout << GridLogMessage << "=== probe_quda_mg_clover ===" << std::endl;
@@ -211,7 +254,7 @@ int main(int argc, char **argv)
     {
       QudaSession session(UGrid);
 
-      QudaOperator qop(UGrid, Umu, clover, mass, csw, QUDA_DOUBLE_PRECISION, sloppy,
+      QudaOperator qop(UGrid, Umu, clover, mass, csw, precise, sloppy,
                        QUDA_RECONSTRUCT_NO, sloppy_recon, tol, maxiter, /*antiperiodic_time=*/true);
 
       // SYMMETRIC (see the SchurOp comment above -- asymmetric coarsening is
@@ -223,7 +266,12 @@ int main(int argc, char **argv)
       // ---- Gate 1: the gauge field QUDA holds is the one Grid read ------------
       const std::array<double, 3> quda_plaquette = qop.plaquette();
       const double plaquette_deviation = std::abs(grid_plaquette - quda_plaquette[0]);
-      const bool plaquette_passed = plaquette_deviation <= 1e-11;
+      // ⚠️ The threshold MUST track the working precision. QUDA stores the gauge
+      // field at `precise`, so with --probe-precise single the plaquette can only
+      // agree with Grid's fp64 value to ~1e-7; 1e-11 would fail a perfectly
+      // correct fp32 run. This is a precision floor, not a slackened gate.
+      const double plaquette_tol = (precise == QUDA_SINGLE_PRECISION) ? 1e-6 : 1e-11;
+      const bool plaquette_passed = plaquette_deviation <= plaquette_tol;
       if (boss)
         std::cout << GridLogMessage << "quda plaquette " << quda_plaquette[0] << ", deviation "
                   << plaquette_deviation << " -> " << (plaquette_passed ? "PASSED" : "FAILED") << std::endl;
@@ -299,9 +347,13 @@ int main(int argc, char **argv)
         std::cout << GridLogMessage << "--- MG setup: n_level=" << mg.n_level << ", block "
                   << mg.geo_block_size[0][0] << "." << mg.geo_block_size[0][1] << "."
                   << mg.geo_block_size[0][2] << "." << mg.geo_block_size[0][3] << " ---" << std::endl;
-      qop.build_multigrid(mg);
-      if (boss)
-        std::cout << GridLogMessage << "MG setup " << qop.mg_setup_seconds() << " s" << std::endl;
+      if (run_mg) {
+        qop.build_multigrid(mg);
+        if (boss)
+          std::cout << GridLogMessage << "MG setup " << qop.mg_setup_seconds() << " s" << std::endl;
+      } else if (boss) {
+        std::cout << GridLogMessage << "MG SKIPPED (--probe-run-mg 0): CG-only row" << std::endl;
+      }
 
       // ---- Source -------------------------------------------------------------
       pRNG.SeedFixedIntegers(std::vector<int>({11, 22, 33, 44}));
@@ -331,19 +383,25 @@ int main(int argc, char **argv)
       };
 
       // ---- Warm MG solve doubles as the correctness gate ----------------------
-      sol = Zero();
-      qop.solve_mg(src, sol);
-      const double warm_residual = mg_residual_of(sol);
-      const bool mg_passed = warm_residual <= std::max(1e-8, 100.0 * tol);
-      if (boss)
-        std::cout << GridLogMessage << "MG warm solve: " << qop.mg_last_iterations()
-                  << " iters, Grid-side residual " << warm_residual << " -> "
-                  << (mg_passed ? "PASSED" : "FAILED") << std::endl;
+      // This is also the untimed warm-up: it absorbs QUDA's autotune so the first
+      // TIMED repeat below is already warm, matching the CG row's explicit warm
+      // and the Grid probe's warm solve on both of its rows.
+      bool mg_passed = true;
+      if (run_mg) {
+        sol = Zero();
+        qop.solve_mg(src, sol);
+        const double warm_residual = mg_residual_of(sol);
+        mg_passed = warm_residual <= std::max(1e-8, 100.0 * tol);
+        if (boss)
+          std::cout << GridLogMessage << "MG warm solve: " << qop.mg_last_iterations()
+                    << " iters, Grid-side residual " << warm_residual << " -> "
+                    << (mg_passed ? "PASSED" : "FAILED") << std::endl;
+      }
 
       // ---- Timed MG repeats ---------------------------------------------------
       std::vector<double> mg_seconds, mg_residuals;
       std::vector<long long> mg_iters;
-      for (int r = 0; r < repeats; ++r) {
+      for (int r = 0; r < (run_mg ? repeats : 0); ++r) {
         sol = Zero();
         accelerator_barrier();
         UGrid->Barrier();
@@ -392,16 +450,18 @@ int main(int argc, char **argv)
                   << std::endl;
         std::cout << GridLogMessage << "mg precision            " << mg_precision << std::endl;
         std::cout << GridLogMessage << "checkerboard            " << cb_name << std::endl;
-        std::cout << GridLogMessage << "MG setup                " << qop.mg_setup_seconds() << " s"
-                  << std::endl;
-        std::cout << GridLogMessage << "MG solve (Mpc)          " << mg_median << " s, "
-                  << mg_iters[mg_iters.size() / 2] << " iters, Grid-side residual "
-                  << *std::max_element(mg_residuals.begin(), mg_residuals.end()) << std::endl;
+        if (run_mg) {
+          std::cout << GridLogMessage << "MG setup                " << qop.mg_setup_seconds() << " s"
+                    << std::endl;
+          std::cout << GridLogMessage << "MG solve (Mpc)          " << mg_median << " s, "
+                    << mg_iters[mg_iters.size() / 2] << " iters, Grid-side residual "
+                    << *std::max_element(mg_residuals.begin(), mg_residuals.end()) << std::endl;
+        }
         if (run_cg)
           std::cout << GridLogMessage << "CG solve (Mpc^dag Mpc)  " << cg_median << " s, "
                     << cg_iters[cg_iters.size() / 2] << " iters, Grid-side residual " << cg_residual
                     << std::endl;
-        if (run_cg && cg_median > 0.0)
+        if (run_mg && run_cg && cg_median > 0.0)
           std::cout << GridLogMessage << "MG/CG (time to solution, NOT per-iteration) "
                     << (mg_median / cg_median) << std::endl;
         std::cout << GridLogMessage << "PROBE RESULT: " << (mg_passed ? "PASS" : "FAIL") << std::endl;
@@ -410,7 +470,7 @@ int main(int argc, char **argv)
 
       // Explicit, before the QudaOperator destructor: the MG hierarchy references
       // the resident gauge and clover fields.
-      qop.destroy_multigrid();
+      if (run_mg) qop.destroy_multigrid();
     } // QudaSession torn down after every QudaOperator is gone
   } catch (const std::exception &error) {
     std::cerr << "probe_quda_mg_clover: ERROR: " << error.what() << std::endl;

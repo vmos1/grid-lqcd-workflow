@@ -37,6 +37,11 @@ ACTION=${ACTION:-clover}
 CHECKERBOARD=${CHECKERBOARD:-even}
 MG_MODE=${MG_MODE:-like_for_like}   # like_for_like | production
 SLOPPY=${SLOPPY:-single}            # production runs SINGLE + RECONS_12
+# Outer working precision. PRECISE=single makes the WHOLE QUDA solve fp32, the
+# only configuration that matches a fully-fp32 Grid solve: QUDA's MG forces its
+# sloppy precision to match the hierarchy, so it cannot be given an fp64 outer.
+# ⚠️ fp32 cannot reach 1e-10 -- pair PRECISE=single with TOL=1e-6.
+PRECISE=${PRECISE:-double}
 # mixed | single. mixed = QUDA's production default: fp32 preconditioner but HALF
 # null vectors and HALF coarse halos. single raises both to fp32, giving the ONE
 # like-for-like precision comparison against Grid (which cannot do half at all).
@@ -46,7 +51,16 @@ MG_PRECISION=${MG_PRECISION:-mixed}
 TOL=${TOL:-1e-10}
 MAXITER=${MAXITER:-5000}
 SOLVE_REPEATS=${SOLVE_REPEATS:-3}
+# Stout smearing, applied through GRID's Smear_Stout -- the SAME code path as the
+# Grid probe, deliberately, so the two sides cannot disagree on the smeared links.
+STOUT_NSMEAR=${STOUT_NSMEAR:-0}
+STOUT_RHO=${STOUT_RHO:-0.125}
 RUN_CG=${RUN_CG:-1}
+# ⛔ Set RUN_MG=0 to measure QUDA CG at SLOPPY=double. QUDA's MG setup requires the
+# sloppy precision to match the hierarchy's and aborts otherwise ("Precisions 4 8 do
+# not match"), and MG is built BEFORE the CG reference, so a fp64 CG row is only
+# reachable with MG skipped.
+RUN_MG=${RUN_MG:-1}
 MG_VERIFY=${MG_VERIFY:-0}           # QUDA's own MG self-check; slow, use at bring-up
 INPUT=${INPUT:-physical}
 CFG=${CFG:-${ROOT}/data/cl21_48_96_b6p3_m0p2416_m0p2050-djm-3_cfg_2000.lime}
@@ -61,7 +75,12 @@ GPUS_PER_TASK=${GPUS_PER_TASK:-1}
 RUN_ID=${RUN_ID:-$(date +%Y%m%dT%H%M%S)}
 RUN_DIR=${RUN_DIR:-${OUT}/${RUN_ID}}
 LOG=${LOG:-${RUN_DIR}/probe.log}
-QUDA_RESOURCE_PATH=${QUDA_RESOURCE_PATH:-${RUN_DIR}/quda_resource}
+# ⛔ SHARED, not per-run. This used to default to ${RUN_DIR}/quda_resource, so every
+# run started with a COLD tunecache and paid QUDA's autotune from scratch -- which
+# lands in the first timed solve and, across a scan, adds a per-run cost that has
+# nothing to do with the solver being measured. One persistent directory lets the
+# tunecache accumulate and be reused.
+QUDA_RESOURCE_PATH=${QUDA_RESOURCE_PATH:-${PSCRATCH}/grid_quda_wilson_clover/quda_tunecache}
 export QUDA_RESOURCE_PATH
 
 mkdir -p "${RUN_DIR}" "${QUDA_RESOURCE_PATH}"
@@ -117,6 +136,8 @@ fi
   printf 'ENV LATT=%s MPI=%s MASS=%s CSW=%s INPUT=%s\n' "${LATT}" "${MPI}" "${MASS}" "${CSW}" "${INPUT}"
   printf 'ENV ACTION=%s CHECKERBOARD=%s MG_MODE=%s SLOPPY=%s MG_PRECISION=%s TOL=%s MAXITER=%s\n' \
     "${ACTION}" "${CHECKERBOARD}" "${MG_MODE}" "${SLOPPY}" "${MG_PRECISION}" "${TOL}" "${MAXITER}"
+  printf 'ENV STOUT_NSMEAR=%s STOUT_RHO=%s QUDA_RESOURCE_PATH=%s\n' \
+    "${STOUT_NSMEAR}" "${STOUT_RHO}" "${QUDA_RESOURCE_PATH}"
   printf 'ENV SOLVE_REPEATS=%s RUN_CG=%s MG_VERIFY=%s CACHE_STATE=%s\n' \
     "${SOLVE_REPEATS}" "${RUN_CG}" "${MG_VERIFY}" "${cache_state}"
   printf 'ENV NODES=%s NTASKS=%s NTPN=%s GPUS_PER_TASK=%s CPUS_PER_TASK=%s\n' \
@@ -138,13 +159,17 @@ args=(
   --probe-checkerboard "${CHECKERBOARD}"
   --probe-mg-mode "${MG_MODE}"
   --probe-sloppy "${SLOPPY}"
+  --probe-precise "${PRECISE}"
   --probe-mg-precision "${MG_PRECISION}"
   --probe-mass "${MASS}"
   --probe-csw "${CSW}"
   --probe-tol "${TOL}"
   --probe-maxiter "${MAXITER}"
   --probe-solve-repeats "${SOLVE_REPEATS}"
+  --probe-stout-nsmear "${STOUT_NSMEAR}"
+  --probe-stout-rho "${STOUT_RHO}"
   --probe-run-cg "${RUN_CG}"
+  --probe-run-mg "${RUN_MG}"
   --probe-mg-verify "${MG_VERIFY}"
 )
 if [[ "${INPUT}" == physical ]]; then

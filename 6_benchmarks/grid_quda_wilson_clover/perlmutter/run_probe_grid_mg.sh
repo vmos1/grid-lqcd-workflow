@@ -66,6 +66,11 @@ OUTER_NSTEP=${OUTER_NSTEP:-16}
 # ⛔ There is no `half`: Grid has no fp16 arithmetic (vComplexH is a uint16_t
 # container, Tensor_traits.h:231). QUDA's half null vectors have no counterpart.
 MG_PRECISION=${MG_PRECISION:-double}
+# `single` runs the OUTER solver and the reference CG in fp32 too, not just the
+# hierarchy -- the only Grid configuration that matches QUDA's, since QUDA's MG
+# forces its outer sloppy precision to equal the hierarchy's. Requires
+# MG_PRECISION=single and a tolerance fp32 can reach (TOL=1e-6).
+OUTER_PRECISION=${OUTER_PRECISION:-double}
 # Stage 1 waste-removal switch. 0 = CONTROL (reproduces Grid's PrecGCRNonHermitian and
 # blockProject exactly); 1 = cleaned path. The sub-switches default to FAST_MG and exist only
 # to isolate one change without a rebuild. See __docs/2026_09_15_grid_mg_fix_plan.md §4.
@@ -77,6 +82,9 @@ if [[ "${FAST_MG}" == "0" ]]; then VERIFY_RESIDUAL=${VERIFY_RESIDUAL:-1}; else V
 # Stage 2 preconditioner-strength knobs. Defaults reproduce the values inherited from Grid's
 # own test; QUDA's counterparts are 0.1 (coarse solver) and 5e-6 (setup).
 COARSE_TOL=${COARSE_TOL:-0.2}
+# Coarse-solver restart cap (cycles of COARSE_NSTEP steps). 50 = the old hardcoded value.
+# QUDA's budget is 1 cycle of 12 (COARSE_MAXITER=1 COARSE_NSTEP=12 COARSE_MMAX=12).
+COARSE_MAXITER=${COARSE_MAXITER:-50}
 SUBSPACE_TOL=${SUBSPACE_TOL:-0.001}
 SUBSPACE_ROUNDS=${SUBSPACE_ROUNDS:-3}
 SUBSPACE_MMAX=${SUBSPACE_MMAX:-10}
@@ -85,6 +93,34 @@ TOL=${TOL:-1e-10}
 MAXITER=${MAXITER:-1000}
 CG_MAXITER=${CG_MAXITER:-50000}
 RUN_CG=${RUN_CG:-1}
+# double | mixed | both. `mixed` = Grid's MixedPrecisionConjugateGradient (fp32 inner, fp64
+# restarts), the production driver's light-tail/strange solver and the counterpart of QUDA's
+# precise=double sloppy=single CG. mixed|both need MG_PRECISION=single (the fp32 operator).
+CG_PRECISION=${CG_PRECISION:-double}
+# Comma-separated list -> one mixed-CG row per value, sharing one MG setup.
+CG_INNER_TOL=${CG_INNER_TOL:-${TOL:-1e-10}}   # default = TOL, as the production driver does
+CG_MIXED_OUTER=${CG_MIXED_OUTER:-50}          # restart cap; 50 = production driver
+# Timed repeats per solver; the MEDIAN is reported, matching the QUDA probe.
+# Both solvers also get an untimed warm solve first.
+SOLVE_REPEATS=${SOLVE_REPEATS:-3}
+# Stout smearing of the gauge field before the operator is built. 0 = off.
+# The production clover action is DEFINED with smeared links, so an unsmeared
+# probe inverts a different operator from the one HMC inverts. The 16^3x48
+# ensemble's own metadata gives rho 0.125, n_smear 1, orthog_dir -1.
+STOUT_NSMEAR=${STOUT_NSMEAR:-0}
+STOUT_RHO=${STOUT_RHO:-0.125}
+# D7: time blockProjectFast vs the probe's fused projector vs blockPromote, N calls
+# each. 0 = off. FAST_PROJECT=2 then SELECTS the fused projector in the V-cycle.
+TRANSFER_BENCH=${TRANSFER_BENCH:-0}
+# Break down the outer GCR's own work -- the ~27% of the MG solve that the
+# preconditioner's breakdown does not see. ⚠️ Adds a barrier per sub-region, so
+# read SHARES from an instrumented run, never its absolute total.
+INSTRUMENT_OUTER=${INSTRUMENT_OUTER:-0}
+# ⛔⛔ The V-cycle breakdown costs 14 accelerator_barrier() per cycle INSIDE the
+# timed region, while the QUDA probe has none inside its solve. It was
+# unconditional until 2026-09-21, so every earlier Grid MG timing carries it.
+# 0 = no barriers, no breakdown (the fair number). 1 = breakdown, inflated total.
+INSTRUMENT_VCYCLE=${INSTRUMENT_VCYCLE:-0}
 INPUT=${INPUT:-hot}
 CFG=${CFG:-${ROOT}/data/cl21_48_96_b6p3_m0p2416_m0p2050-djm-3_cfg_2000.lime}
 
@@ -171,7 +207,8 @@ chmod +x "${SELECT_GPU}"
   printf 'ENV ACTION=%s SCHUR=%s DEVICE_MEM_MB=%s\n' "${ACTION}" "${SCHUR}" "${DEVICE_MEM_MB:-default}"
   printf 'ENV CHECKERBOARD=%s BLOCK=%s STENCIL_HOPS=%s TOL=%s MAXITER=%s RUN_CG=%s\n' \
     "${CHECKERBOARD}" "${BLOCK}" "${STENCIL_HOPS}" "${TOL}" "${MAXITER}" "${RUN_CG}"
-  printf 'ENV COARSE_MMAX=%s COARSE_NSTEP=%s\n' "${COARSE_MMAX}" "${COARSE_NSTEP}"
+  printf 'ENV COARSE_MMAX=%s COARSE_NSTEP=%s COARSE_MAXITER=%s\n' \
+    "${COARSE_MMAX}" "${COARSE_NSTEP}" "${COARSE_MAXITER}"
   printf 'ENV SMOOTHER_MMAX=%s SMOOTHER_NSTEP=%s SMOOTHER_TOL=%s SMOOTHER_MAXITER=%s\n' \
     "${SMOOTHER_MMAX}" "${SMOOTHER_NSTEP}" "${SMOOTHER_TOL}" "${SMOOTHER_MAXITER}"
   printf 'ENV OUTER_MMAX=%s OUTER_NSTEP=%s MG_PRECISION=%s\n' \
@@ -180,6 +217,10 @@ chmod +x "${SELECT_GPU}"
     "${FAST_MG}" "${FAST_GCR}" "${FAST_PROJECT}" "${PERSISTENT_TEMPS}" "${VERIFY_RESIDUAL}"
   printf 'ENV COARSE_TOL=%s SUBSPACE_TOL=%s SUBSPACE_ROUNDS=%s SUBSPACE_MMAX=%s SUBSPACE_MAXITER=%s\n' \
     "${COARSE_TOL}" "${SUBSPACE_TOL}" "${SUBSPACE_ROUNDS}" "${SUBSPACE_MMAX}" "${SUBSPACE_MAXITER}"
+  printf 'ENV SOLVE_REPEATS=%s STOUT_NSMEAR=%s STOUT_RHO=%s\n' \
+    "${SOLVE_REPEATS}" "${STOUT_NSMEAR}" "${STOUT_RHO}"
+  printf 'ENV OUTER_PRECISION=%s CG_PRECISION=%s CG_INNER_TOL=%s CG_MIXED_OUTER=%s\n' \
+    "${OUTER_PRECISION}" "${CG_PRECISION}" "${CG_INNER_TOL}" "${CG_MIXED_OUTER}"
   printf 'ENV NODES=%s NTASKS=%s NTPN=%s GPUS_PER_TASK=%s CPUS_PER_TASK=%s\n' \
     "${NODES}" "${NTASKS}" "${NTPN}" "${GPUS_PER_TASK}" "${CPUS_PER_TASK}"
   printf 'ENV BIN=%s\n' "${BIN}"
@@ -214,6 +255,7 @@ args=(
   --probe-persistent-temps "${PERSISTENT_TEMPS}"
   --probe-verify-residual "${VERIFY_RESIDUAL}"
   --probe-coarse-tol "${COARSE_TOL}"
+  --probe-coarse-maxiter "${COARSE_MAXITER}"
   --probe-subspace-tol "${SUBSPACE_TOL}"
   --probe-subspace-rounds "${SUBSPACE_ROUNDS}"
   --probe-subspace-mmax "${SUBSPACE_MMAX}"
@@ -224,6 +266,16 @@ args=(
   --probe-maxiter "${MAXITER}"
   --probe-cg-maxiter "${CG_MAXITER}"
   --probe-run-cg "${RUN_CG}"
+  --probe-cg-precision "${CG_PRECISION}"
+  --probe-cg-inner-tol "${CG_INNER_TOL}"
+  --probe-cg-mixed-outer "${CG_MIXED_OUTER}"
+  --probe-solve-repeats "${SOLVE_REPEATS}"
+  --probe-stout-nsmear "${STOUT_NSMEAR}"
+  --probe-stout-rho "${STOUT_RHO}"
+  --probe-transfer-bench "${TRANSFER_BENCH}"
+  --probe-instrument-outer "${INSTRUMENT_OUTER}"
+  --probe-instrument-vcycle "${INSTRUMENT_VCYCLE}"
+  --probe-outer-precision "${OUTER_PRECISION}"
 )
 if [[ -n "${DEVICE_MEM_MB}" ]]; then
   args+=(--device-mem "${DEVICE_MEM_MB}")
@@ -233,6 +285,33 @@ if [[ -n "${GRID_LOG}" ]]; then
 fi
 if [[ "${INPUT}" == physical ]]; then
   args+=(--probe-cfg "${CFG}")
+fi
+
+# NSYS=1 wraps the binary in Nsight Systems. Requires the _nvtx binary (build with
+# NVTX=1) or the timeline cannot be attributed to the solve -- setup is 7-10 s
+# against a 0.08 s solve, so unscoped kernel statistics are meaningless here.
+# ⛔ Profiler overhead is not backend-neutral; never quote a Grid-vs-QUDA ratio
+# from a profiled run. Within-run attribution only.
+NSYS=${NSYS:-0}
+# There is no nsight-systems module on Perlmutter; nsys ships inside the HPC SDK.
+NSYS_BIN=${NSYS_BIN:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/compilers/bin/nsys}
+nsys_cmd=()
+if [[ "${NSYS}" == "1" ]]; then
+  [[ -x "${NSYS_BIN}" ]] || {
+    printf 'ERROR: nsys not executable at %s (override with NSYS_BIN)\n' "${NSYS_BIN}" >&2
+    exit 1; }
+  case "${BIN}" in
+    *_nvtx) ;;
+    *) printf 'WARNING: BIN is not the _nvtx build; NVTX ranges will be absent\n' >&2 ;;
+  esac
+  nsys_cmd=(
+    "${NSYS_BIN}" profile
+    --trace=cuda,nvtx
+    --sample=none
+    --cpuctxsw=none
+    --force-overwrite=true
+    -o "${RUN_DIR}/mg_profile"
+  )
 fi
 
 srun_cmd=(
@@ -251,12 +330,12 @@ srun_cmd=(
   printf '%s\n' '--- provenance ---'
   while IFS= read -r line; do printf '%s\n' "${line}"; done < "${RUN_DIR}/provenance.env"
   printf '%s\n' '--- command ---'
-  printf '%q ' "${srun_cmd[@]}" "${SELECT_GPU}" "${BIN}" "${args[@]}"
+  printf '%q ' "${srun_cmd[@]}" "${SELECT_GPU}" ${nsys_cmd[@]+"${nsys_cmd[@]}"} "${BIN}" "${args[@]}"
   printf '\n--- output ---\n'
 } > "${LOG}"
 
 set +e
-"${srun_cmd[@]}" "${SELECT_GPU}" "${BIN}" "${args[@]}" 2>&1 | tee -a "${LOG}"
+"${srun_cmd[@]}" "${SELECT_GPU}" ${nsys_cmd[@]+"${nsys_cmd[@]}"} "${BIN}" "${args[@]}" 2>&1 | tee -a "${LOG}"
 status=${PIPESTATUS[0]}
 set -e
 

@@ -80,6 +80,97 @@ namespace ProbeMG {
 using namespace Grid;
 
 // ---------------------------------------------------------------------------
+// D7: fused block projection (restriction)
+// ---------------------------------------------------------------------------
+//
+// MEASURED 2026-09-18, smeared Wilson 16^3x48, 1 GPU: `project` is 35.1% of the
+// V-cycle while `promote` -- its ADJOINT, same data, same call count -- is 11.8%.
+// The asymmetry is structural, not algorithmic:
+//
+//   blockPromote  (Lattice_transfer.h:641)  ONE accelerator_for over FINE sites.
+//       The nbasis basis vectors are gathered into a device view array and all
+//       accumulated in a SINGLE pass.  One kernel, no temporaries.
+//
+//   blockProjectFast (Lattice_transfer.h:1809)  a HOST-side loop over nbasis,
+//       each iteration calling blockInnerProductD (:398), which for EVERY basis
+//       vector:
+//         - allocates a FULL FINE-SIZED temporary `fine_inner`,
+//         - writes it   (localInnerProductD, one full fine pass),
+//         - reads it    (blockSum, another full fine pass),
+//         - runs a third kernel to convert into the coarse field.
+//       At nbasis=48 that is ~48 fine-sized allocations, ~96 full fine-sized
+//       passes and ~190 kernel launches per blockProject call.
+//
+// This routine does what blockPromote already does, in the other direction: one
+// kernel, no fine-sized temporaries, the basis gathered into a device view array.
+// It parallelises over (coarse site x basis vector) -- nbasis times more threads
+// than a coarse-site-only decomposition, which matters here because the coarse
+// grid is small (2304 sites at this volume, far below what an A100 wants).
+//
+// ⚠️ It still READS fineData once per basis vector; what it removes is the
+// fine-sized WRITE + re-READ of `fine_inner`, the allocations, and the launches.
+// A variant reading fineData exactly once would need nbasis accumulators live per
+// thread (96 reals at nbasis=48) and would spill, so it is not obviously better --
+// hence the microbenchmark rather than an assumption.
+//
+// ⛔ NOT bit-identical to blockProjectFast: the reduction order over the block
+// differs, so results agree to rounding, not exactly.
+template <class vobj, class CComplex, int nbasis, class VLattice>
+inline void blockProjectFused(Lattice<iVector<CComplex, nbasis>> &coarseData,
+                              const Lattice<vobj> &fineData,
+                              const VLattice &Basis)
+{
+  GridBase *fine = fineData.Grid();
+  GridBase *coarse = coarseData.Grid();
+  const int _ndimension = coarse->_ndimension;
+
+  GRID_ASSERT(nbasis == static_cast<int>(Basis.size()));
+  subdivides(coarse, fine);
+
+  Coordinate block_r(_ndimension);
+  int blockVol = 1;
+  for (int d = 0; d < _ndimension; d++) {
+    block_r[d] = fine->_rdimensions[d] / coarse->_rdimensions[d];
+    blockVol *= block_r[d];
+  }
+
+  autoView(fineData_, fineData, AcceleratorRead);
+  autoView(coarseData_, coarseData, AcceleratorWrite);
+
+  // Same device-view-array idiom blockPromote uses (Lattice_transfer.h:631-637).
+  typedef LatticeView<vobj> Vview;
+  std::vector<Vview> basis_views_h;
+  basis_views_h.reserve(nbasis);
+  for (int v = 0; v < nbasis; v++) basis_views_h.push_back(Basis[v].View(AcceleratorRead));
+  static deviceVector<Vview> basis_views;
+  basis_views.resize(nbasis);
+  acceleratorCopyToDevice(&basis_views_h[0], &basis_views[0], nbasis * sizeof(Vview));
+  auto Basis_p = &basis_views[0];
+
+  Coordinate frdimensions = fine->_rdimensions;
+  Coordinate crdimensions = coarse->_rdimensions;
+
+  accelerator_for2d(sc, coarse->oSites(), v, nbasis, vobj::Nsimd(), {
+    Coordinate coor_c(_ndimension);
+    Coordinate coor_b(_ndimension);
+    Coordinate coor_f(_ndimension);
+    Lexicographic::CoorFromIndex(coor_c, sc, crdimensions);
+
+    decltype(innerProduct(Basis_p[0](0), fineData_(0))) sum = Zero();
+    for (int b = 0; b < blockVol; b++) {
+      Lexicographic::CoorFromIndex(coor_b, b, block_r);
+      for (int d = 0; d < _ndimension; d++) coor_f[d] = coor_c[d] * block_r[d] + coor_b[d];
+      int sf;
+      Lexicographic::IndexFromCoor(coor_f, sf, frdimensions);
+      sum = sum + innerProduct(Basis_p[v](sf), fineData_(sf));
+    }
+    convertType(coarseData_[sc](v), sum);
+  });
+
+  for (int v = 0; v < nbasis; v++) basis_views_h[v].ViewClose();
+}
+
+// ---------------------------------------------------------------------------
 // Operator-application counters (Stage 0)
 // ---------------------------------------------------------------------------
 //
@@ -159,6 +250,50 @@ public:
   int mmax;
   int nstep;
   int steps = 0;
+
+  // ---- Accounting for the UNATTRIBUTED time ------------------------------
+  //
+  // The MGPreconditioner's barriered breakdown captures only ~73% of the MG solve
+  // at 16^3x48; the remaining ~27% is this class's own work and appears in no
+  // timer. That is the largest single block of waste left, and `OUTER_MMAX` 6->1
+  // buys only 2.5%, so it is NOT the O(m^2) Gram-Schmidt. These split it.
+  //
+  // ⚠️ Every tick() carries an accelerator_barrier(), so these timers themselves
+  // serialise the pipeline. They are a DIAGNOSTIC: read the shares, and do not
+  // quote a total measured with instrument=true against one measured without.
+  bool instrument = false;
+  double t_op = 0.0;      // Linop.Op -- the outer Krylov step's own application
+  double t_prec = 0.0;    // Preconditioner() -- the V-cycle, for cross-checking
+  double t_linalg = 0.0;  // innerProduct / axpy / axpy_norm, per step
+  double t_gs = 0.0;      // the classical Gram-Schmidt history loop
+  double t_qq = 0.0;      // norm2 of the new q
+  double t_setup = 0.0;   // r0 formation + the pre-loop precon/op pair
+  double t_log = 0.0;     // ostringstream construction (built even when !verbose)
+
+  void reset_timers()
+  {
+    t_op = t_prec = t_linalg = t_gs = t_qq = t_setup = t_log = 0.0;
+  }
+
+  std::string timer_report() const
+  {
+    const double tot = t_op + t_prec + t_linalg + t_gs + t_qq + t_setup + t_log;
+    std::ostringstream os;
+    auto row = [&](const char *n, double v) {
+      os << "\n      " << n << " " << (v / 1.0e6) << " s";
+      if (tot > 0.0) os << "  (" << (100.0 * v / tot) << "%)";
+    };
+    os << "  outer GCR breakdown (barriered; diagnostic only):";
+    row("preconditioner (V-cycle)", t_prec);
+    row("operator Linop.Op       ", t_op);
+    row("step linalg (ip/axpy)   ", t_linalg);
+    row("Gram-Schmidt history    ", t_gs);
+    row("qq norm2                ", t_qq);
+    row("pre-loop setup          ", t_setup);
+    row("log string construction ", t_log);
+    os << "\n      barriered total " << (tot / 1.0e6) << " s";
+    return os.str();
+  }
   int level = 1;
   int verbose = 1;
 
@@ -275,6 +410,17 @@ public:
     // r0 = src - A psi.  With a guaranteed-zero psi this is r0 = src, and the
     // operator application is skipped entirely (D1).
     //////////////////////////////////////////////////////////////////////////
+    // Instrumentation tick. Identical form to MGPreconditioner's so the two
+    // breakdowns are commensurate; a no-op returning 0 when instrument is false,
+    // so the uninstrumented path pays neither a barrier nor a timer.
+    auto tick = [this]() -> double {
+      if (!instrument) return 0.0;
+      accelerator_barrier();
+      return usecond();
+    };
+    double tt;
+
+    tt = tick();
     if (guess_is_zero) {
       r = src;
     } else {
@@ -293,6 +439,7 @@ public:
     qq_[0] = norm2(Az);
 
     cp = norm2(r);
+    t_setup += tick() - tt;
 
     for (int k = 0; k < nstep; k++) {
 
@@ -302,31 +449,44 @@ public:
       const int peri_k = k % mmax;
       const int peri_kp = kp % mmax;
 
+      tt = tick();
       rq = innerProduct(*q_[peri_k], r);
       a = rq / qq_[peri_k];
 
       axpy(psi, a, *p_[peri_k], psi);
 
       cp = axpy_norm(r, -a, *q_[peri_k], r);
+      t_linalg += tick() - tt;
 
+      // ⚠️ The stream is CONSTRUCTED unconditionally and only then does log()
+      // test `verbose`, so this is paid on every step of every solve. Timed to
+      // find out whether that matters.
+      tt = tick();
       {
         std::ostringstream os;
         os << "PGCR step[" << steps << "]  resid " << cp << " target " << rsq;
         log(os.str());
       }
+      t_log += tick() - tt;
 
       if ((k == nstep - 1) || (cp < rsq)) {
         return cp;
       }
 
+      tt = tick();
       Preconditioner(r, z); // solve Az = r
+      t_prec += tick() - tt;
+
+      tt = tick();
       Linop.Op(z, Az);
+      t_op += tick() - tt;
 
       *q_[peri_kp] = Az;
       *p_[peri_kp] = z;
 
       // Classical Gram-Schmidt against the history, verbatim from Grid: `b` is formed against
       // the ORIGINAL Az, not the partially-updated q[peri_kp]. Do not "improve" this.
+      tt = tick();
       const int northog = ((kp) > (mmax - 1)) ? (mmax - 1) : (kp);
       for (int back = 0; back < northog; back++) {
 
@@ -337,7 +497,11 @@ public:
         *p_[peri_kp] = *p_[peri_kp] + b * (*p_[peri_back]);
         *q_[peri_kp] = *q_[peri_kp] + b * (*q_[peri_back]);
       }
+      t_gs += tick() - tt;
+
+      tt = tick();
       qq_[peri_kp] = norm2(*q_[peri_kp]);
+      t_qq += tick() - tt;
     }
     GRID_ASSERT(0); // never reached
     return cp;
