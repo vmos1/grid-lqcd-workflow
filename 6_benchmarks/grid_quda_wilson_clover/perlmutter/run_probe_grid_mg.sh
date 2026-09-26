@@ -85,6 +85,15 @@ COARSE_TOL=${COARSE_TOL:-0.2}
 # Coarse-solver restart cap (cycles of COARSE_NSTEP steps). 50 = the old hardcoded value.
 # QUDA's budget is 1 cycle of 12 (COARSE_MAXITER=1 COARSE_NSTEP=12 COARSE_MMAX=12).
 COARSE_MAXITER=${COARSE_MAXITER:-50}
+# Workstream A (plan v2 §5): which coarse-operator APPLY drives the coarse solve. Coarsening
+# is always GeneralCoarsenedMatrix; only the apply routine changes.
+#   general  the control (padded volume, PaddedCell exchange), ~3.2 ms/apply at C3 clover
+#   stencil  Grid's old CoarsenedMatrix apply (stencil halo, interior only); needs STENCIL_HOPS=1
+#   mrhs     Grid's MultiGeneralCoarsenedMatrix (batched cuBLAS); MG_PRECISION=double only
+COARSE_APPLY=${COARSE_APPLY:-general}
+# N>0: build every available alternative, check each against `general` on a random coarse
+# vector, and time N applies of each. Costs memory (extra link copies); 0 = off.
+COARSE_APPLY_CHECK=${COARSE_APPLY_CHECK:-0}
 SUBSPACE_TOL=${SUBSPACE_TOL:-0.001}
 SUBSPACE_ROUNDS=${SUBSPACE_ROUNDS:-3}
 SUBSPACE_MMAX=${SUBSPACE_MMAX:-10}
@@ -207,8 +216,8 @@ chmod +x "${SELECT_GPU}"
   printf 'ENV ACTION=%s SCHUR=%s DEVICE_MEM_MB=%s\n' "${ACTION}" "${SCHUR}" "${DEVICE_MEM_MB:-default}"
   printf 'ENV CHECKERBOARD=%s BLOCK=%s STENCIL_HOPS=%s TOL=%s MAXITER=%s RUN_CG=%s\n' \
     "${CHECKERBOARD}" "${BLOCK}" "${STENCIL_HOPS}" "${TOL}" "${MAXITER}" "${RUN_CG}"
-  printf 'ENV COARSE_MMAX=%s COARSE_NSTEP=%s COARSE_MAXITER=%s\n' \
-    "${COARSE_MMAX}" "${COARSE_NSTEP}" "${COARSE_MAXITER}"
+  printf 'ENV COARSE_MMAX=%s COARSE_NSTEP=%s COARSE_MAXITER=%s COARSE_APPLY=%s COARSE_APPLY_CHECK=%s\n' \
+    "${COARSE_MMAX}" "${COARSE_NSTEP}" "${COARSE_MAXITER}" "${COARSE_APPLY}" "${COARSE_APPLY_CHECK}"
   printf 'ENV SMOOTHER_MMAX=%s SMOOTHER_NSTEP=%s SMOOTHER_TOL=%s SMOOTHER_MAXITER=%s\n' \
     "${SMOOTHER_MMAX}" "${SMOOTHER_NSTEP}" "${SMOOTHER_TOL}" "${SMOOTHER_MAXITER}"
   printf 'ENV OUTER_MMAX=%s OUTER_NSTEP=%s MG_PRECISION=%s\n' \
@@ -256,6 +265,8 @@ args=(
   --probe-verify-residual "${VERIFY_RESIDUAL}"
   --probe-coarse-tol "${COARSE_TOL}"
   --probe-coarse-maxiter "${COARSE_MAXITER}"
+  --probe-coarse-apply "${COARSE_APPLY}"
+  --probe-coarse-apply-check "${COARSE_APPLY_CHECK}"
   --probe-subspace-tol "${SUBSPACE_TOL}"
   --probe-subspace-rounds "${SUBSPACE_ROUNDS}"
   --probe-subspace-mmax "${SUBSPACE_MMAX}"

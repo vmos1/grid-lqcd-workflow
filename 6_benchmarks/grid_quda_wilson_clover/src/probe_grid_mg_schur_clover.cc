@@ -538,6 +538,16 @@ int main(int argc, char **argv)
   // V-cycle, where QUDA caps its coarse solve at 12 iterations total (quda_grid_bridge.h:562).
   // QUDA's budget is coarse_maxiter 1 with coarse_nstep = coarse_mmax = 12.
   const int coarse_maxiter = read_int(argc, argv, "--probe-coarse-maxiter", 50);
+  // Workstream A (plan v2 §5): which coarse-operator APPLY the coarse solver drives. The
+  // coarsening is ALWAYS done by GeneralCoarsenedMatrix; only the apply changes.
+  //   general : GeneralCoarsenedMatrix::Mult -- the control (padded volume, PaddedCell exchange)
+  //   stencil : Grid's old CoarsenedMatrix apply (CartesianStencil halo, interior only); hops=1
+  //   mrhs    : Grid's MultiGeneralCoarsenedMatrix (batched cuBLAS, interior only); fp64 only
+  // See probe_mg_solvers.h for why each restriction exists.
+  const std::string coarse_apply = read_string(argc, argv, "--probe-coarse-apply", "general");
+  // N timed applications of each available apply on one random coarse vector, plus the
+  // agreement gate against `general`. 0 = off. Builds every alternative, so costs memory.
+  const int coarse_apply_check = read_int(argc, argv, "--probe-coarse-apply-check", 0);
   // Null-vector solve tolerance and inverse-iteration rounds. Grid hardcodes 1e-3 and 3
   // rounds (Aggregates.h:136); QUDA's setup_tol is 5e-6 (quda_grid_bridge.h:479).
   // ⚠️ THE LEADING CANDIDATE for the iteration gap, and the one that also retires the
@@ -591,6 +601,24 @@ int main(int argc, char **argv)
   const int stencil_hops = read_int(argc, argv, "--probe-stencil-hops", 2);
   if (stencil_hops < 1 || stencil_hops > 4) {
     std::cerr << "probe: --probe-stencil-hops must be 1..4" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (coarse_apply != "general" && coarse_apply != "stencil" && coarse_apply != "mrhs") {
+    std::cerr << "probe: --probe-coarse-apply must be general|stencil|mrhs" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (coarse_apply == "stencil" && stencil_hops != 1) {
+    std::cerr << "probe: --probe-coarse-apply stencil needs --probe-stencil-hops 1"
+              << " (Grid's old Geometry has no corner points)" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (coarse_apply == "mrhs" && mg_single) {
+    std::cerr << "probe: --probe-coarse-apply mrhs needs --probe-mg-precision double: Grid's"
+              << " MultiGeneralCoarsenedMatrix hard-wires ComplexD GEMM (see probe_mg_solvers.h)"
+              << std::endl;
     Grid_finalize();
     return 2;
   }
@@ -670,6 +698,8 @@ int main(int argc, char **argv)
     std::cout << GridLogMessage << "outer    mmax/nstep " << outer_mmax << "/" << outer_nstep << std::endl;
     std::cout << GridLogMessage << "coarse   tol        " << coarse_tol << " (QUDA asks 0.1)"
               << std::endl;
+    std::cout << GridLogMessage << "coarse   apply      " << coarse_apply
+              << " (check " << coarse_apply_check << ")" << std::endl;
     std::cout << GridLogMessage << "subspace tol/rounds " << subspace_tol << "/" << subspace_rounds
               << " mmax " << subspace_mmax << " maxiter " << subspace_maxiter
               << " (QUDA setup_tol 5e-6)" << std::endl;
@@ -982,7 +1012,41 @@ int main(int argc, char **argv)
 
   NonHermitianLinearOperator<LittleDiracOperator, CoarseVector> LinOpCoarse(LittleDiracOp);
   ShiftedNonHermitianLinearOperator<LittleDiracOperator, CoarseVector> ShiftedLinOpCoarse(LittleDiracOp, 0.001);
-  ProbeMG::CountingLinearOperator<CoarseVector> CountedCoarse(ShiftedLinOpCoarse, counts.coarse);
+
+  // ---- Workstream A: alternative coarse APPLIES, fp64 hierarchy (plan v2 §5) -------------
+  //
+  // Same coarse matrix and the same 0.001 shift, different apply routine. Built only when
+  // selected or when the agreement check is on, since each holds its own copy of the links.
+  // Skipped entirely under --probe-mg-precision single: the fp64 coarse solver is never driven
+  // there (OuterPrecon selects the fp32 hierarchy) and memory at C3 is already tight.
+  typedef ProbeMG::StencilCoarseApply<vSpinColourVectorD, vTComplexD, 2 * kNbasis> StencilCoarseD;
+  typedef ProbeMG::MrhsCoarseApply<vSpinColourVectorD, vTComplexD, 2 * kNbasis> MrhsCoarseD;
+  std::unique_ptr<StencilCoarseD> StencilCoarse;
+  std::unique_ptr<MrhsCoarseD> MrhsCoarse;
+  if (!mg_single) {
+    if (coarse_apply == "stencil" || (coarse_apply_check > 0 && stencil_hops == 1))
+      StencilCoarse.reset(new StencilCoarseD(LittleDiracOp, Coarse4d, 0.001));
+    if (coarse_apply == "mrhs" || coarse_apply_check > 0)
+      MrhsCoarse.reset(new MrhsCoarseD(LittleDiracOp, Coarse4d, 0.001));
+    if (coarse_apply_check > 0) {
+      if (boss) std::cout << GridLogMessage << "--- coarse apply check (fp64) ---" << std::endl;
+      CoarseVector c_probe(Coarse4d);
+      random(CRNG, c_probe);
+      if (StencilCoarse)
+        ProbeMG::check_coarse_apply<CoarseVector>("stencil", ShiftedLinOpCoarse, *StencilCoarse,
+                                                  c_probe, UGrid, coarse_apply_check, boss);
+      if (MrhsCoarse)
+        ProbeMG::check_coarse_apply<CoarseVector>("mrhs   ", ShiftedLinOpCoarse, *MrhsCoarse,
+                                                  c_probe, UGrid, coarse_apply_check, boss);
+    }
+  }
+  LinearOperatorBase<CoarseVector> &SelectedCoarse =
+      (StencilCoarse && coarse_apply == "stencil")
+          ? static_cast<LinearOperatorBase<CoarseVector> &>(*StencilCoarse)
+          : (MrhsCoarse && coarse_apply == "mrhs")
+                ? static_cast<LinearOperatorBase<CoarseVector> &>(*MrhsCoarse)
+                : static_cast<LinearOperatorBase<CoarseVector> &>(ShiftedLinOpCoarse);
+  ProbeMG::CountingLinearOperator<CoarseVector> CountedCoarse(SelectedCoarse, counts.coarse);
   ProbeMG::CountingLinearOperator<LatticeFermionD> CountedSchurOp(SchurOp, counts.fine);
   // ⛔ mmax IS A MEMORY KNOB, NOT JUST AN ALGORITHM KNOB.
   // PrecGeneralisedConjugateResidualNonHermitian allocates
@@ -1073,6 +1137,9 @@ int main(int argc, char **argv)
   std::unique_ptr<TrivialPrecon<LatticeFermionF>> fine_trivialF;
   std::unique_ptr<NonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>> LinOpCoarseF;
   std::unique_ptr<ShiftedNonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>> ShiftedLinOpCoarseF;
+  // Workstream A on the fp32 hierarchy: stencil apply only (mrhs is fp64-only, see the header).
+  typedef ProbeMG::StencilCoarseApply<vSpinColourVectorF, vTComplexF, 2 * kNbasis> StencilCoarseF_t;
+  std::unique_ptr<StencilCoarseF_t> StencilCoarseF;
   std::unique_ptr<ProbeMG::CountingLinearOperator<CoarseVectorF>> CountedCoarseF;
   std::unique_ptr<ProbeMG::CountingLinearOperator<LatticeFermionF>> CountedSchurOpF;
   std::unique_ptr<ProbeMG::CountingLinearOperator<LatticeFermionF>> CountedShiftedSchurOpF;
@@ -1145,10 +1212,27 @@ int main(int argc, char **argv)
         new NonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>(*LittleDiracOpF));
     ShiftedLinOpCoarseF.reset(
         new ShiftedNonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>(*LittleDiracOpF, 0.001));
+    // Workstream A, fp32: the stencil apply of the same fp32 coarse matrix (+0.001).
+    if (coarse_apply == "stencil" || (coarse_apply_check > 0 && stencil_hops == 1))
+      StencilCoarseF.reset(new StencilCoarseF_t(*LittleDiracOpF, Coarse4dF, 0.001));
+    if (coarse_apply_check > 0 && StencilCoarseF) {
+      if (boss) std::cout << GridLogMessage << "--- coarse apply check (fp32) ---" << std::endl;
+      // CRNG lives on the fp64 coarse grid; draw there and convert, as the subspace is.
+      CoarseVector c_probeD(Coarse4d);
+      random(CRNG, c_probeD);
+      CoarseVectorF c_probeF(Coarse4dF);
+      precisionChange(c_probeF, c_probeD);
+      ProbeMG::check_coarse_apply<CoarseVectorF>("stencil", *ShiftedLinOpCoarseF, *StencilCoarseF,
+                                                 c_probeF, UGrid, coarse_apply_check, boss);
+    }
+    LinearOperatorBase<CoarseVectorF> &SelectedCoarseF =
+        (StencilCoarseF && coarse_apply == "stencil")
+            ? static_cast<LinearOperatorBase<CoarseVectorF> &>(*StencilCoarseF)
+            : static_cast<LinearOperatorBase<CoarseVectorF> &>(*ShiftedLinOpCoarseF);
     // The fp32 hierarchy shares the SAME counters as the fp64 one: only one of the two is ever
     // driven by the outer solver (OuterPrecon selects), so the totals stay unambiguous.
     CountedCoarseF.reset(
-        new ProbeMG::CountingLinearOperator<CoarseVectorF>(*ShiftedLinOpCoarseF, counts.coarse));
+        new ProbeMG::CountingLinearOperator<CoarseVectorF>(SelectedCoarseF, counts.coarse));
     CountedSchurOpF.reset(
         new ProbeMG::CountingLinearOperator<LatticeFermionF>(*schur_holderF, counts.fine));
     CoarseSolverStockF.reset(new PrecGeneralisedConjugateResidualNonHermitian<CoarseVectorF>(
@@ -1603,6 +1687,7 @@ int main(int argc, char **argv)
     std::cout << GridLogMessage << "checkerboard            " << cb_name << std::endl;
     std::cout << GridLogMessage << "stencil hops / npoint   " << stencil_hops << " / " << geom.npoint
               << std::endl;
+    std::cout << GridLogMessage << "coarse apply            " << coarse_apply << std::endl;
     std::cout << GridLogMessage << "MG precondition prec    " << precision_name
               << (mg_single ? " (hierarchy fp32; outer solver + gates fp64)" : " (fp64 throughout)")
               << std::endl;

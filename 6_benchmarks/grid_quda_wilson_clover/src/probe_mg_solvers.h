@@ -73,6 +73,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace ProbeMG {
@@ -585,6 +586,225 @@ void create_subspace_gcr(GridParallelRNG &RNG,
 
     Agg.subspace[b] = noise;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Workstream A (plan v2, __docs/2026_09_25_mg_plan_v2_coarse_apply_first.md §5):
+// alternative COARSE-OPERATOR APPLIES built from Grid's own classes.
+// ---------------------------------------------------------------------------
+//
+// WHY. At C3 clover the coarse apply of GeneralCoarsenedMatrix::Mult costs ~3.2 ms and is
+// ~89% of a 410 ms outer step (LEDGER L152). Its Mult expands the input into a halo-PADDED
+// copy through PaddedCell (Cshift-based, not the stencil), runs the 48x48 multiply over the
+// padded volume (2.37x the real sites at C3/16 GPU), keeps npoint padded scratch vectors, then
+// extracts the interior. A streaming bound for the real links is ~0.3 ms.
+//
+// Both alternatives reuse the GENERAL class for COARSENING (the only path that accepts a Schur
+// operator, L131) and replace only the APPLY. Neither edits Grid/.
+//
+//   A2  StencilCoarseApply : the apply of Grid's OLD CoarsenedMatrix (CartesianStencil::
+//       HaloExchange, interior volume; the same halo path the fine Dslash uses and the CG
+//       campaign's comms flags tune). Its link matrices are filled from the general operator's
+//       by matching shift vectors. Kernel conventions differ:
+//         general (GeneralCoarsenedMatrix.h:197-201): res(b) += A[p](bb,b) * nbr(bb)  => A^T nbr
+//         old     (CoarsenedMatrix.h:158)           : res(b) += A[pt](b,bb) * nbr(bb) => A   nbr
+//       so A_old[pt] = TRANSPOSE(A_general[p]) for the matching shift. `transpose_links`
+//       exists so the agreement check can falsify this reading. hops==1 only (the old
+//       Geometry has no corner points). CoarsenedMatrix also builds red-black members we never
+//       use; the rb grid it needs is constructed with a checker mask on x only, because the
+//       default all-dims mask asserts on odd reduced dimensions (rdim 3 at C3).
+//
+//   A1  MrhsCoarseApply : Grid's MultiGeneralCoarsenedMatrix (batched cuBLAS GEMM over the
+//       INTERIOR sites), the class both physical-volume HDCG drivers use for the solve. It
+//       wants nrhs right-hand-side SLOTS as dimension 0 of a 5D grid; slot 0 carries the one
+//       real vector and the rest stay zero. ⛔ fp64 COARSE TYPE ONLY: its GEMM pointer tables
+//       and the gemmBatched call are hard-wired ComplexD (GeneralCoarsenedMatrixMultiRHS.h:
+//       70-72, 695) whatever CComplex is, so with fp32 links it would run Zgemm over ComplexF
+//       data. Every Grid test instantiates it with vTComplex (double). Diagnostic only here.
+//       ⚠️ It still does the padded exchange, on a vector nrhs x larger.
+//
+// GATE for both: agreement with the general apply on a random coarse vector (~1e-6 fp32,
+// ~1e-12 fp64), then an UNCHANGED outer iteration count and independent residual in the solve.
+
+// Site-wise transpose of a lattice of nbasis x nbasis matrices. A free function because CUDA
+// refuses an extended device lambda inside a constructor ("must allow its address to be taken").
+template <class CComplex, int nbasis>
+void transpose_site_matrices(Lattice<iMatrix<CComplex, nbasis>> &dst,
+                             const Lattice<iMatrix<CComplex, nbasis>> &src)
+{
+  conformable(dst.Grid(), src.Grid());
+  autoView(dst_v, dst, AcceleratorWrite);
+  autoView(src_v, src, AcceleratorRead);
+  const int Nsimd = CComplex::Nsimd();
+  accelerator_for(ss, src.Grid()->oSites(), Nsimd, {
+    auto s = coalescedRead(src_v[ss]);
+    auto t = s;
+    for (int i = 0; i < nbasis; ++i)
+      for (int j = 0; j < nbasis; ++j) t(i, j) = s(j, i);
+    coalescedWrite(dst_v[ss], t);
+  });
+}
+
+// A2 ------------------------------------------------------------------------
+template <class Fobj, class CComplex, int nbasis>
+class StencilCoarseApply : public LinearOperatorBase<Lattice<iVector<CComplex, nbasis>>> {
+public:
+  typedef GeneralCoarsenedMatrix<Fobj, CComplex, nbasis> GeneralOp;
+  typedef CoarsenedMatrix<Fobj, CComplex, nbasis> OldOp;
+  typedef Lattice<iVector<CComplex, nbasis>> CoarseVector;
+  typedef Lattice<iMatrix<CComplex, nbasis>> CoarseMatrix;
+
+  GridRedBlackCartesian *CoarseRB = nullptr;
+  std::unique_ptr<OldOp> op;
+  RealD shift = 0.0;
+  bool transposed = true;
+
+  StencilCoarseApply(GeneralOp &general, GridCartesian *Coarse4d, RealD shift_ = 0.0,
+                     bool transpose_links = true)
+      : shift(shift_), transposed(transpose_links)
+  {
+    GRID_ASSERT(general.geom.npoint == 9); // hops==1 only
+    // Red-black grid checkered on x only. CoarsenedMatrix never applies its rb members here;
+    // this grid exists so the constructor can build them without tripping the all-dims
+    // rdim-even assert (Cartesian_red_black.h:214) at C3 (rdim 12.6.3.3 / 12.3.3.3).
+    Coordinate mask({1, 0, 0, 0});
+    CoarseRB = new GridRedBlackCartesian(Coarse4d, mask, 0);
+    op.reset(new OldOp(*Coarse4d, *CoarseRB, 1)); // hermitian=1: Mdag aliases M (never called)
+
+    const int Nd = 4;
+    for (int point = 0; point < op->geom.npoint; ++point) {
+      const int dir = op->geom.directions[point];
+      const int disp = op->geom.displacements[point];
+      Coordinate want(Nd, 0);
+      want[dir] = disp;
+      int found = -1;
+      for (int p = 0; p < general.geom.npoint; ++p)
+        if (general.geom.shifts[p] == want) found = p;
+      GRID_ASSERT(found >= 0);
+      // The general operator's links live on the PADDED grid after ExchangeCoarseLinks;
+      // Extract returns the interior on Coarse4d, which is where op->A[point] lives.
+      CoarseMatrix Aup = general.Cell.Extract(general._A[found]);
+      if (transposed)
+        transpose_site_matrices<CComplex, nbasis>(op->A[point], Aup);
+      else
+        op->A[point] = Aup;
+    }
+  }
+  ~StencilCoarseApply()
+  {
+    op.reset();
+    delete CoarseRB;
+  }
+
+  void Op(const CoarseVector &in, CoarseVector &out) override
+  {
+    op->M(in, out);
+    if (shift != 0.0) out = out + shift * in;
+  }
+  void AdjOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+  void OpDiag(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+  void OpDir(const CoarseVector &in, CoarseVector &out, int dir, int disp) override { GRID_ASSERT(0); }
+  void OpDirAll(const CoarseVector &in, std::vector<CoarseVector> &out) override { GRID_ASSERT(0); }
+  void HermOpAndNorm(const CoarseVector &in, CoarseVector &out, RealD &n1, RealD &n2) override { GRID_ASSERT(0); }
+  void HermOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+};
+
+// A1 ------------------------------------------------------------------------
+template <class Fobj, class CComplex, int nbasis>
+class MrhsCoarseApply : public LinearOperatorBase<Lattice<iVector<CComplex, nbasis>>> {
+public:
+  typedef GeneralCoarsenedMatrix<Fobj, CComplex, nbasis> GeneralOp;
+  typedef MultiGeneralCoarsenedMatrix<Fobj, CComplex, nbasis> MrhsOp;
+  typedef Lattice<iVector<CComplex, nbasis>> CoarseVector;
+
+  GridCartesian *CoarseMrhs = nullptr; // 5D: {nrhs, c0, c1, c2, c3}, all SIMD lanes in dim 0
+  std::unique_ptr<MrhsOp> op;
+  std::unique_ptr<CoarseVector> vm, wm; // persistent (D4 lesson)
+  int nrhs = 0;
+  RealD shift = 0.0;
+
+  MrhsCoarseApply(GeneralOp &general, GridCartesian *Coarse4d, RealD shift_ = 0.0) : shift(shift_)
+  {
+    // See the header comment: the class's GEMM is ComplexD whatever CComplex is.
+    GRID_ASSERT((std::is_same<typename CComplex::scalar_type, ComplexD>::value));
+    // Smallest legal batch: one full SIMD vector of RHS slots (the class divides by Nsimd).
+    nrhs = CComplex::Nsimd();
+    Coordinate clatt = Coarse4d->GlobalDimensions();
+    Coordinate mpi = Coarse4d->_processors;
+    // 5D, not the HDCG drivers' 6D: their fine operator is 5D (DWF) so their coarse geometry
+    // already skips one dim; ours is 4D and MultiGeneralCoarsenedMatrix adds exactly one
+    // skipped dim for the RHS index. A 6D grid here would shift the wrong dimensions.
+    Coordinate rhLatt({nrhs, clatt[0], clatt[1], clatt[2], clatt[3]});
+    Coordinate rhSimd({nrhs, 1, 1, 1, 1});
+    Coordinate rhMpi({1, mpi[0], mpi[1], mpi[2], mpi[3]});
+    CoarseMrhs = new GridCartesian(rhLatt, rhSimd, rhMpi);
+    op.reset(new MrhsOp(general.geom, CoarseMrhs));
+    op->CopyMatrix(general); // unpadded links straight from the general operator
+    vm.reset(new CoarseVector(CoarseMrhs));
+    wm.reset(new CoarseVector(CoarseMrhs));
+    *vm = Zero();
+    *wm = Zero();
+  }
+  ~MrhsCoarseApply()
+  {
+    op.reset();
+    vm.reset();
+    wm.reset();
+    delete CoarseMrhs;
+  }
+
+  void Op(const CoarseVector &in, CoarseVector &out) override
+  {
+    out.Checkerboard() = in.Checkerboard();
+    // Slot 0 carries the real vector; the other slots are zero from the constructor and, M
+    // being linear, stay zero.
+    InsertSliceFast(in, *vm, 0, 0);
+    op->M(*vm, *wm);
+    ExtractSliceFast(out, *wm, 0, 0);
+    if (shift != 0.0) out = out + shift * in;
+  }
+  void AdjOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+  void OpDiag(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+  void OpDir(const CoarseVector &in, CoarseVector &out, int dir, int disp) override { GRID_ASSERT(0); }
+  void OpDirAll(const CoarseVector &in, std::vector<CoarseVector> &out) override { GRID_ASSERT(0); }
+  void HermOpAndNorm(const CoarseVector &in, CoarseVector &out, RealD &n1, RealD &n2) override { GRID_ASSERT(0); }
+  void HermOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+};
+
+// Agreement + timing of an alternative apply against the reference one on the given vector.
+// Returns the relative difference; prints ms/apply for both (`reps` timed calls each, after
+// the agreement call has warmed both paths).
+template <class CoarseVector>
+double check_coarse_apply(const char *name, LinearOperatorBase<CoarseVector> &reference,
+                          LinearOperatorBase<CoarseVector> &candidate, const CoarseVector &src,
+                          GridBase *UGrid, int reps, bool boss)
+{
+  CoarseVector ref(src.Grid()), alt(src.Grid()), diff(src.Grid());
+  ref.Checkerboard() = src.Checkerboard();
+  alt.Checkerboard() = src.Checkerboard();
+  reference.Op(src, ref);
+  candidate.Op(src, alt);
+  diff = ref - alt;
+  const double rel = std::sqrt(norm2(diff) / norm2(ref));
+
+  auto time_it = [&](LinearOperatorBase<CoarseVector> &L) {
+    accelerator_barrier();
+    UGrid->Barrier();
+    const double s = usecond();
+    for (int i = 0; i < reps; ++i) L.Op(src, alt);
+    accelerator_barrier();
+    UGrid->Barrier();
+    return (usecond() - s) / 1.0e3 / double(reps);
+  };
+  const double ms_ref = time_it(reference);
+  const double ms_alt = time_it(candidate);
+  if (boss) {
+    std::cout << GridLogMessage << "coarse apply  " << name << "  rel diff vs general " << rel
+              << (rel < 1.0e-5 ? "  AGREES" : "  DISAGREES") << "  general " << ms_ref
+              << " ms/apply  " << name << " " << ms_alt << " ms/apply  (" << (ms_ref / ms_alt)
+              << "x)" << std::endl;
+  }
+  return rel;
 }
 
 } // namespace ProbeMG
