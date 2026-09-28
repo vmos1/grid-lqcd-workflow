@@ -98,6 +98,19 @@ SUBSPACE_TOL=${SUBSPACE_TOL:-0.001}
 SUBSPACE_ROUNDS=${SUBSPACE_ROUNDS:-3}
 SUBSPACE_MMAX=${SUBSPACE_MMAX:-10}
 SUBSPACE_MAXITER=${SUBSPACE_MAXITER:-30}
+# Workstream B (plan v2 §6): null-vector generator and the precision it runs at.
+#   gcr    Grid's CreateSubspaceGCR (control): solve Mpc x = noise, SUBSPACE_ROUNDS rounds
+#   relax  Grid's own #else branch: relax Mpc x = 0 from the noise (QUDA's scheme); use ROUNDS=1
+#   cheb   Chebyshev filter on Mpc^dag Mpc; SUBSPACE_CHEB_LO / _ORDER, hi from a power method
+# SUBSPACE_PRECISION=single generates on the fp32 operator (needs MG_PRECISION=single).
+SUBSPACE_METHOD=${SUBSPACE_METHOD:-gcr}
+SUBSPACE_PRECISION=${SUBSPACE_PRECISION:-double}
+SUBSPACE_CHEB_LO=${SUBSPACE_CHEB_LO:-0.01}
+SUBSPACE_CHEB_ORDER=${SUBSPACE_CHEB_ORDER:-100}
+SUBSPACE_PM_ITERS=${SUBSPACE_PM_ITERS:-50}
+# Headroom on the power-method lambda_max (a LOWER bound). Modes above hi are amplified by the
+# Chebyshev filter, not damped; 1.05 gave NaN at order 200 (2026-09-28).
+SUBSPACE_CHEB_HI_FACTOR=${SUBSPACE_CHEB_HI_FACTOR:-1.25}
 TOL=${TOL:-1e-10}
 MAXITER=${MAXITER:-1000}
 CG_MAXITER=${CG_MAXITER:-50000}
@@ -226,6 +239,8 @@ chmod +x "${SELECT_GPU}"
     "${FAST_MG}" "${FAST_GCR}" "${FAST_PROJECT}" "${PERSISTENT_TEMPS}" "${VERIFY_RESIDUAL}"
   printf 'ENV COARSE_TOL=%s SUBSPACE_TOL=%s SUBSPACE_ROUNDS=%s SUBSPACE_MMAX=%s SUBSPACE_MAXITER=%s\n' \
     "${COARSE_TOL}" "${SUBSPACE_TOL}" "${SUBSPACE_ROUNDS}" "${SUBSPACE_MMAX}" "${SUBSPACE_MAXITER}"
+  printf 'ENV SUBSPACE_METHOD=%s SUBSPACE_PRECISION=%s SUBSPACE_CHEB_LO=%s SUBSPACE_CHEB_ORDER=%s SUBSPACE_PM_ITERS=%s SUBSPACE_CHEB_HI_FACTOR=%s\n' \
+    "${SUBSPACE_METHOD}" "${SUBSPACE_PRECISION}" "${SUBSPACE_CHEB_LO}" "${SUBSPACE_CHEB_ORDER}" "${SUBSPACE_PM_ITERS}" "${SUBSPACE_CHEB_HI_FACTOR}"
   printf 'ENV SOLVE_REPEATS=%s STOUT_NSMEAR=%s STOUT_RHO=%s\n' \
     "${SOLVE_REPEATS}" "${STOUT_NSMEAR}" "${STOUT_RHO}"
   printf 'ENV OUTER_PRECISION=%s CG_PRECISION=%s CG_INNER_TOL=%s CG_MIXED_OUTER=%s\n' \
@@ -271,6 +286,12 @@ args=(
   --probe-subspace-rounds "${SUBSPACE_ROUNDS}"
   --probe-subspace-mmax "${SUBSPACE_MMAX}"
   --probe-subspace-maxiter "${SUBSPACE_MAXITER}"
+  --probe-subspace-method "${SUBSPACE_METHOD}"
+  --probe-subspace-precision "${SUBSPACE_PRECISION}"
+  --probe-subspace-cheb-lo "${SUBSPACE_CHEB_LO}"
+  --probe-subspace-cheb-order "${SUBSPACE_CHEB_ORDER}"
+  --probe-subspace-pm-iters "${SUBSPACE_PM_ITERS}"
+  --probe-subspace-cheb-hi-factor "${SUBSPACE_CHEB_HI_FACTOR}"
   --probe-mass "${MASS}"
   --probe-csw "${CSW}"
   --probe-tol "${TOL}"

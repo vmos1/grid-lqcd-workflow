@@ -557,6 +557,25 @@ int main(int argc, char **argv)
   const int subspace_rounds = read_int(argc, argv, "--probe-subspace-rounds", 3);
   const int subspace_mmax = read_int(argc, argv, "--probe-subspace-mmax", 10);
   const int subspace_maxiter = read_int(argc, argv, "--probe-subspace-maxiter", 30);
+  // Workstream B (plan v2 §6): HOW the near-null vectors are generated.
+  //   gcr    Grid's CreateSubspaceGCR: solve Mpc x = noise, `rounds` rounds (the control)
+  //   relax  Grid's own alternative branch (Aggregates.h:160-166): noise as guess, zero RHS,
+  //          i.e. relax Mpc x = 0 -- QUDA's QUDA_NULL_VECTOR_SETUP. Same GCR knobs.
+  //   cheb   Chebyshev filter on Mpc^dag Mpc (Grid's CreateSubspaceChebyshev pattern);
+  //          knobs --probe-subspace-cheb-lo / -order, hi from a power method
+  const std::string subspace_method = read_string(argc, argv, "--probe-subspace-method", "gcr");
+  const double subspace_cheb_lo = read_double(argc, argv, "--probe-subspace-cheb-lo", 0.01);
+  const int subspace_cheb_order = read_int(argc, argv, "--probe-subspace-cheb-order", 100);
+  const int subspace_pm_iters = read_int(argc, argv, "--probe-subspace-pm-iters", 50);
+  // Headroom on the power-method estimate. The estimate is a lower bound, and a Chebyshev
+  // polynomial evaluated ABOVE hi blows up like cosh(order * acosh(x/hi)): 5% was not enough
+  // at order 200 (NaN, 2026-09-28). See power_method_max in probe_mg_solvers.h.
+  const double subspace_cheb_hi_factor = read_double(argc, argv, "--probe-subspace-cheb-hi-factor", 1.25);
+  // double | single: the operator the null vectors are generated on. `single` needs
+  // --probe-mg-precision single, generates on the fp32 Schur operator and converts the vectors
+  // UP for the fp64 hierarchy, so both hierarchies still share one null space. QUDA generates
+  // at its sloppy precision; the fp64 default is a measurement choice from the 09-15 session.
+  const std::string subspace_precision = read_string(argc, argv, "--probe-subspace-precision", "double");
 
   // Precision of the MG PRECONDITIONER (the outer solver and every gate stay in
   // double either way -- see PrecisionChangeAdaptor for why).
@@ -612,6 +631,22 @@ int main(int argc, char **argv)
   if (coarse_apply == "stencil" && stencil_hops != 1) {
     std::cerr << "probe: --probe-coarse-apply stencil needs --probe-stencil-hops 1"
               << " (Grid's old Geometry has no corner points)" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (subspace_method != "gcr" && subspace_method != "relax" && subspace_method != "cheb") {
+    std::cerr << "probe: --probe-subspace-method must be gcr|relax|cheb" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (subspace_precision != "double" && subspace_precision != "single") {
+    std::cerr << "probe: --probe-subspace-precision must be double|single" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (subspace_precision == "single" && !mg_single) {
+    std::cerr << "probe: --probe-subspace-precision single needs --probe-mg-precision single"
+              << std::endl;
     Grid_finalize();
     return 2;
   }
@@ -703,6 +738,12 @@ int main(int argc, char **argv)
     std::cout << GridLogMessage << "subspace tol/rounds " << subspace_tol << "/" << subspace_rounds
               << " mmax " << subspace_mmax << " maxiter " << subspace_maxiter
               << " (QUDA setup_tol 5e-6)" << std::endl;
+    std::cout << GridLogMessage << "subspace method     " << subspace_method << " precision "
+              << subspace_precision;
+    if (subspace_method == "cheb")
+      std::cout << " cheb lo " << subspace_cheb_lo << " order " << subspace_cheb_order
+                << " pm-iters " << subspace_pm_iters << " hi-factor " << subspace_cheb_hi_factor;
+    std::cout << std::endl;
     std::cout << GridLogMessage << "fast-mg           " << fast_mg << " (gcr " << fast_gcr
               << ", project " << fast_project << ", persistent-temps " << persistent_temps
               << ", verify-residual " << verify_residual << ")"
@@ -846,8 +887,49 @@ int main(int argc, char **argv)
     schur_holder.reset(new SchurDiagMooeeOperator<WilsonFermionD, LatticeFermionD>(Dc));
   SchurOperatorBase<LatticeFermionD> &SchurOp = *schur_holder;
 
+  // ---- fp32 grids and operator (built here, ahead of the subspace, so that workstream B can
+  // generate the null vectors ON the fp32 operator; the rest of the fp32 hierarchy follows the
+  // fp64 one below). Separate grids: vComplexF has twice vComplexD's SIMD lanes, so the F
+  // fields need their own layout. precisionChange handles the cross-grid copy; this is the
+  // same construction Grid's mixed-precision CG uses.
+  GridCartesian *UGridF = nullptr;
+  GridRedBlackCartesian *UrbGridF = nullptr;
+  GridCartesian *Coarse4dF = nullptr;
+  std::unique_ptr<LatticeGaugeFieldF> UmuF;
+  std::unique_ptr<WilsonFermionF> fermopF;
+  std::unique_ptr<SchurOperatorBase<LatticeFermionF>> schur_holderF;
+  std::unique_ptr<GridParallelRNG> RNG4F;
+  if (mg_single) {
+    UGridF = SpaceTimeGrid::makeFourDimGrid(
+        GridDefaultLatt(), GridDefaultSimd(Nd, vComplexF::Nsimd()), GridDefaultMpi());
+    UrbGridF = SpaceTimeGrid::makeFourDimRedBlackGrid(UGridF);
+    Coarse4dF = SpaceTimeGrid::makeFourDimGrid(
+        clatt, GridDefaultSimd(Nd, vComplexF::Nsimd()), GridDefaultMpi());
+    subdivides(Coarse4dF, UrbGridF);
+
+    UmuF.reset(new LatticeGaugeFieldF(UGridF));
+    precisionChange(*UmuF, Umu);
+
+    if (action_name == "wilson")
+      fermopF.reset(new WilsonFermionF(*UmuF, *UGridF, *UrbGridF, mass, implParams));
+    else
+      fermopF.reset(new CompactWilsonCloverFermionF(*UmuF, *UGridF, *UrbGridF, mass, csw, csw, 1.0,
+                                                    anisotropy, implParams));
+
+    if (schur_name == "one")
+      schur_holderF.reset(new SchurDiagOneOperator<WilsonFermionF, LatticeFermionF>(*fermopF));
+    else
+      schur_holderF.reset(new SchurDiagMooeeOperator<WilsonFermionF, LatticeFermionF>(*fermopF));
+    // An RNG on the fp32 full grid, for drawing fp32 noise directly (RNG4's fill of a
+    // checkerboarded field builds its temporary on RNG4's own grid, whose SIMD layout is
+    // the fp64 one). Same seeds: Grid's parallel RNG is site-indexed, so the streams match.
+    RNG4F.reset(new GridParallelRNG(UGridF));
+    RNG4F->SeedFixedIntegers(seeds4);
+  }
+
   // ---- Subspace ------------------------------------------------------------
   typedef Aggregation<vSpinColourVectorD, vTComplexD, kNbasis> Subspace;
+  typedef Aggregation<vSpinColourVectorF, vTComplexF, kNbasis> SubspaceF;
   typedef Aggregation<vSpinColourVectorD, vTComplexD, 2 * kNbasis> CombinedSubspace;
   typedef GeneralCoarsenedMatrix<vSpinColourVectorD, vTComplexD, 2 * kNbasis> LittleDiracOperator;
   typedef LittleDiracOperator::CoarseVector CoarseVector;
@@ -864,22 +946,53 @@ int main(int argc, char **argv)
   if (cb == Even) {
     Subspace Aggregates(Coarse4d, UrbGrid, cb);
 
-    if (boss) std::cout << GridLogMessage << "--- subspace generation (GCR) ---" << std::endl;
+    if (boss)
+      std::cout << GridLogMessage << "--- subspace generation (" << subspace_method << ", "
+                << subspace_precision << ") ---" << std::endl;
     accelerator_barrier();
     UGrid->Barrier();
     t0 = usecond();
-    // GCR, not Chebyshev: CreateSubspaceChebyshev filters a HERMITIAN operator and
-    // does not apply to Mpc. CreateSubspaceGCR drives DiracOp.Op() directly.
+    // Note every generator builds its noise as `FineField noise(FineGrid)`, whose checkerboard
+    // defaults to Even, so the subspace it returns is Even whatever the Aggregation was
+    // constructed with. That is the same default that makes CoarsenOperator Even-only, and it
+    // is why this branch is guarded on cb == Even.
     //
-    // Note it builds its noise as `FineField noise(FineGrid)`, whose checkerboard
-    // defaults to Even, so the subspace it returns is Even whatever the Aggregation
-    // was constructed with. That is the same default that makes CoarsenOperator
-    // Even-only, and it is why this branch is guarded on cb == Even.
-    // Probe-local reimplementation of Grid's CreateSubspaceGCR with the tolerance and round
-    // count exposed (Stage 2). Defaults reproduce Grid exactly; see probe_mg_solvers.h.
-    ProbeMG::create_subspace_gcr(RNG4, SchurOp, Aggregates, kNbasis, subspace_tol,
-                                 subspace_rounds, subspace_mmax, subspace_mmax,
-                                 subspace_maxiter, fast_gcr != 0, fast_gcr != 0);
+    // Workstream B (plan v2 §6): the generator and the precision it runs at are knobs.
+    //   gcr    probe-local copy of Grid's CreateSubspaceGCR (solve Mpc x = noise, `rounds`
+    //          rounds of inverse iteration); defaults reproduce Grid exactly
+    //   relax  Grid's own alternative branch: relax Mpc x = 0 from the noise (QUDA's scheme)
+    //   cheb   Chebyshev filter on Mpc^dag Mpc (Grid's CreateSubspaceChebyshev pattern); the
+    //          upper edge from a short power method
+    // Generic over the precision: the fp32 path generates on the fp32 Schur operator and
+    // converts the vectors UP into the fp64 Aggregation, so both hierarchies still share one
+    // null space and everything downstream is unchanged.
+    auto generate = [&](auto &Agg, auto &Op, GridParallelRNG &rng, GridBase *rbgrid) {
+      if (subspace_method == "cheb") {
+        const RealD lambda_max = ProbeMG::power_method_max(Op, rng, rbgrid, cb, subspace_pm_iters, boss);
+        // Headroom above the (lower-bound) power-method estimate keeps the whole spectrum
+        // inside [lo,hi]; anything above hi is AMPLIFIED, not damped, and overflows fp32.
+        if (boss)
+          std::cout << GridLogMessage << "chebyshev filter: lo " << subspace_cheb_lo << " hi "
+                    << subspace_cheb_hi_factor * lambda_max << " order " << subspace_cheb_order << std::endl;
+        ProbeMG::create_subspace_chebyshev(rng, Op, Agg, kNbasis, subspace_cheb_lo,
+                                           subspace_cheb_hi_factor * lambda_max, subspace_cheb_order,
+                                           fast_gcr != 0);
+      } else {
+        ProbeMG::create_subspace_gcr(rng, Op, Agg, kNbasis, subspace_tol, subspace_rounds,
+                                     subspace_mmax, subspace_mmax, subspace_maxiter, fast_gcr != 0,
+                                     fast_gcr != 0, subspace_method == "relax");
+      }
+    };
+    if (subspace_precision == "single") {
+      SubspaceF AggregatesF(Coarse4dF, UrbGridF, cb);
+      generate(AggregatesF, *schur_holderF, *RNG4F, UrbGridF);
+      for (int b = 0; b < kNbasis; ++b) {
+        Aggregates.subspace[b].Checkerboard() = cb;
+        precisionChange(Aggregates.subspace[b], AggregatesF.subspace[b]);
+      }
+    } else {
+      generate(Aggregates, SchurOp, RNG4, UrbGrid);
+    }
     accelerator_barrier();
     UGrid->Barrier();
     subspace_seconds = (usecond() - t0) / 1.0e6;
@@ -1118,12 +1231,7 @@ int main(int argc, char **argv)
   typedef GeneralCoarsenedMatrix<vSpinColourVectorF, vTComplexF, 2 * kNbasis> LittleDiracOperatorF;
   typedef LittleDiracOperatorF::CoarseVector CoarseVectorF;
 
-  GridCartesian *UGridF = nullptr;
-  GridRedBlackCartesian *UrbGridF = nullptr;
-  GridCartesian *Coarse4dF = nullptr;
-  std::unique_ptr<LatticeGaugeFieldF> UmuF;
-  std::unique_ptr<WilsonFermionF> fermopF;
-  std::unique_ptr<SchurOperatorBase<LatticeFermionF>> schur_holderF;
+  // (UGridF, UrbGridF, Coarse4dF, UmuF, fermopF, schur_holderF are built above the subspace.)
   std::unique_ptr<CombinedSubspaceF> CombinedUVF;
   // ⛔ MUST OUTLIVE LittleDiracOpF: GeneralCoarsenedMatrix stores the geometry BY
   // REFERENCE (`NonLocalStencilGeometry &geom;`, GeneralCoarsenedMatrix.h:61), so
@@ -1155,30 +1263,6 @@ int main(int argc, char **argv)
   if (mg_single) {
     if (boss)
       std::cout << GridLogMessage << "--- building SINGLE-precision MG hierarchy ---" << std::endl;
-
-    // Separate grids: vComplexF has twice vComplexD's SIMD lanes, so the F fields
-    // need their own layout. precisionChange handles the cross-grid copy; this is
-    // the same construction Grid's mixed-precision CG uses.
-    UGridF = SpaceTimeGrid::makeFourDimGrid(
-        GridDefaultLatt(), GridDefaultSimd(Nd, vComplexF::Nsimd()), GridDefaultMpi());
-    UrbGridF = SpaceTimeGrid::makeFourDimRedBlackGrid(UGridF);
-    Coarse4dF = SpaceTimeGrid::makeFourDimGrid(
-        clatt, GridDefaultSimd(Nd, vComplexF::Nsimd()), GridDefaultMpi());
-    subdivides(Coarse4dF, UrbGridF);
-
-    UmuF.reset(new LatticeGaugeFieldF(UGridF));
-    precisionChange(*UmuF, Umu);
-
-    if (action_name == "wilson")
-      fermopF.reset(new WilsonFermionF(*UmuF, *UGridF, *UrbGridF, mass, implParams));
-    else
-      fermopF.reset(new CompactWilsonCloverFermionF(*UmuF, *UGridF, *UrbGridF, mass, csw, csw, 1.0,
-                                                    anisotropy, implParams));
-
-    if (schur_name == "one")
-      schur_holderF.reset(new SchurDiagOneOperator<WilsonFermionF, LatticeFermionF>(*fermopF));
-    else
-      schur_holderF.reset(new SchurDiagMooeeOperator<WilsonFermionF, LatticeFermionF>(*fermopF));
 
     // Subspace converted from the double one, vector by vector.
     //

@@ -531,11 +531,19 @@ public:
 // <n|Op|n> and <f|Op|f> diagnostics -- 2*nbasis extra fine applications in setup. Those are
 // skipped when `quiet`, which is why fast-mode setup is faster for a reason that has nothing
 // to do with null-space quality; do not read that as a preconditioner change.
+//
+// Workstream B (plan v2 §6): `relax` selects Grid's OWN alternative branch, Aggregates.h:160-166
+// (the `#else` of the `#if 1`): the noise is the INITIAL GUESS and the right-hand side is ZERO,
+// so the GCR relaxes A x = 0 from the noise, damping the high modes it can resolve and leaving
+// the near-null ones. That is exactly QUDA's QUDA_NULL_VECTOR_SETUP (multigrid.cpp:1391-1392,
+// CG on M†M rather than GCR on M). ⚠️ FlexibleGCR's zero_guess shortcut is WRONG here (the guess
+// is not zero), so the relax path always uses the stock PGCR, whose D1 residual computation is
+// then the necessary one. Typically one round.
 template <class Aggregates>
 void create_subspace_gcr(GridParallelRNG &RNG,
                          LinearOperatorBase<typename Aggregates::FineField> &DiracOp,
                          Aggregates &Agg, int nn, RealD tol, int rounds, int mmax, int nstep,
-                         Integer maxiter, bool use_fast_gcr, bool quiet)
+                         Integer maxiter, bool use_fast_gcr, bool quiet, bool relax = false)
 {
   typedef typename Aggregates::FineField FineField;
   GridBase *FineGrid = Agg.FineGrid;
@@ -547,8 +555,8 @@ void create_subspace_gcr(GridParallelRNG &RNG,
   gcr_fast.zero_guess = true; // `guess` is zeroed before every solve below
   gcr_fast.verify_residual = false;
   LinearFunction<FineField> &GCR =
-      use_fast_gcr ? static_cast<LinearFunction<FineField> &>(gcr_fast)
-                   : static_cast<LinearFunction<FineField> &>(gcr_stock);
+      (use_fast_gcr && !relax) ? static_cast<LinearFunction<FineField> &>(gcr_fast)
+                               : static_cast<LinearFunction<FineField> &>(gcr_stock);
 
   FineField noise(FineGrid);
   FineField src(FineGrid);
@@ -570,8 +578,14 @@ void create_subspace_gcr(GridParallelRNG &RNG,
     // Inverse iteration: each round solves against the previous iterate, pulling the vector
     // towards the low modes the coarse space has to represent.
     for (int i = 0; i < rounds; i++) {
-      src = noise;
-      guess = Zero();
+      if (relax) {
+        src = Zero();
+        src.Checkerboard() = noise.Checkerboard();
+        guess = noise;
+      } else {
+        src = noise;
+        guess = Zero();
+      }
       GCR(src, guess);
       Agg.subspace[b] = guess;
       noise = Agg.subspace[b];
@@ -586,6 +600,86 @@ void create_subspace_gcr(GridParallelRNG &RNG,
 
     Agg.subspace[b] = noise;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Workstream B (plan v2 §6): Chebyshev-filtered null vectors, Grid's Aggregation::
+// CreateSubspaceChebyshev pattern (Aggregates.h:364-410) applied to the SCHUR operator.
+// ---------------------------------------------------------------------------
+//
+// The probe's earlier comment dismissed this as "Hermitian only". It IS Hermitian-only, and
+// that is fine: SchurOperatorBase::HermOp is Mpc†Mpc (LinearOperator.h:336), whose low modes
+// are the low right-singular vectors of Mpc, which is exactly the near-null space the
+// aggregation needs and exactly what QUDA's CG on M†M relaxes towards. Grid's HDCG drivers
+// generate their subspace this way on the Schur operator (Test_general_coarse_hdcg.cc:157).
+//
+// Cost: `order` applications of Mpc†Mpc = 2*order fine applies per vector, fixed, no inner
+// products, no cap to hit. hi = largest eigenvalue of Mpc†Mpc (power method, ~pm_iters
+// applies once); lo = the filter's lower edge: modes below lo are kept, modes in [lo,hi] are
+// damped by ~1/T_order. Grid's own test uses (hi, lo, order) = (35, 0.01, 500) on DWF.
+//
+// Grid's version refines each vector with a 1000th-order power-law Chebyshev afterwards; that is
+// another 2000 applies per vector and is left out here (knob `refine` if wanted later).
+template <class Aggregates>
+void create_subspace_chebyshev(GridParallelRNG &RNG,
+                               LinearOperatorBase<typename Aggregates::FineField> &HermOp,
+                               Aggregates &Agg, int nn, double lo, double hi, int order,
+                               bool quiet)
+{
+  typedef typename Aggregates::FineField FineField;
+  GridBase *FineGrid = Agg.FineGrid;
+  FineField noise(FineGrid);
+  FineField Mn(FineGrid);
+  FineField tmp(FineGrid);
+  Chebyshev<FineField> Cheb(lo, hi, order);
+  for (int b = 0; b < nn; b++) {
+    gaussian(RNG, noise);
+    noise = noise * RealD(std::pow(norm2(noise), -0.5));
+    if (!quiet) {
+      HermOp.HermOp(noise, Mn);
+      std::cout << GridLogMessage << "noise   [" << b << "] <n|MdagM|n> " << norm2(Mn) << std::endl;
+    }
+    Cheb(HermOp, noise, Mn);
+    Mn = Mn * RealD(std::pow(norm2(Mn), -0.5));
+    Agg.subspace[b] = Mn;
+    if (!quiet) {
+      HermOp.HermOp(Mn, tmp);
+      std::cout << GridLogMessage << "filtered[" << b << "] <f|MdagM|f> " << norm2(tmp) << std::endl;
+    }
+  }
+}
+
+// Largest eigenvalue of HermOp by power iteration, `iters` steps from a random start.
+// Grid's PowerMethod runs a fixed 200 steps and prints every one; this is the same loop with
+// the count exposed, since ~20 steps give the upper edge to the few percent a filter needs.
+template <class Field>
+RealD power_method_max(LinearOperatorBase<Field> &HermOp, GridParallelRNG &RNG, GridBase *grid,
+                       int checkerboard, int iters, bool boss)
+{
+  Field full(RNG.Grid());
+  random(RNG, full);
+  Field v(grid), Av(grid);
+  v.Checkerboard() = checkerboard;
+  Av.Checkerboard() = checkerboard;
+  pickCheckerboard(checkerboard, v, full);
+  // ⛔ The estimate is a LOWER bound on lambda_max and converges slowly when the top of the
+  // spectrum is dense. A Chebyshev filter of degree n evaluated at an eigenvalue ABOVE `hi`
+  // grows like cosh(n acosh(x/hi)): at degree 199 a 10% overshoot is ~1e38, i.e. fp32 overflow
+  // -> NaN null vectors (seen 2026-09-28, C2 order 200 with 20 steps and 5% headroom). Hence
+  // the mid-point print: if lambda(iters) is still moving relative to lambda(iters/2), raise
+  // the iteration count or the headroom factor.
+  RealD lambda = 0.0, lambda_half = 0.0;
+  for (int i = 0; i < iters; ++i) {
+    v = v * RealD(std::pow(norm2(v), -0.5));
+    HermOp.HermOp(v, Av);
+    lambda = real(innerProduct(v, Av));
+    if (i == iters / 2) lambda_half = lambda;
+    v = Av;
+  }
+  if (boss)
+    std::cout << GridLogMessage << "power method: lambda_max(Mpc^dag Mpc) ~ " << lambda << " after "
+              << iters << " steps (was " << lambda_half << " at step " << iters / 2 << ")" << std::endl;
+  return lambda;
 }
 
 // ---------------------------------------------------------------------------
