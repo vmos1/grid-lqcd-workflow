@@ -181,10 +181,12 @@ inline void blockProjectFused(Lattice<iVector<CComplex, nbasis>> &coarseData,
 struct OpCounts {
   long long fine = 0;
   long long coarse = 0;
+  long long coarse2 = 0; // level-2 (coarse-coarse) operator, workstream C (3-level)
   void reset()
   {
     fine = 0;
     coarse = 0;
+    coarse2 = 0;
   }
 };
 

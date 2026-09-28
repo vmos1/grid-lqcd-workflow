@@ -111,6 +111,24 @@ SUBSPACE_PM_ITERS=${SUBSPACE_PM_ITERS:-50}
 # Headroom on the power-method lambda_max (a LOWER bound). Modes above hi are amplified by the
 # Chebyshev filter, not damped; 1.05 gave NaN at order 200 (2026-09-28).
 SUBSPACE_CHEB_HI_FACTOR=${SUBSPACE_CHEB_HI_FACTOR:-1.25}
+# Workstream C (plan v2 §7): precondition the coarse (level-1) GCR.
+#   none  trivial preconditioner (control, every number before 2026-09-28)
+#   mg    level-2 V-cycle: L2_SMOOTHER_NSTEP GCR steps on the level-1 operator + a GCR solve
+#         on the level-1 operator coarsened again with BLOCK2 (level-1 sites) and 32 dof.
+#         fp32 hierarchy only. With it, cap the level-1 GCR like QUDA (COARSE_MAXITER=1
+#         COARSE_NSTEP=12 COARSE_MMAX=12) or leave COARSE_TOL=0.2 to see the step count fall.
+COARSE_PRECON=${COARSE_PRECON:-none}
+BLOCK2=${BLOCK2:-2.3.3.3}            # C3 (level-1 rdim 12.3.3.3); C2 needs 2.2.2.3
+L2_SUBSPACE_TOL=${L2_SUBSPACE_TOL:-0.001}
+L2_SUBSPACE_ROUNDS=${L2_SUBSPACE_ROUNDS:-3}
+L2_SUBSPACE_MAXITER=${L2_SUBSPACE_MAXITER:-30}
+L2_SMOOTHER_NSTEP=${L2_SMOOTHER_NSTEP:-4}
+L2_SMOOTHER_TOL=${L2_SMOOTHER_TOL:-0.1}
+L2_COARSE_TOL=${L2_COARSE_TOL:-0.2}
+L2_COARSE_MAXITER=${L2_COARSE_MAXITER:-50}
+L2_COARSE_NSTEP=${L2_COARSE_NSTEP:-8}
+L2_COARSE_MMAX=${L2_COARSE_MMAX:-8}
+COARSE2_APPLY=${COARSE2_APPLY:-general}
 TOL=${TOL:-1e-10}
 MAXITER=${MAXITER:-1000}
 CG_MAXITER=${CG_MAXITER:-50000}
@@ -241,6 +259,10 @@ chmod +x "${SELECT_GPU}"
     "${COARSE_TOL}" "${SUBSPACE_TOL}" "${SUBSPACE_ROUNDS}" "${SUBSPACE_MMAX}" "${SUBSPACE_MAXITER}"
   printf 'ENV SUBSPACE_METHOD=%s SUBSPACE_PRECISION=%s SUBSPACE_CHEB_LO=%s SUBSPACE_CHEB_ORDER=%s SUBSPACE_PM_ITERS=%s SUBSPACE_CHEB_HI_FACTOR=%s\n' \
     "${SUBSPACE_METHOD}" "${SUBSPACE_PRECISION}" "${SUBSPACE_CHEB_LO}" "${SUBSPACE_CHEB_ORDER}" "${SUBSPACE_PM_ITERS}" "${SUBSPACE_CHEB_HI_FACTOR}"
+  printf 'ENV COARSE_PRECON=%s BLOCK2=%s L2_SUBSPACE_TOL=%s L2_SUBSPACE_ROUNDS=%s L2_SUBSPACE_MAXITER=%s\n' \
+    "${COARSE_PRECON}" "${BLOCK2}" "${L2_SUBSPACE_TOL}" "${L2_SUBSPACE_ROUNDS}" "${L2_SUBSPACE_MAXITER}"
+  printf 'ENV L2_SMOOTHER_NSTEP=%s L2_SMOOTHER_TOL=%s L2_COARSE_TOL=%s L2_COARSE_MAXITER=%s L2_COARSE_NSTEP=%s L2_COARSE_MMAX=%s COARSE2_APPLY=%s\n' \
+    "${L2_SMOOTHER_NSTEP}" "${L2_SMOOTHER_TOL}" "${L2_COARSE_TOL}" "${L2_COARSE_MAXITER}" "${L2_COARSE_NSTEP}" "${L2_COARSE_MMAX}" "${COARSE2_APPLY}"
   printf 'ENV SOLVE_REPEATS=%s STOUT_NSMEAR=%s STOUT_RHO=%s\n' \
     "${SOLVE_REPEATS}" "${STOUT_NSMEAR}" "${STOUT_RHO}"
   printf 'ENV OUTER_PRECISION=%s CG_PRECISION=%s CG_INNER_TOL=%s CG_MIXED_OUTER=%s\n' \
@@ -292,6 +314,18 @@ args=(
   --probe-subspace-cheb-order "${SUBSPACE_CHEB_ORDER}"
   --probe-subspace-pm-iters "${SUBSPACE_PM_ITERS}"
   --probe-subspace-cheb-hi-factor "${SUBSPACE_CHEB_HI_FACTOR}"
+  --probe-coarse-precon "${COARSE_PRECON}"
+  --probe-block2 "${BLOCK2}"
+  --probe-l2-subspace-tol "${L2_SUBSPACE_TOL}"
+  --probe-l2-subspace-rounds "${L2_SUBSPACE_ROUNDS}"
+  --probe-l2-subspace-maxiter "${L2_SUBSPACE_MAXITER}"
+  --probe-l2-smoother-nstep "${L2_SMOOTHER_NSTEP}"
+  --probe-l2-smoother-tol "${L2_SMOOTHER_TOL}"
+  --probe-l2-coarse-tol "${L2_COARSE_TOL}"
+  --probe-l2-coarse-maxiter "${L2_COARSE_MAXITER}"
+  --probe-l2-coarse-nstep "${L2_COARSE_NSTEP}"
+  --probe-l2-coarse-mmax "${L2_COARSE_MMAX}"
+  --probe-coarse2-apply "${COARSE2_APPLY}"
   --probe-mass "${MASS}"
   --probe-csw "${CSW}"
   --probe-tol "${TOL}"
