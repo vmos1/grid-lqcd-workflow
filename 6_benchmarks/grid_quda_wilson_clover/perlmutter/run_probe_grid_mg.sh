@@ -129,6 +129,13 @@ L2_COARSE_MAXITER=${L2_COARSE_MAXITER:-50}
 L2_COARSE_NSTEP=${L2_COARSE_NSTEP:-8}
 L2_COARSE_MMAX=${L2_COARSE_MMAX:-8}
 COARSE2_APPLY=${COARSE2_APPLY:-general}
+# 0 = level-1 smoother ONLY as the coarse GCR's preconditioner (no level-2 aggregation).
+L2_COARSE_SOLVE=${L2_COARSE_SOLVE:-1}
+# 1 = skip the fp64 coarsening + its Galerkin check (production runs the fp32 hierarchy only).
+# Needs MG_PRECISION=single, RUN_CG=0 or CG_PRECISION=double, COARSE_APPLY_CHECK=0.
+SKIP_FP64_COARSEN=${SKIP_FP64_COARSEN:-0}
+# 1 = build the fp64<->fp32 precision-change site maps once (stock rebuilds them per call).
+PERSISTENT_PRECCHANGE=${PERSISTENT_PRECCHANGE:-0}
 TOL=${TOL:-1e-10}
 MAXITER=${MAXITER:-1000}
 CG_MAXITER=${CG_MAXITER:-50000}
@@ -263,6 +270,8 @@ chmod +x "${SELECT_GPU}"
     "${COARSE_PRECON}" "${BLOCK2}" "${L2_SUBSPACE_TOL}" "${L2_SUBSPACE_ROUNDS}" "${L2_SUBSPACE_MAXITER}"
   printf 'ENV L2_SMOOTHER_NSTEP=%s L2_SMOOTHER_TOL=%s L2_COARSE_TOL=%s L2_COARSE_MAXITER=%s L2_COARSE_NSTEP=%s L2_COARSE_MMAX=%s COARSE2_APPLY=%s\n' \
     "${L2_SMOOTHER_NSTEP}" "${L2_SMOOTHER_TOL}" "${L2_COARSE_TOL}" "${L2_COARSE_MAXITER}" "${L2_COARSE_NSTEP}" "${L2_COARSE_MMAX}" "${COARSE2_APPLY}"
+  printf 'ENV L2_COARSE_SOLVE=%s SKIP_FP64_COARSEN=%s PERSISTENT_PRECCHANGE=%s\n' \
+    "${L2_COARSE_SOLVE}" "${SKIP_FP64_COARSEN}" "${PERSISTENT_PRECCHANGE}"
   printf 'ENV SOLVE_REPEATS=%s STOUT_NSMEAR=%s STOUT_RHO=%s\n' \
     "${SOLVE_REPEATS}" "${STOUT_NSMEAR}" "${STOUT_RHO}"
   printf 'ENV OUTER_PRECISION=%s CG_PRECISION=%s CG_INNER_TOL=%s CG_MIXED_OUTER=%s\n' \
@@ -326,6 +335,9 @@ args=(
   --probe-l2-coarse-nstep "${L2_COARSE_NSTEP}"
   --probe-l2-coarse-mmax "${L2_COARSE_MMAX}"
   --probe-coarse2-apply "${COARSE2_APPLY}"
+  --probe-l2-coarse-solve "${L2_COARSE_SOLVE}"
+  --probe-skip-fp64-coarsen "${SKIP_FP64_COARSEN}"
+  --probe-persistent-precchange "${PERSISTENT_PRECCHANGE}"
   --probe-mass "${MASS}"
   --probe-csw "${CSW}"
   --probe-tol "${TOL}"

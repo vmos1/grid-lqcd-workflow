@@ -867,6 +867,27 @@ public:
   void HermOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
 };
 
+// Zero the output, then apply. A FlexibleGCR with zero_guess=true trusts that its psi IS zero
+// on entry; MGPreconditioner guarantees that for the smoothers it drives (it zeroes `out` and
+// `vec2` itself, probe_grid_mg_schur_clover.cc MGPreconditioner::operator()), but a GCR used
+// DIRECTLY as another GCR's preconditioner receives that solver's uninitialised workspace `z`
+// and forms r0 = src - A*garbage -> NaN (seen 2026-09-28, row p_smooth). This wrapper restores
+// the guarantee wherever a solver is used as a preconditioner outside MGPreconditioner.
+template <class Field>
+class ZeroThenApply : public LinearFunction<Field> {
+  LinearFunction<Field> &inner_;
+
+public:
+  using LinearFunction<Field>::operator();
+  explicit ZeroThenApply(LinearFunction<Field> &inner) : inner_(inner) {}
+  void operator()(const Field &in, Field &out) override
+  {
+    out = Zero();
+    out.Checkerboard() = in.Checkerboard();
+    inner_(in, out);
+  }
+};
+
 // Agreement + timing of an alternative apply against the reference one on the given vector.
 // Returns the relative difference; prints ms/apply for both (`reps` timed calls each, after
 // the agreement call has warmed both paths).

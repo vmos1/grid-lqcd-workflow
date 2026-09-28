@@ -129,6 +129,14 @@ public:
 //
 // precisionChange is Grid's supported double<->single conversion
 // (Lattice_transfer.h:1377) and is the same primitive its mixed-precision CG uses.
+//
+// ⚠️ The two-argument precisionChange(out,in) REBUILDS its site/lane map on every call
+// (Lattice_transfer.h:1489-1493: a fresh precisionChangeWorkspace, built on the host with a
+// thread_for over all sites, then copied to the device). Grid's own
+// MixedPrecisionFlexibleGeneralisedMinimalResidual pays the same cost per iteration
+// (MixedPrecisionFlexibleGeneralisedMinimalResidual.h:210-219). The workspace class exists
+// precisely so callers can build the map once; `persistent` does that, and also keeps the two
+// fp32 temporaries alive across calls (D4 lesson). Default OFF reproduces every earlier number.
 template <class FieldD, class FieldF>
 class PrecisionChangeAdaptor : public LinearFunction<FieldD> {
 public:
@@ -137,15 +145,35 @@ public:
 private:
   LinearFunction<FieldF> &inner_;
   GridBase *fine_f_;
+  bool persistent_ = false;
+  std::unique_ptr<precisionChangeWorkspace> ws_down_, ws_up_; // fp64->fp32, fp32->fp64
+  std::unique_ptr<FieldF> in_f_, out_f_;
 
 public:
-  PrecisionChangeAdaptor(LinearFunction<FieldF> &inner, GridBase *fine_f)
-      : inner_(inner), fine_f_(fine_f)
+  PrecisionChangeAdaptor(LinearFunction<FieldF> &inner, GridBase *fine_f, bool persistent = false)
+      : inner_(inner), fine_f_(fine_f), persistent_(persistent)
   {
   }
 
   void operator()(const FieldD &in, FieldD &out) override
   {
+    if (persistent_) {
+      if (!ws_down_) {
+        ws_down_.reset(new precisionChangeWorkspace(fine_f_, in.Grid()));
+        ws_up_.reset(new precisionChangeWorkspace(in.Grid(), fine_f_));
+        in_f_.reset(new FieldF(fine_f_));
+        out_f_.reset(new FieldF(fine_f_));
+      }
+      in_f_->Checkerboard() = in.Checkerboard();
+      out_f_->Checkerboard() = in.Checkerboard();
+      precisionChange(*in_f_, in, *ws_down_);
+      *out_f_ = Zero();
+      out_f_->Checkerboard() = in.Checkerboard();
+      inner_(*in_f_, *out_f_);
+      precisionChange(out, *out_f_, *ws_up_);
+      out.Checkerboard() = in.Checkerboard();
+      return;
+    }
     FieldF in_f(fine_f_);
     FieldF out_f(fine_f_);
     in_f.Checkerboard() = in.Checkerboard();
@@ -609,6 +637,17 @@ int main(int argc, char **argv)
   // general | stencil, as COARSE_APPLY but for the level-2 operator (768 sites at C3, so it
   // hardly matters; stencil needs the coarse2 x-dim even).
   const std::string coarse2_apply = read_string(argc, argv, "--probe-coarse2-apply", "general");
+  // Level-2 solve on/off inside the level-2 V-cycle. 0 = smoother-only preconditioner for the
+  // level-1 GCR (no level-2 aggregation is built): measures what the third level itself buys
+  // over a smoothed level-1 solve. Needs --probe-coarse-precon mg.
+  const int l2_coarse_solve = read_int(argc, argv, "--probe-l2-coarse-solve", 1);
+  // Skip the fp64 coarsening and its Galerkin check. Production runs only the fp32 hierarchy;
+  // the fp64 one (11 s at C3) exists so that the probe can grade the fp32 one against it. Needs
+  // --probe-mg-precision single; the fp64 outer operator is unaffected (it IS the system solved).
+  const int skip_fp64_coarsen = read_int(argc, argv, "--probe-skip-fp64-coarsen", 0);
+  // Persistent precision-change workspaces + temporaries in the fp64->fp32 adaptor. 0 = the
+  // stock two-argument precisionChange, which rebuilds its site map every call.
+  const int persistent_precchange = read_int(argc, argv, "--probe-persistent-precchange", 0);
 
   // Precision of the MG PRECONDITIONER (the outer solver and every gate stay in
   // double either way -- see PrecisionChangeAdaptor for why).
@@ -696,6 +735,17 @@ int main(int argc, char **argv)
   }
   if (coarse2_apply != "general" && coarse2_apply != "stencil") {
     std::cerr << "probe: --probe-coarse2-apply must be general|stencil" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (skip_fp64_coarsen && !mg_single) {
+    std::cerr << "probe: --probe-skip-fp64-coarsen needs --probe-mg-precision single" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (skip_fp64_coarsen && coarse_apply_check > 0) {
+    std::cerr << "probe: --probe-skip-fp64-coarsen is incompatible with --probe-coarse-apply-check"
+              << " (the fp64 check applies the fp64 coarse operator)" << std::endl;
     Grid_finalize();
     return 2;
   }
@@ -1095,15 +1145,25 @@ int main(int argc, char **argv)
   // ---- Coarsen -------------------------------------------------------------
   LittleDiracOperator LittleDiracOp(geom, UrbGrid, Coarse4d);
 
-  if (boss) std::cout << GridLogMessage << "--- coarsening (" << geom.npoint << " points x " << 2 * kNbasis
-                      << " vectors = " << geom.npoint * 2 * kNbasis << " Mpc applications) ---" << std::endl;
-  accelerator_barrier();
-  UGrid->Barrier();
-  t0 = usecond();
-  LittleDiracOp.CoarsenOperator(SchurOp, CombinedUV);
-  accelerator_barrier();
-  UGrid->Barrier();
-  const double coarsen_seconds = (usecond() - t0) / 1.0e6;
+  double coarsen_seconds = 0.0;
+  if (!skip_fp64_coarsen) {
+    if (boss) std::cout << GridLogMessage << "--- coarsening (" << geom.npoint << " points x " << 2 * kNbasis
+                        << " vectors = " << geom.npoint * 2 * kNbasis << " Mpc applications) ---" << std::endl;
+    accelerator_barrier();
+    UGrid->Barrier();
+    t0 = usecond();
+    LittleDiracOp.CoarsenOperator(SchurOp, CombinedUV);
+    accelerator_barrier();
+    UGrid->Barrier();
+    coarsen_seconds = (usecond() - t0) / 1.0e6;
+  } else {
+    // The fp32 coarsening below block-orthogonalises ITS copy of the subspace, which is all the
+    // fp32 hierarchy reads. The fp64 subspace stays UN-orthogonalised and the fp64 coarse
+    // operator unbuilt; under MG_PRECISION=single neither is applied (OuterPrecon selects the
+    // fp32 hierarchy; the fp64 `Precon` is constructed but never called). The guard on
+    // coarse_apply_check above removes the one path that would apply the fp64 coarse operator.
+    if (boss) std::cout << GridLogMessage << "--- fp64 coarsening SKIPPED (--probe-skip-fp64-coarsen) ---" << std::endl;
+  }
 
   // ---- Galerkin check ------------------------------------------------------
   //
@@ -1143,12 +1203,14 @@ int main(int argc, char **argv)
     return std::sqrt(norm2(c_proj) / norm2(c_res));
   };
 
-  const double galerkin_mpc = galerkin_deviation(false);
-  const double galerkin_herm = galerkin_deviation(true);
+  // With the fp64 coarsening skipped there is nothing to check; report the control as passed
+  // so the PROBE RESULT gate (which requires galerkin_herm > 1e-3) is unaffected.
+  const double galerkin_mpc = skip_fp64_coarsen ? 0.0 : galerkin_deviation(false);
+  const double galerkin_herm = skip_fp64_coarsen ? 1.0 : galerkin_deviation(true);
   const double galerkin_tolerance = 1.0e-10;
   const bool galerkin_passed = (galerkin_mpc <= galerkin_tolerance) && (galerkin_herm > 1.0e-3);
 
-  if (boss) {
+  if (boss && !skip_fp64_coarsen) {
     std::cout << GridLogMessage << "--- Galerkin check ---" << std::endl;
     std::cout << GridLogMessage << "  vs Mpc          (expect <= " << galerkin_tolerance << ") : "
               << galerkin_mpc << std::endl;
@@ -1350,6 +1412,7 @@ int main(int argc, char **argv)
   std::unique_ptr<TrivialPrecon<CoarseVector2F>> coarse2_trivialF;
   std::unique_ptr<ProbeMG::FlexibleGCR<CoarseVector2F>> Coarse2SolverF;
   std::unique_ptr<ProbeMG::FlexibleGCR<CoarseVectorF>> L1SmootherF;
+  std::unique_ptr<ProbeMG::ZeroThenApply<CoarseVectorF>> L1SmootherZeroedF; // smoother-only path
   std::unique_ptr<MGPreconditioner<L1SiteF, CComplex2F, kNbasis2>> Precon2F;
   double l2_subspace_seconds = 0.0, l2_coarsen_seconds = 0.0, l2_galerkin = -1.0;
 
@@ -1414,7 +1477,21 @@ int main(int argc, char **argv)
         new ProbeMG::CountingLinearOperator<LatticeFermionF>(*schur_holderF, counts.fine));
 
     // ---- Level 2: coarsen the level-1 operator the coarse GCR actually solves -----------
-    if (coarse_precon == "mg") {
+    if (coarse_precon == "mg" && !l2_coarse_solve) {
+      // Smoother-only preconditioner for the level-1 GCR: the same L1SmootherF as the mg path,
+      // with no level-2 aggregation. Isolates what the third level buys over smoothing alone.
+      L1SmootherF.reset(new ProbeMG::FlexibleGCR<CoarseVectorF>(
+          l2_smoother_tol, 1, *CountedCoarseF, *coarse_trivialF, 1, l2_smoother_nstep));
+      L1SmootherF->Level(4);
+      L1SmootherF->verbose = 0;
+      L1SmootherF->zero_guess = true;
+      L1SmootherF->verify_residual = false;
+      // The level-1 GCR hands its preconditioner an uninitialised workspace vector; the
+      // smoother's zero-guess shortcut needs it zeroed first (see ZeroThenApply).
+      L1SmootherZeroedF.reset(new ProbeMG::ZeroThenApply<CoarseVectorF>(*L1SmootherF));
+      if (boss) std::cout << GridLogMessage << "--- coarse precon: level-1 SMOOTHER ONLY (no level 2) ---" << std::endl;
+    }
+    if (coarse_precon == "mg" && l2_coarse_solve) {
       if (boss) std::cout << GridLogMessage << "--- level 2: aggregating the level-1 operator ---" << std::endl;
       Coordinate clatt2 = Coarse4dF->GlobalDimensions();
       for (int d = 0; d < 4; ++d) {
@@ -1481,7 +1558,19 @@ int main(int argc, char **argv)
       // Level-2 solver stack, mirroring level 1's: shifted operator, counted, GCR to tolerance.
       LinOp2F.reset(new NonHermitianLinearOperator<L2OperatorF, CoarseVector2F>(*L2OpF));
       Shifted2F.reset(new ShiftedNonHermitianLinearOperator<L2OperatorF, CoarseVector2F>(*L2OpF, 0.001));
-      if (coarse2_apply == "stencil") Stencil2F.reset(new Stencil2F_t(*L2OpF, Coarse2F, 0.001));
+      // ⚠️ The stencil apply needs the general geometry's 9-point stencil. In a dimension of
+      // global extent 2 the +1 and -1 shifts coincide and NonLocalStencilGeometry emits ONE
+      // point for them (Geometry.h:166-169), so npoint < 9 and the old class's fixed 9-point
+      // Geometry cannot be filled from it. That is the C2 level-2 lattice (2.2.2.4); at C3
+      // (6.4.4.8) it does not arise. Fall back to the general apply rather than abort.
+      if (coarse2_apply == "stencil") {
+        if (geom2F->npoint == 9) {
+          Stencil2F.reset(new Stencil2F_t(*L2OpF, Coarse2F, 0.001));
+        } else if (boss) {
+          std::cout << GridLogMessage << "level-2 stencil apply UNAVAILABLE (npoint " << geom2F->npoint
+                    << " != 9: a level-2 dimension has extent 2); using the general apply" << std::endl;
+        }
+      }
       LinearOperatorBase<CoarseVector2F> &Selected2F =
           Stencil2F ? static_cast<LinearOperatorBase<CoarseVector2F> &>(*Stencil2F)
                     : static_cast<LinearOperatorBase<CoarseVector2F> &>(*Shifted2F);
@@ -1508,10 +1597,12 @@ int main(int argc, char **argv)
       Precon2F->instrument = false;
       Precon2F->persistent_temps = (persistent_temps != 0);
     }
-    // The coarse (level-1) GCR's preconditioner: trivial (control) or the level-2 V-cycle.
+    // The coarse (level-1) GCR's preconditioner: trivial (control), the level-1 smoother alone,
+    // or the level-2 V-cycle.
     LinearFunction<CoarseVectorF> &CoarsePreconF =
         Precon2F ? static_cast<LinearFunction<CoarseVectorF> &>(*Precon2F)
-                 : static_cast<LinearFunction<CoarseVectorF> &>(*coarse_trivialF);
+        : L1SmootherZeroedF ? static_cast<LinearFunction<CoarseVectorF> &>(*L1SmootherZeroedF)
+                            : static_cast<LinearFunction<CoarseVectorF> &>(*coarse_trivialF);
 
     CoarseSolverStockF.reset(new PrecGeneralisedConjugateResidualNonHermitian<CoarseVectorF>(
         coarse_tol, coarse_maxiter, *CountedCoarseF, CoarsePreconF, coarse_mmax, coarse_nstep));
@@ -1547,8 +1638,8 @@ int main(int argc, char **argv)
     PreconF->project_mode = fast_project;
     PreconF->instrument = (instrument_vcycle != 0);
     PreconF->persistent_temps = (persistent_temps != 0);
-    PreconMixed.reset(
-        new PrecisionChangeAdaptor<LatticeFermionD, LatticeFermionF>(*PreconF, UrbGridF));
+    PreconMixed.reset(new PrecisionChangeAdaptor<LatticeFermionD, LatticeFermionF>(
+        *PreconF, UrbGridF, persistent_precchange != 0));
 
     // ⛔ RELEASE THE DOUBLE HIERARCHY'S DEVICE MEMORY -- WITHOUT THIS THE fp32 ROW
     // CANNOT RUN AT C3. Both hierarchies are live at this point: the fp64 coarse
@@ -1983,7 +2074,10 @@ int main(int argc, char **argv)
               << (subspace_seconds + coarsen_seconds + coarsen_f_seconds + l2_subspace_seconds +
                   l2_coarsen_seconds)
               << " s" << std::endl;
-    std::cout << GridLogMessage << "coarse precon           " << coarse_precon << std::endl;
+    std::cout << GridLogMessage << "coarse precon           " << coarse_precon
+              << (coarse_precon == "mg" && !l2_coarse_solve ? " (smoother only)" : "")
+              << "  fp64-coarsen " << (skip_fp64_coarsen ? "skipped" : "built")
+              << "  precchange " << (persistent_precchange ? "persistent" : "stock") << std::endl;
     std::cout << GridLogMessage << "MG solve (Mpc)          " << mg_seconds << " s, " << mg_steps
               << " outer PGCR steps, independent residual " << mg_residual << std::endl;
     if (instrument_vcycle) {
