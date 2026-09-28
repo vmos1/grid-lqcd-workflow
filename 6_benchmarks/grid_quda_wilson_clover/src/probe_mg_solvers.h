@@ -541,11 +541,18 @@ public:
 // CG on M†M rather than GCR on M). ⚠️ FlexibleGCR's zero_guess shortcut is WRONG here (the guess
 // is not zero), so the relax path always uses the stock PGCR, whose D1 residual computation is
 // then the necessary one. Typically one round.
+//
+// Task 1 of the 09-28 handoff (§3): `from_subspace` starts each vector from what is already in
+// Agg.subspace[b] (normalised) instead of fresh Gaussian noise, so a Chebyshev pre-filter can
+// hand GCR a start that is already rich in the low modes (method `cheb_gcr` in the probe).
+// Grid's own two-stage generator (Aggregates.h:447, CreateSubspaceChebyshevNew) chains two
+// Chebyshev filters of order 600 and 2500 instead; at C3 that is ~25x the filter cost of ours.
 template <class Aggregates>
 void create_subspace_gcr(GridParallelRNG &RNG,
                          LinearOperatorBase<typename Aggregates::FineField> &DiracOp,
                          Aggregates &Agg, int nn, RealD tol, int rounds, int mmax, int nstep,
-                         Integer maxiter, bool use_fast_gcr, bool quiet, bool relax = false)
+                         Integer maxiter, bool use_fast_gcr, bool quiet, bool relax = false,
+                         bool from_subspace = false)
 {
   typedef typename Aggregates::FineField FineField;
   GridBase *FineGrid = Agg.FineGrid;
@@ -567,8 +574,12 @@ void create_subspace_gcr(GridParallelRNG &RNG,
 
   for (int b = 0; b < nn; b++) {
 
-    Agg.subspace[b] = Zero();
-    gaussian(RNG, noise);
+    if (from_subspace) {
+      noise = Agg.subspace[b];
+    } else {
+      Agg.subspace[b] = Zero();
+      gaussian(RNG, noise);
+    }
     noise = noise * RealD(std::pow(norm2(noise), -0.5));
 
     if (!quiet) {

@@ -594,6 +594,8 @@ int main(int argc, char **argv)
   //          i.e. relax Mpc x = 0 -- QUDA's QUDA_NULL_VECTOR_SETUP. Same GCR knobs.
   //   cheb   Chebyshev filter on Mpc^dag Mpc (Grid's CreateSubspaceChebyshev pattern);
   //          knobs --probe-subspace-cheb-lo / -order, hi from a power method
+  //   cheb_gcr  two-stage (handoff 09-28 §3): the cheb filter, then `rounds` rounds of the gcr
+  //          inverse iteration STARTING from the filtered vector instead of fresh noise
   const std::string subspace_method = read_string(argc, argv, "--probe-subspace-method", "gcr");
   const double subspace_cheb_lo = read_double(argc, argv, "--probe-subspace-cheb-lo", 0.01);
   const int subspace_cheb_order = read_int(argc, argv, "--probe-subspace-cheb-order", 100);
@@ -706,8 +708,9 @@ int main(int argc, char **argv)
     Grid_finalize();
     return 2;
   }
-  if (subspace_method != "gcr" && subspace_method != "relax" && subspace_method != "cheb") {
-    std::cerr << "probe: --probe-subspace-method must be gcr|relax|cheb" << std::endl;
+  if (subspace_method != "gcr" && subspace_method != "relax" && subspace_method != "cheb" &&
+      subspace_method != "cheb_gcr") {
+    std::cerr << "probe: --probe-subspace-method must be gcr|relax|cheb|cheb_gcr" << std::endl;
     Grid_finalize();
     return 2;
   }
@@ -848,7 +851,7 @@ int main(int argc, char **argv)
               << " (QUDA setup_tol 5e-6)" << std::endl;
     std::cout << GridLogMessage << "subspace method     " << subspace_method << " precision "
               << subspace_precision;
-    if (subspace_method == "cheb")
+    if (subspace_method == "cheb" || subspace_method == "cheb_gcr")
       std::cout << " cheb lo " << subspace_cheb_lo << " order " << subspace_cheb_order
                 << " pm-iters " << subspace_pm_iters << " hi-factor " << subspace_cheb_hi_factor;
     std::cout << std::endl;
@@ -1071,11 +1074,15 @@ int main(int argc, char **argv)
     //   relax  Grid's own alternative branch: relax Mpc x = 0 from the noise (QUDA's scheme)
     //   cheb   Chebyshev filter on Mpc^dag Mpc (Grid's CreateSubspaceChebyshev pattern); the
     //          upper edge from a short power method
+    //   cheb_gcr  the cheb filter, then the gcr inverse iteration started from its output;
+    //          the two stages are timed separately (one boss line) since the point is to see
+    //          which of them the setup time went to
     // Generic over the precision: the fp32 path generates on the fp32 Schur operator and
     // converts the vectors UP into the fp64 Aggregation, so both hierarchies still share one
     // null space and everything downstream is unchanged.
     auto generate = [&](auto &Agg, auto &Op, GridParallelRNG &rng, GridBase *rbgrid) {
-      if (subspace_method == "cheb") {
+      if (subspace_method == "cheb" || subspace_method == "cheb_gcr") {
+        const double tc0 = usecond();
         const RealD lambda_max = ProbeMG::power_method_max(Op, rng, rbgrid, cb, subspace_pm_iters, boss);
         // Headroom above the (lower-bound) power-method estimate keeps the whole spectrum
         // inside [lo,hi]; anything above hi is AMPLIFIED, not damped, and overflows fp32.
@@ -1085,6 +1092,20 @@ int main(int argc, char **argv)
         ProbeMG::create_subspace_chebyshev(rng, Op, Agg, kNbasis, subspace_cheb_lo,
                                            subspace_cheb_hi_factor * lambda_max, subspace_cheb_order,
                                            fast_gcr != 0);
+        if (subspace_method == "cheb_gcr") {
+          accelerator_barrier();
+          UGrid->Barrier();
+          const double tc1 = usecond();
+          ProbeMG::create_subspace_gcr(rng, Op, Agg, kNbasis, subspace_tol, subspace_rounds,
+                                       subspace_mmax, subspace_mmax, subspace_maxiter, fast_gcr != 0,
+                                       fast_gcr != 0, false, true);
+          accelerator_barrier();
+          UGrid->Barrier();
+          if (boss)
+            std::cout << GridLogMessage << "cheb_gcr stages: chebyshev+pm " << (tc1 - tc0) / 1.0e6
+                      << " s, gcr " << subspace_rounds << " round(s) " << (usecond() - tc1) / 1.0e6
+                      << " s" << std::endl;
+        }
       } else {
         ProbeMG::create_subspace_gcr(rng, Op, Agg, kNbasis, subspace_tol, subspace_rounds,
                                      subspace_mmax, subspace_mmax, subspace_maxiter, fast_gcr != 0,

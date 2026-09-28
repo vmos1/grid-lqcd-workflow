@@ -102,6 +102,7 @@ SUBSPACE_MAXITER=${SUBSPACE_MAXITER:-30}
 #   gcr    Grid's CreateSubspaceGCR (control): solve Mpc x = noise, SUBSPACE_ROUNDS rounds
 #   relax  Grid's own #else branch: relax Mpc x = 0 from the noise (QUDA's scheme); use ROUNDS=1
 #   cheb   Chebyshev filter on Mpc^dag Mpc; SUBSPACE_CHEB_LO / _ORDER, hi from a power method
+#   cheb_gcr  cheb, then SUBSPACE_ROUNDS gcr rounds started from the filtered vector (same knobs)
 # SUBSPACE_PRECISION=single generates on the fp32 operator (needs MG_PRECISION=single).
 SUBSPACE_METHOD=${SUBSPACE_METHOD:-gcr}
 SUBSPACE_PRECISION=${SUBSPACE_PRECISION:-double}
