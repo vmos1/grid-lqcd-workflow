@@ -1,0 +1,70 @@
+diff --git a/Grid/parallelIO/BinaryIO.h b/Grid/parallelIO/BinaryIO.h
+index 4df9fdf9..59c4632d 100644
+--- a/Grid/parallelIO/BinaryIO.h
++++ b/Grid/parallelIO/BinaryIO.h
+@@ -402,7 +402,7 @@ class BinaryIO {
+       bstimer.Stop();
+     }
+     
+-    if ( control & BINARYIO_WRITE ) { 
++    if ( control & BINARYIO_WRITE ) {
+ 
+       bstimer.Start();
+       NerscChecksum(grid,iodata,nersc_csum);
+@@ -603,7 +603,7 @@ class BinaryIO {
+     // Munge [ .e.g 3rd row recon ]
+     //////////////////////////////////////////////////////////////////////////////
+     GridStopWatch timer; timer.Start();
+-    unvectorizeToLexOrdArray(scalardata,Umu);    
++    unvectorizeToLexOrdArray(scalardata,Umu);
+ 
+     thread_for(x, lsites, { munge(scalardata[x],iodata[x]); });
+ 
+diff --git a/Grid/parallelIO/IldgIO.h b/Grid/parallelIO/IldgIO.h
+index 8ed7df5b..4ab796e9 100644
+--- a/Grid/parallelIO/IldgIO.h
++++ b/Grid/parallelIO/IldgIO.h
+@@ -431,7 +431,6 @@ class GridLimeWriter : public BinaryIO
+     ////////////////////////////////////////////////////////////////////
+     
+     GridBase *grid = field.Grid();
+-    GRID_ASSERT(boss_node == field.Grid()->IsBoss() );
+ 
+     FieldNormMetaData FNMD; FNMD.norm2 = norm2(field);
+ 
+@@ -456,7 +455,7 @@ class GridLimeWriter : public BinaryIO
+     ////////////////////////////////////////////////
+     uint64_t offset1;
+     if ( boss_node ) {
+-      offset1 = ftello(File);    
++      offset1 = ftello(File);
+     }
+     grid->Broadcast(0,(void *)&offset1,sizeof(offset1));
+ 
+@@ -621,8 +620,10 @@ class IldgWriter : public ScidacWriter {
+     uint64_t PayloadSize = LFN.size();
+     int err;
+     createLimeRecordHeader(ILDG_DATA_LFN, 0 , 0, PayloadSize);
+-    err=limeWriteRecordData(const_cast<char*>(LFN.c_str()), &PayloadSize,LimeW); GRID_ASSERT(err>=0);
+-    err=limeWriterCloseRecord(LimeW); GRID_ASSERT(err>=0);
++    if ( boss_node ) {
++      err=limeWriteRecordData(const_cast<char*>(LFN.c_str()), &PayloadSize,LimeW); GRID_ASSERT(err>=0);
++      err=limeWriterCloseRecord(LimeW); GRID_ASSERT(err>=0);
++    }
+   }
+ 
+   ////////////////////////////////////////////////////////////////
+@@ -863,10 +864,10 @@ class IldgReader : public GridLimeReader {
+     }
+ 
+     //////////////////////////////////////////////////////
+-    // Minimally must find binary segment and checksum
+-    // Since this is an ILDG reader require ILDG format
++    // Minimally must find binary segment and checksum.
++    // The ILDG LFN record is optional — chroma-produced ILDG configs (which
++    // otherwise satisfy the ILDG spec) don't always include it.
+     //////////////////////////////////////////////////////
+-    GRID_ASSERT(found_ildgLFN);
+     GRID_ASSERT(found_ildgBinary);
+     GRID_ASSERT(found_ildgFormat);
+     GRID_ASSERT(found_scidacChecksum);

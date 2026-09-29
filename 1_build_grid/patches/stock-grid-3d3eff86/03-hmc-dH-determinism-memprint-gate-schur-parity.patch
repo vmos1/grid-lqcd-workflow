@@ -1,0 +1,163 @@
+diff --git a/Grid/qcd/action/gauge/GaugeImplTypes.h b/Grid/qcd/action/gauge/GaugeImplTypes.h
+index 95b69290..d25f9a0c 100644
+--- a/Grid/qcd/action/gauge/GaugeImplTypes.h
++++ b/Grid/qcd/action/gauge/GaugeImplTypes.h
+@@ -153,14 +153,18 @@ public:
+   }
+     
+   static inline RealD FieldSquareNorm(Field& U){
+-    LatticeComplex Hloc(U.Grid());
+-    Hloc = Zero();
++    // For antihermitian SU(N) momentum P_mu: Tr(P_mu^2) = -|P_mu|_Frob^2.
++    // The lattice sum Σ_x Tr(P_mu^2) = -norm2(P_mu).  Using norm2 instead of
++    // Re(sum(trace(P*P))) gives a bit-deterministic reduction across runs;
++    // the previous LatticeComplex sum's reduction order was non-deterministic
++    // on GPU (~10⁻⁵ relative noise that was the dominant FP error in the HMC
++    // ΔH) while norm2's sum-of-squares pathway is deterministic at this scale.
++    RealD total = 0.0;
+     for (int mu = 0; mu < Nd; mu++) {
+       auto Umu = PeekIndex<LorentzIndex>(U, mu);
+-      Hloc += trace(Umu * Umu);
++      total -= norm2(Umu);
+     }
+-    auto Hsum = TensorRemove(sum(Hloc));
+-    return Hsum.real();
++    return total;
+   }
+ 
+   static inline void Project(Field &U) {
+diff --git a/Grid/qcd/action/pseudofermion/EvenOddSchurDifferentiable.h b/Grid/qcd/action/pseudofermion/EvenOddSchurDifferentiable.h
+index 29408ea2..42c606be 100644
+--- a/Grid/qcd/action/pseudofermion/EvenOddSchurDifferentiable.h
++++ b/Grid/qcd/action/pseudofermion/EvenOddSchurDifferentiable.h
+@@ -50,7 +50,7 @@ public:
+   SchurDifferentiableOperator (Matrix &Mat) : SchurDiagMooeeOperator<Matrix,FermionField>(Mat) {};
+ 
+   void MpcDeriv(GaugeField &Force,const FermionField &U,const FermionField &V) {
+-        
++
+     GridBase *fgrid   = this->_Mat.FermionGrid();
+     GridBase *fcbgrid = this->_Mat.FermionRedBlackGrid();
+ 
+@@ -60,9 +60,8 @@ public:
+     conformable(fcbgrid,U.Grid());
+     conformable(fcbgrid,V.Grid());
+ 
+-    // Assert the checkerboard?? or code for either
+-    GRID_ASSERT(U.Checkerboard()==Odd);
+-    GRID_ASSERT(V.Checkerboard()==U.Checkerboard());
++    GRID_ASSERT(U.Checkerboard()==V.Checkerboard());
++    const bool input_odd = (U.Checkerboard()==Odd);
+ 
+     // NOTE Guido: WE DO NOT WANT TO USE THE ucbgrid GRID FOR THE FORCE
+     // it is not conformable with the HMC force field
+@@ -73,20 +72,23 @@ public:
+     GaugeField ForceE(forcecb);
+ 
+ 
+-    //  X^dag Der_oe MeeInv Meo Y
++    //  X^dag Der_oe MeeInv Meo Y      (input on Odd parity)
++    //  X^dag Der_eo MooInv Moe Y      (input on Even parity)
+     // Use Mooee as nontrivial but gauge field indept
+-    this->_Mat.Meooe   (V,tmp1);      // odd->even -- implicit -0.5 factor to be applied
+-    this->_Mat.MooeeInv(tmp1,tmp2);   // even->even 
+-    this->_Mat.MoeDeriv(ForceO,U,tmp2,DaggerNo);
+-    //  Accumulate X^dag M_oe MeeInv Der_eo Y
+-    this->_Mat.MeooeDag   (U,tmp1);    // even->odd -- implicit -0.5 factor to be applied
+-    this->_Mat.MooeeInvDag(tmp1,tmp2); // even->even 
+-    this->_Mat.MeoDeriv(ForceE,tmp2,V,DaggerNo);
+-          
++    this->_Mat.Meooe   (V,tmp1);      // input parity → other parity
++    this->_Mat.MooeeInv(tmp1,tmp2);   // diagonal in 'other'
++    if (input_odd) this->_Mat.MoeDeriv(ForceO,U,tmp2,DaggerNo);
++    else           this->_Mat.MeoDeriv(ForceE,U,tmp2,DaggerNo);
++    //  Accumulate the conjugate term
++    this->_Mat.MeooeDag   (U,tmp1);
++    this->_Mat.MooeeInvDag(tmp1,tmp2);
++    if (input_odd) this->_Mat.MeoDeriv(ForceE,tmp2,V,DaggerNo);
++    else           this->_Mat.MoeDeriv(ForceO,tmp2,V,DaggerNo);
++
+     GRID_ASSERT(ForceE.Checkerboard()==Even);
+     GRID_ASSERT(ForceO.Checkerboard()==Odd);
+ 
+-    setCheckerboard(Force,ForceE); 
++    setCheckerboard(Force,ForceE);
+     setCheckerboard(Force,ForceO);
+     Force=-Force;
+ 
+@@ -95,7 +97,7 @@ public:
+ 
+ 
+   void MpcDagDeriv(GaugeField &Force,const FermionField &U,const FermionField &V) {
+-        
++
+     GridBase *fgrid   = this->_Mat.FermionGrid();
+     GridBase *fcbgrid = this->_Mat.FermionRedBlackGrid();
+ 
+@@ -105,32 +107,27 @@ public:
+     conformable(fcbgrid,U.Grid());
+     conformable(fcbgrid,V.Grid());
+ 
+-    // Assert the checkerboard?? or code for either
+-    GRID_ASSERT(V.Checkerboard()==Odd);
+-    GRID_ASSERT(V.Checkerboard()==V.Checkerboard());
++    GRID_ASSERT(U.Checkerboard()==V.Checkerboard());
++    const bool input_odd = (V.Checkerboard()==Odd);
+ 
+-    // NOTE Guido: WE DO NOT WANT TO USE THE ucbgrid GRID FOR THE FORCE
+-    // it is not conformable with the HMC force field
+-    // INHERIT FROM THE Force field instead
+     GridRedBlackCartesian* forcecb = new GridRedBlackCartesian(Force.Grid());
+     GaugeField ForceO(forcecb);
+     GaugeField ForceE(forcecb);
+ 
+-    //  X^dag Der_oe MeeInv Meo Y
+-    // Use Mooee as nontrivial but gauge field indept
+-    this->_Mat.MeooeDag   (V,tmp1);      // odd->even -- implicit -0.5 factor to be applied
+-    this->_Mat.MooeeInvDag(tmp1,tmp2);   // even->even 
+-    this->_Mat.MoeDeriv(ForceO,U,tmp2,DaggerYes);
+-          
+-    //  Accumulate X^dag M_oe MeeInv Der_eo Y
+-    this->_Mat.Meooe   (U,tmp1);    // even->odd -- implicit -0.5 factor to be applied
+-    this->_Mat.MooeeInv(tmp1,tmp2); // even->even 
+-    this->_Mat.MeoDeriv(ForceE,tmp2,V,DaggerYes);
++    this->_Mat.MeooeDag   (V,tmp1);
++    this->_Mat.MooeeInvDag(tmp1,tmp2);
++    if (input_odd) this->_Mat.MoeDeriv(ForceO,U,tmp2,DaggerYes);
++    else           this->_Mat.MeoDeriv(ForceE,U,tmp2,DaggerYes);
++
++    this->_Mat.Meooe   (U,tmp1);
++    this->_Mat.MooeeInv(tmp1,tmp2);
++    if (input_odd) this->_Mat.MeoDeriv(ForceE,tmp2,V,DaggerYes);
++    else           this->_Mat.MoeDeriv(ForceO,tmp2,V,DaggerYes);
+ 
+     GRID_ASSERT(ForceE.Checkerboard()==Even);
+     GRID_ASSERT(ForceO.Checkerboard()==Odd);
+ 
+-    setCheckerboard(Force,ForceE); 
++    setCheckerboard(Force,ForceE);
+     setCheckerboard(Force,ForceO);
+     Force=-Force;
+ 
+diff --git a/Grid/qcd/hmc/integrators/Integrator.h b/Grid/qcd/hmc/integrators/Integrator.h
+index f497f749..d7dd65c6 100644
+--- a/Grid/qcd/hmc/integrators/Integrator.h
++++ b/Grid/qcd/hmc/integrators/Integrator.h
+@@ -137,11 +137,15 @@ public:
+ 
+       double start_force = usecond();
+ 
+-      MemoryManager::Print();
++      // MemoryManager::Print() each call cudaMemGetInfo's which synchronizes
++      // the device — gates async kernel overlap and dominates wallclock per
++      // call. Disabled by default; INTEGRATOR_VERBOSE_MEM=1 re-enables.
++      bool _verbose_mem = std::getenv("INTEGRATOR_VERBOSE_MEM") != nullptr;
++      if (_verbose_mem) MemoryManager::Print();
+       as[level].actions.at(a)->deriv_timer_start();
+       as[level].actions.at(a)->deriv(Smearer, force);  // deriv should NOT include Ta
+       as[level].actions.at(a)->deriv_timer_stop();
+-      MemoryManager::Print();
++      if (_verbose_mem) MemoryManager::Print();
+ 
+       auto name = as[level].actions.at(a)->action_name();
+ 
