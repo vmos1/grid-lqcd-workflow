@@ -66,7 +66,15 @@ namespace {
 // nbasis vectors and doubles them with gamma5 into a 2*nbasis aggregation => 48
 // coarse dof per block. QUDA reaches the same 48 via n_vec=24 with
 // spin_block_size[0]=2. Compare 48 against 48, never 24 against 24.
-constexpr int kNbasis = 24;
+//
+// Handoff 09-28 §4 lever 3: overridable at build time (`NBASIS=32` in build_probe_grid_mg.sh
+// -> -DPROBE_NBASIS=32, binary suffix _nb32) so the default binary stays at 24 and every
+// earlier number stays reproducible. The 09-29 step-count rows put the limit here: better
+// null vectors plateau at 31 steps, and block size never moved the 2-level count.
+#ifndef PROBE_NBASIS
+#define PROBE_NBASIS 24
+#endif
+constexpr int kNbasis = PROBE_NBASIS;
 // Level-2 null vectors (workstream C). QUDA production: <NullVectors>24 32</NullVectors>, and
 // spin_block_size = 1 below level 0, so level 2 has 32 dof with no chirality doubling.
 constexpr int kNbasis2 = 32;
@@ -828,7 +836,7 @@ int main(int argc, char **argv)
                                       : " (asymmetric; QUDA MG CANNOT coarsen this)")
               << std::endl;
     std::cout << GridLogMessage << "nbasis            " << kNbasis << " -> coarse dof " << 2 * kNbasis
-              << " (gamma5 doubled; matches QUDA n_vec=24 x spin_block_size=2)" << std::endl;
+              << " (gamma5 doubled; QUDA production is n_vec=24 x spin_block_size=2 = 48)" << std::endl;
     std::cout << GridLogMessage << "coarse   mmax/nstep " << coarse_mmax << "/" << coarse_nstep << std::endl;
     std::cout << GridLogMessage << "smoother mmax/nstep " << smoother_mmax << "/" << smoother_nstep
               << " tol " << smoother_tol << " maxiter " << smoother_maxiter << std::endl;

@@ -60,6 +60,13 @@ if [[ "${NVTX:-0}" == "1" ]]; then
   BIN="${BIN}_nvtx"
   LOG="${LOG%.log}_nvtx.log"
 fi
+# NBASIS=<n> builds a SEPARATE binary (`..._nb<n>`) with n level-1 null vectors (2n coarse
+# dof after gamma5 doubling); the default binary keeps the source default (24).
+if [[ -n "${NBASIS:-}" ]]; then
+  CXXFLAGS="${CXXFLAGS} -DPROBE_NBASIS=${NBASIS}"
+  BIN="${BIN}_nb${NBASIS}"
+  LOG="${LOG%.log}_nb${NBASIS}.log"
+fi
 LDFLAGS="$(${GRID_CONFIG} --ldflags) ${GRID_EXTRA_LDFLAGS}"
 LIBS="$(${GRID_CONFIG} --libs)"
 
