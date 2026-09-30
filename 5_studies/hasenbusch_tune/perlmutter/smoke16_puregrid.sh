@@ -105,7 +105,10 @@ fi
 #   STRANGE_EVEN, NO_METROP, IMPORT_CFG    reset, then set below as needed
 while read -r v; do
   unset "$v"
-done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|STRANGE_EVEN$|NO_METROP$|IMPORT_CFG$)')
+done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|STRANGE_EVEN$|NO_METROP$|IMPORT_CFG$)' | grep -v -E '^(HASEN_GRID_MG_|GRID_MG_)')
+# Kept on purpose (not scrubbed): HASEN_GRID_MG_RUNGS and GRID_MG_* select and tune the
+# pure-Grid multigrid rung solver (M2, 2026_09_29_pure_grid_m2_mg_solver_design.md).
+# Unset = the plain-CG default binary behaviour; the ENV line below records them.
 N_QUDA_ENV=$(compgen -e | grep -c '^QUDA_' || true)
 [ "$N_QUDA_ENV" -eq 0 ] || die "QUDA_* variables still set after clearing"
 
@@ -183,7 +186,10 @@ export MPICH_OFI_NIC_POLICY=GPU                           # halo-nic fix (L122);
 export OMP_NUM_THREADS=8                                  # run_probe_grid_mg.sh
 # Decomposition: 4 ranks split T, as every 4-rank 16^3 driver recipe does
 # (three_level_recheck_tol11_16.sh: --mpi 1.1.1.4); local volume 16.16.16.12.
-MPI_GEOM=1.1.1.4
+# MPI_GEOM is overridable (4 ranks in every case): the Grid-MG runs need 1.1.2.2, because
+# 1.1.1.4 leaves a level-1 coarse T extent of 3 that the fp32 SIMD layout cannot split
+# (test_grid_mg_odd.cc header). Runs to be compared must share the same MPI_GEOM.
+MPI_GEOM=${MPI_GEOM:-1.1.1.4}
 NTASKS=4
 # Grid flags from run_probe_grid_mg.sh. No --device-mem: the cap exists for the
 # MG PaddedCell raw allocations (run_probe_grid_mg.sh DEVICE_MEM_MB note), this
@@ -240,13 +246,14 @@ GRID_SHA=${GRID_HASH_LINE:0:40}
 GRID_SHA=${GRID_SHA:-unknown}
 case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
 
-printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_FLAGS="%s"\n' \
+printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_ENV="%s" GRID_FLAGS="%s"\n' \
   "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
   "$LATT" "$MPI_GEOM" "$NTASKS" "$(basename "$IMPORT_CFG")" "$HMC_SEED_OFFSET" "$N_TRAJ" \
   "$MDSTEPS" "$TRAJL" "$INTEGRATOR" "$GAUGE_INNER_MULT" "$HASEN_LADDER" "$HASEN_TAIL_LEVEL" \
   "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \
   "$RAT_LO" "$RAT_HI" "$RAT_DEGREE" "$TUNE_CG_TOL_DERIV" "$TUNE_CG_TOL_ACTION" \
   "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" "$MPICH_GPU_IPC_ENABLED" "$MPICH_RDMA_ENABLED_CUDA" \
+  "${HASEN_GRID_MG_RUNGS:-none}" "$(compgen -e | grep '^GRID_MG_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
   "${GRID_ARGS[*]}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"

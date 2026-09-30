@@ -1,0 +1,34 @@
+--- a/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h
++++ b/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h
+@@ -367,6 +367,11 @@
+     ///////////////////////////////////////////////////////////////////////
+     FineField phaV(grid); // Phased block basis vector
+     FineField MphaV(grid);// Matrix applied
++    // Honour the checkerboard of the subspace: on a red-black fine grid the
++    // temporaries default to Even, and an Odd subspace then aborts in the
++    // checkerboard checks of blockZAXPY / the expression engine.
++    phaV.Checkerboard()  = Subspace.subspace[0].Checkerboard();
++    MphaV.Checkerboard() = Subspace.subspace[0].Checkerboard();
+     CoarseVector coarseInner(CoarseGrid());
+ 
+     std::vector<CoarseVector> ComputeProj(npoint,CoarseGrid());
+@@ -527,6 +532,19 @@
+     typedef typename CComplex::scalar_type SComplex;
+     FineComplexField one(grid); one=SComplex(1.0);
+     FineComplexField zz(grid); zz = Zero();
++    // Honour the checkerboard of the subspace: on a red-black fine grid every
++    // temporary above defaults to Even (Lattice_base.h), so an Odd subspace
++    // aborts in CBFromExpression at `phaF[p]*V.subspace[i]`. Setting the
++    // checkerboards here makes coarsening parity-agnostic; blockZAXPY copies
++    // the checkerboard of `one` onto phaF[p].
++    {
++      const int cb = V.subspace[0].Checkerboard();
++      one.Checkerboard()   = cb;
++      zz.Checkerboard()    = cb;
++      phaV.Checkerboard()  = cb;
++      MphaV.Checkerboard() = cb;
++      for(int p=0;p<npoint;p++) phaF[p].Checkerboard() = cb;
++    }
+     tphase=-usecond();
+     for(int p=0;p<npoint;p++){ // Loop over momenta in npoint
+       /////////////////////////////////////////////////////

@@ -91,12 +91,29 @@ for h in $(cd "$HB/include" && find Grid -name '*.h'); do
   fi
 done
 
+# Patch 04 (parity-agnostic CoarsenOperator) must be in the tree: the driver's opt-in
+# Grid-MG route (HASEN_GRID_MG_RUNGS, src/grid_mg/) coarsens on the Odd checkerboard and
+# aborts without it. Same check as build_test_grid_mg.sh.
+GCM=$GRID_SOURCE/Grid/algorithms/multigrid/GeneralCoarsenedMatrix.h
+N04=$(grep -c 'Honour the checkerboard of the subspace' "$GCM" || true)
+if [ "$N04" -lt 2 ]; then
+  echo "ERROR: $GCM does not carry patch 04 (found $N04 of 2 hunks)." >&2
+  echo "       Apply 1_build_grid/patches/stock-grid-3d3eff86/04-*.patch to the staged tree." >&2
+  exit 1
+fi
+echo "OK: patch 04 present in $GCM ($N04 hunks)."
+
 SRC=${SRC:-$HB/src/gen_qcd_hasenbusch_tune_compact_schur.cc}
 BIN=${BIN:-$HB/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 mkdir -p "$(dirname "$BIN")"
 
 CXX=$("$GRID_CONFIG" --cxx)
-CXXFLAGS="-I$HB/include $("$GRID_CONFIG" --cxxflags) -I$GRID_SOURCE -I$GRID_BUILD/Grid"
+# INCLUDE ORDER: $HB/include, $HB/src ("grid_mg/..."), the staged Grid SOURCE tree and its
+# build dir (Config.h) all come BEFORE grid-config's flags. grid-config --cxxflags carries
+# -I<prefix>/include, a `make install` made before patch 04 was applied to the source tree,
+# so its GeneralCoarsenedMatrix.h is the unpatched one (the only header that differs); with
+# grid-config first it would shadow the patched copy. Same order as build_test_grid_mg.sh.
+CXXFLAGS="-I$HB/include -I$HB/src -I$GRID_SOURCE -I$GRID_BUILD/Grid $("$GRID_CONFIG" --cxxflags)"
 LDFLAGS="$("$GRID_CONFIG" --ldflags) -L$GRID_BUILD/Grid"
 LIBS=$("$GRID_CONFIG" --libs)
 
@@ -104,13 +121,28 @@ echo "Compiler:    $CXX"
 echo "GRID_CONFIG: $GRID_CONFIG"
 echo "GRID_SOURCE: $GRID_SOURCE"
 echo "GRID_BUILD:  $GRID_BUILD"
-echo "Include:     $HB/include (first)"
+echo "Include:     $HB/include (first), $HB/src, $GRID_SOURCE, $GRID_BUILD/Grid, then grid-config"
 echo "Source:      $SRC"
 echo "Binary:      $BIN"
+
+# The dependency file (written during the compile, no extra pass) proves which
+# GeneralCoarsenedMatrix.h was compiled: it must be the patched source-tree copy.
+DEPS=$BIN.d
+check_gcm_used() {
+  local used
+  used=$(tr ' \\' '\n\n' < "$DEPS" | grep 'multigrid/GeneralCoarsenedMatrix.h$' | head -1)
+  if [ -z "$used" ] || [ "$(readlink -f "$used")" != "$(readlink -f "$GCM")" ]; then
+    echo "ERROR: compiled GeneralCoarsenedMatrix.h = '${used:-none}', expected $GCM (patch 04)." >&2
+    exit 1
+  fi
+  echo "OK: compiled GeneralCoarsenedMatrix.h is the patched one: $used"
+}
+
 echo "Building PURE-GRID against STOCK Grid (no -DGRID_HAVE_QUDA) ..."
-$CXX $CXXFLAGS -o "$BIN" "$SRC" $LDFLAGS $LIBS
+$CXX $CXXFLAGS -MD -MF "$DEPS" -o "$BIN" "$SRC" $LDFLAGS $LIBS
 
 echo "Done: $BIN"
+check_gcm_used
 echo "--- sanity: libGrid statically in, mpfr/cuda/mpi dynamic, NO libquda, 0 'not found' ---"
 LDD_OUT=$(ldd "$BIN" 2>&1) || { echo "ERROR: ldd failed on $BIN:" >&2; echo "$LDD_OUT" >&2; exit 1; }
 

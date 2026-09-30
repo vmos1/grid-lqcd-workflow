@@ -35,6 +35,10 @@
 //                  action (cg_tol_act) solves through plain QUDA CG instead of
 //                  Grid mixed-precision CG.  The tail heatbath needs no solve
 //                  (phi = Mpc^dag eta), so it has no QUDA variant.
+//   HASEN_GRID_MG_RUNGS  Comma-separated ratio-rung indices (the k of "PF<k>")
+//                  whose deriv/action solves run through the pure-Grid multigrid
+//                  (src/grid_mg/, tunables GRID_MG_*); the lowest listed rung
+//                  donates the one shared hierarchy.  Unset = Grid CG as before.
 //   N_TRAJ         Number of trajectories (default 5)
 //   MDSTEPS        MD steps per trajectory (default 20)
 //   IMPORT_CFG     Path to starting gauge config (NERSC or Chroma LIME)
@@ -69,6 +73,10 @@
 #include <Grid/qcd/observables/polyakov_loop.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMixedPrec.h>
 #include <Grid/algorithms/iterative/ConjugateGradientMultiShiftMixedPrec.h>
+// Pure-Grid multigrid rung solver (HASEN_GRID_MG_RUNGS): header-only, in src/grid_mg/
+// (see its PROVENANCE.md).  Nothing in it runs unless HASEN_GRID_MG_RUNGS is set.
+#include "grid_mg/grid_mg_schur_solver.h"
+#include "grid_mg/ratio_action_rung_solver.h"
 #ifdef GRID_HAVE_QUDA
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
@@ -519,6 +527,12 @@ int main(int argc, char **argv) {
   // A rung may only be routed one way; precedence when the same rung is listed more than once:
   // HASEN_MG_RUNG > HASEN_MG_SHARED_RUNGS > HASEN_QUDA_CG_RUNGS.  All accept comma-separated lists.
   int n_pf = n_ops - 1;
+  // Pure-Grid multigrid (HASEN_GRID_MG_RUNGS, parsed and built below): one hierarchy at the
+  // donor rung's mass and one GridMGSchurSolver per listed rung.  Declared HERE, at main()'s
+  // scope and before RatioPF, so they outlive the ratio actions that reference them and the
+  // integrator.  Both stay empty (nothing constructed) when HASEN_GRID_MG_RUNGS is unset.
+  std::unique_ptr<GridMGHierarchy> GridMGH;
+  std::vector<std::unique_ptr<GridMGSchurSolver>> GridMGRungSolver(n_pf);
   std::vector<std::unique_ptr<Action<LatticeGaugeField>>> RatioPF;
 #ifdef GRID_HAVE_QUDA
   std::vector<std::unique_ptr<QudaRungSolverBase>> QudaRungSolver(n_pf);
@@ -619,6 +633,96 @@ int main(int argc, char **argv) {
       std::cout << GridLogMessage << "[FORCES_ONLY] de-routed skipped rungs:";
       for (int k : fo_skip) std::cout << " " << k;
       std::cout << std::endl;
+    }
+  }
+  // ── HASEN_GRID_MG_RUNGS: pure-Grid multigrid rung solver (no QUDA) ─────────
+  // HASEN_GRID_MG_RUNGS=<csv> -- these rungs' DerivativeSolver AND ActionSolver (both solve
+  //   Mpc(DenOp) at ladder[k]; one GridMGSchurSolver per rung fills both slots, at cg_tol_drv,
+  //   as the QUDA hybrid does) run a fresh fp64 flexible GCR on the action's own operator,
+  //   preconditioned by ONE fp32 three-level multigrid (the gq-mg `best2` recipe, src/grid_mg/,
+  //   tunables GRID_MG_* in grid_mg_params.h).  The hierarchy sits on LightOpsF[k0], k0 = the
+  //   LOWEST listed rung (the donor), and is built lazily at the donor's first solve; every
+  //   other listed rung shares it unchanged (GCR at its own mass, donor's hierarchy).  Only the
+  //   donor imports the gauge into it (GridMGSchurSolver::SetGauge), which is exact because the
+  //   donor's monomial is pushed -- hence refreshed, evaluated and differentiated -- before
+  //   every higher-index rung's, on the same gauge field.  The heatbath stays CG_action.
+  //   Mutually exclusive with every QUDA rung route.  Unset or empty = nothing here runs: no
+  //   hierarchy, no solver, no output.  Spec: __docs/2026_09_29_pure_grid_m2_mg_solver_design.md
+  //   section 3.
+  const char *grid_mg_env = std::getenv("HASEN_GRID_MG_RUNGS");
+  const bool grid_mg_on = grid_mg_env && *grid_mg_env;
+  std::set<int> grid_mg_rungs;       // routed to Grid-MG (after FORCES_ONLY de-routing)
+  std::set<int> grid_mg_fo_skipped;  // listed, but dropped by a FORCES_ONLY skip
+  int grid_mg_donor = -1;
+  if (grid_mg_on) {
+    for (const char *q : {"HASEN_MG_RUNG", "HASEN_MG_SHARED_RUNGS", "HASEN_QUDA_CG_RUNGS",
+                          "HASEN_MG_HEATBATH_RUNGS", "HASEN_QUDA_CG_HEATBATH_RUNGS"}) {
+      if (const char *v = std::getenv(q); v && *v) {
+        std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << " and " << q << "=" << v
+                  << " are both set: a rung has ONE solver route (pure-Grid MG or QUDA). "
+                     "Unset one of them.\n";
+        exit(1);
+      }
+    }
+    // Strict parse: a typo must not silently become rung 0 (atoi would make it so).
+    std::stringstream ss(grid_mg_env);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      if (tok.empty()) continue;
+      char *end = nullptr;
+      const long k = std::strtol(tok.c_str(), &end, 10);
+      if (end == tok.c_str() || *end != '\0') {
+        std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << ": '" << tok
+                  << "' is not a rung index.\n";
+        exit(1);
+      }
+      if (k < 0 || k >= n_pf) {  // only ratio rungs; the tail is not routable
+        std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << ": rung " << k
+                  << " is not a ratio rung (need 0 <= k < " << n_pf << ", the ladder's "
+                  << n_pf << " ratio rungs).\n";
+        exit(1);
+      }
+      grid_mg_rungs.insert((int)k);
+    }
+    if (grid_mg_rungs.empty()) {
+      std::cerr << "HASEN_GRID_MG_RUNGS=" << grid_mg_env << " lists no rung.\n";
+      exit(1);
+    }
+    // FORCES_ONLY: a skipped rung never solves, so it must not be the donor (the hierarchy
+    // imports its gauge only through the donor): drop skipped rungs, as the QUDA lists above
+    // are de-routed, and the lowest SURVIVING listed rung becomes the donor.
+    if (std::getenv("FORCES_ONLY") != nullptr) {
+      std::set<int> fo_skip = parse_rung_list("FORCES_SKIP_RUNGS");
+      if (std::getenv("FORCES_SKIP_LIGHT") != nullptr)
+        for (int k = 0; k < n_pf; ++k) fo_skip.insert(k);
+      for (int k : fo_skip)
+        if (grid_mg_rungs.erase(k)) grid_mg_fo_skipped.insert(k);
+      if (!grid_mg_fo_skipped.empty()) {
+        std::cout << GridLogMessage << "[FORCES_ONLY] Grid-MG: de-routed skipped rungs:";
+        for (int k : grid_mg_fo_skipped) std::cout << " " << k;
+        std::cout << " (donor = lowest surviving listed rung)" << std::endl;
+      }
+    }
+    if (!grid_mg_rungs.empty()) {
+      const int k0 = *grid_mg_rungs.begin();
+      grid_mg_donor = k0;
+      GridMGH = std::make_unique<GridMGHierarchy>(*LightOpsF[k0], &GridF, &RBGridF, Odd,
+                                                  GridMGParams::from_env(),
+                                                  "PF" + std::to_string(k0) + " hierarchy");
+      for (int k : grid_mg_rungs) {
+        if (k < k0)  // cannot happen: k0 is the set's minimum
+          std::cout << GridLogMessage << "[Ladder] NOTE: Grid-MG rung " << k
+                    << " is below the donor rung " << k0
+                    << ": it would solve before the donor imports the gauge" << std::endl;
+        GridMGRungSolver[k] = std::make_unique<GridMGSchurSolver>(
+            *GridMGH, cg_tol_drv, Odd, "PF" + std::to_string(k), k == k0);
+      }
+      std::cout << GridLogMessage << "[Ladder] Grid-MG hierarchy: donor rung " << k0
+                << " mass=" << ladder[k0] << " cb=Odd fp32, outer fp64 FGCR tol=" << cg_tol_drv
+                << " | " << GridMGH->Params().Summary() << std::endl;
+    } else {
+      std::cout << GridLogMessage << "[Ladder] Grid-MG: every listed rung is skipped by "
+                                     "FORCES_ONLY; no hierarchy built" << std::endl;
     }
   }
 #ifdef GRID_HAVE_QUDA
@@ -797,11 +901,32 @@ int main(int argc, char **argv) {
                      "a QUDA rung solver for gauge residency).\n";
         exit(1);
       }
-      RatioPF.emplace_back(
-          std::make_unique<TwoFlavourSchurCloverRatioAction<WilsonImplR, WCF>>(
-              *LightOps[k+1],  // NumOp = heavier mass
-              *LightOps[k],    // DenOp = lighter mass
-              CG_deriv, CG_action));
+      if (GridMGRungSolver[k]) {
+        // HASEN_GRID_MG_RUNGS: Grid-MG for deriv + S (Mpc(DenOp)), plain CG_action heatbath.
+        RatioPF.emplace_back(
+            std::make_unique<TwoFlavourSchurCloverRatioActionRungSolver<WilsonImplR, WCF>>(
+                *LightOps[k+1],  // NumOp = heavier mass
+                *LightOps[k],    // DenOp = lighter mass
+                *GridMGRungSolver[k], CG_action));
+      } else {
+        RatioPF.emplace_back(
+            std::make_unique<TwoFlavourSchurCloverRatioAction<WilsonImplR, WCF>>(
+                *LightOps[k+1],  // NumOp = heavier mass
+                *LightOps[k],    // DenOp = lighter mass
+                CG_deriv, CG_action));
+      }
+      if (grid_mg_on)
+        std::cout << GridLogMessage << "[Ladder] rung " << k
+                  << " DerivativeSolver/ActionSolver = "
+                  << (!GridMGRungSolver[k]
+                          ? std::string(grid_mg_fo_skipped.count(k)
+                                            ? "Grid-CG (Grid-MG de-routed: FORCES_ONLY skip)"
+                                            : "Grid-CG")
+                      : k == grid_mg_donor
+                          ? std::string("Grid-MG donor (builds the fp32 hierarchy at this mass)")
+                          : "Grid-MG shared (GCR at own mass, rung " +
+                                std::to_string(grid_mg_donor) + "'s hierarchy)")
+                  << ", HeatbathSolver = Grid CG, mass=" << ladder[k] << std::endl;
     }
     RatioPF.back()->is_smeared = true;
   }
@@ -1093,6 +1218,21 @@ int main(int argc, char **argv) {
                  "3-level integrator (HASEN_STRANGE_LEVEL=middle) -- strange "
                  "is not a distinct level in 2-level mode.\n";
     exit(1);
+  }
+  // Grid-MG sharers rely on the donor's gauge import (HASEN_GRID_MG_RUNGS above).  If
+  // HASEN_STRANGE_RUNGS puts a sharer and its donor on different integrator levels, the sharer
+  // can solve at a gauge field the donor has not imported yet.  Still exact to tol (the outer
+  // GCR runs on the sharer's own, current fp64 operator); only the preconditioner's fp32 fine
+  // operator lags, which can cost outer iterations.  Report it.
+  if (GridMGH && three_level) {
+    const bool donor_on_strange = strange_rungs.count(grid_mg_donor) != 0;
+    for (int k : grid_mg_rungs)
+      if ((strange_rungs.count(k) != 0) != donor_on_strange)
+        std::cout << GridLogMessage << "[Ladder] NOTE: Grid-MG rung " << k
+                  << " and its donor rung " << grid_mg_donor
+                  << " are on different integrator levels (HASEN_STRANGE_RUNGS): its MG "
+                     "preconditioner may see the previous gauge field (the solve itself "
+                     "stays on the current fp64 operator)" << std::endl;
   }
   std::cout << GridLogMessage << "[Ladder] tail level = " << tail_level
             << (tail_level == "inner"    ? " (with gauge — Chroma has_cancel placement)"
