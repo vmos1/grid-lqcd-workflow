@@ -25,6 +25,8 @@
 # Caller overrides (everything else is hard-coded on purpose):
 #   HASEN_GRID_MG_RUNGS  default "0,1,2"; set EMPTY (HASEN_GRID_MG_RUNGS=) for the
 #                        CG-only control. GRID_MG_* pass through untouched.
+#   HASEN_GRID_MG_HEATBATH_RUNGS, HASEN_GRID_MIXED_CG_RUNGS,
+#   HASEN_GRID_MIXED_CG_HEATBATH_RUNGS  M3 routes, default unset; see section 8.
 #   DEVICE_MEM_MB        default 8000 (--device-mem, Grid's device lattice cache in MB)
 #   FORCES_SAMPLES       default 2 (see section 7)
 #   INTEGRATOR_VERBOSE_MEM  default 1; "" or 0 = off (see section 10: INERT here)
@@ -96,7 +98,7 @@ fi
 [ "$N_QUDA" -eq 0 ] || die "ldd shows libquda in $BIN; this probe is for pure-Grid builds only"
 
 # ---- 3. Clear every knob this probe does not set ------------------------------
-# Same families as smoke16_puregrid.sh, same HASEN_GRID_MG_/GRID_MG_ exemption. A
+# Same families as smoke16_puregrid.sh, same HASEN_GRID_/GRID_MG_ exemption. A
 # stray variable from the caller's shell would silently change the run, or kill it:
 # every QUDA_* / HASEN_QUDA_* / HASEN_MG_* / HMC_MG_* knob of chroma_match_sop_48.sh
 # and forces_only_sop_48.sh goes here, and in a pure-Grid build HASEN_MG_RUNG /
@@ -115,9 +117,12 @@ fi
 #   STRANGE_EVEN, NO_METROP, IMPORT_CFG    reset, then set below as needed
 while read -r v; do
   unset "$v"
-done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|STRANGE_EVEN$|NO_METROP$|IMPORT_CFG$)' | grep -v -E '^(HASEN_GRID_MG_|GRID_MG_)')
-# Kept on purpose (not scrubbed): HASEN_GRID_MG_RUNGS and GRID_MG_* select and tune the
-# pure-Grid multigrid rung solver (M2, 2026_09_29_pure_grid_m2_mg_solver_design.md).
+done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|STRANGE_EVEN$|NO_METROP$|IMPORT_CFG$)' | grep -v -E '^(HASEN_GRID_|GRID_MG_)')
+# Kept on purpose (not scrubbed): every HASEN_GRID_* switch of the pure-Grid rung solvers
+# and GRID_MG_*, the multigrid tunables. HASEN_GRID_MG_RUNGS (M2,
+# 2026_09_29_pure_grid_m2_mg_solver_design.md) and, since M3, HASEN_GRID_MG_HEATBATH_RUNGS,
+# HASEN_GRID_MIXED_CG_RUNGS and HASEN_GRID_MIXED_CG_HEATBATH_RUNGS select the routes; the
+# driver parses each strictly and exits on a bad or conflicting list.
 # GridMGParams::from_env rejects an unknown GRID_MG_* name ("typo?"), so a stray one
 # fails loudly rather than silently. The ENV line below records them.
 N_QUDA_ENV=$(compgen -e | grep -c '^QUDA_' || true)
@@ -199,7 +204,11 @@ export FORCES_SAMPLES=$FO_SAMPLES
 # hierarchy, rungs 1 (-0.2380) and 2 (-0.2340) share it (GCR at their own mass);
 # rung 3 (-0.2180) and the tail stay on CG, as the QUDA hybrid routes C3
 # (SOP section D: MG 0 + shared 1,2, CG 3 + tail). MG covers deriv and S only; every
-# heatbath stays CG_action. Empty = CG-only control (driver treats empty as unset).
+# heatbath stays CG_action unless the caller sets the M3 lists (pass through untouched,
+# recorded on the ENV line): HASEN_GRID_MG_HEATBATH_RUNGS (heatbath on the hierarchy; rungs
+# must be MG rungs), HASEN_GRID_MIXED_CG_RUNGS (non-MG rungs' deriv/S in mixed-precision CG),
+# HASEN_GRID_MIXED_CG_HEATBATH_RUNGS (the other heatbaths in mixed-precision CG).
+# Empty = CG-only control (driver treats empty as unset).
 if [ -n "$HASEN_GRID_MG_RUNGS" ]; then
   [[ "$HASEN_GRID_MG_RUNGS" =~ ^[0-3](,[0-3])*$ ]] || die "HASEN_GRID_MG_RUNGS must list ratio rungs 0..3 of the C3 ladder, got '$HASEN_GRID_MG_RUNGS'"
   # A binary built before M2 ignores the switch and would silently run CG
@@ -212,6 +221,16 @@ else
   unset HASEN_GRID_MG_RUNGS
   MG_RUNGS_TAG=none
 fi
+# The M3 lists: validated by the driver (strict parse, subset/exclusion rules). A pre-M3
+# binary ignores them and would silently run the M2 routes, so refuse that here.
+for v in HASEN_GRID_MG_HEATBATH_RUNGS HASEN_GRID_MIXED_CG_RUNGS HASEN_GRID_MIXED_CG_HEATBATH_RUNGS; do
+  if [ -n "${!v:-}" ]; then
+    [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ] || die "$BIN has no $v support (pre-M3 build): it would silently ignore $v=${!v}."
+    export "$v"
+  else
+    unset "$v"
+  fi
+done
 GRID_MG_ENV=$(compgen -e | grep '^GRID_MG_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
 
 # ---- 9. MPI / comms / threads -------------------------------------------------------
@@ -235,7 +254,9 @@ NTASKS=16
 # allocations; run_probe_grid_mg.sh DEVICE_MEM_MB note): 8000 is what the 48^3 MG
 # probe needed, 12000 OOMs (L119, L167). Fields beyond the cap are evicted to host,
 # not OOMed, so a too-small cap shows up as time, a too-large one as an OOM.
-GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB")
+# GRID_EXTRA_ARGS (optional, space-separated) is appended verbatim, e.g.
+# GRID_EXTRA_ARGS="--log Error,Warning,Message,Performance,Debug" for the M5 instrumented run.
+GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB" ${GRID_EXTRA_ARGS:+$GRID_EXTRA_ARGS})
 
 # ---- 10. Device-memory reporting ------------------------------------------------------
 # INTEGRATOR_VERBOSE_MEM=1 re-enables patch 03's MemoryManager::Print around each
@@ -318,7 +339,7 @@ GRID_SHA=${GRID_HASH_LINE:0:40}
 GRID_SHA=${GRID_SHA:-unknown}
 case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
 
-printf 'ENV FORCES48_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s MODE=FORCES_ONLY FORCES_SAMPLES=%s FORCES_SKIP=none LATT=%s MPI=%s NODES=%s NTASKS=%s IMPORT_CFG=%s SEED=%s LADDER=%s STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s TAIL_LEVEL=%s INTEGRATOR=%s MDSTEPS=%s GAUGE_INNER_MULT=%s TRAJL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s MPICH_NIC=%s OMP=%s GRID_MG_RUNGS=%s GRID_MG_ENV="%s" DEVICE_MEM_MB=%s VERBOSE_MEM=%s GPU_MON_MS=%s GRID_FLAGS="%s"\n' \
+printf 'ENV FORCES48_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s MODE=FORCES_ONLY FORCES_SAMPLES=%s FORCES_SKIP=none LATT=%s MPI=%s NODES=%s NTASKS=%s IMPORT_CFG=%s SEED=%s LADDER=%s STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s TAIL_LEVEL=%s INTEGRATOR=%s MDSTEPS=%s GAUGE_INNER_MULT=%s TRAJL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s MPICH_NIC=%s OMP=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" DEVICE_MEM_MB=%s VERBOSE_MEM=%s GPU_MON_MS=%s GRID_FLAGS="%s"\n' \
   "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
   "$FORCES_SAMPLES" "$LATT" "$MPI_GEOM" "$NODES" "$NTASKS" "$(basename "$IMPORT_CFG")" \
   "$HMC_SEED_OFFSET" "$HASEN_LADDER" "$HASEN_STRANGE_LEVEL" "$HASEN_STRANGE_INNER_MULT" \
@@ -326,7 +347,9 @@ printf 'ENV FORCES48_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s G
   "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \
   "$RAT_LO" "$RAT_HI" "$RAT_DEGREE" "$TUNE_CG_TOL_DERIV" "$TUNE_CG_TOL_ACTION" \
   "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" "$MPICH_GPU_IPC_ENABLED" "$MPICH_RDMA_ENABLED_CUDA" \
-  "$MPICH_OFI_NIC_POLICY" "$OMP_NUM_THREADS" "$MG_RUNGS_TAG" "$GRID_MG_ENV" \
+  "$MPICH_OFI_NIC_POLICY" "$OMP_NUM_THREADS" "$MG_RUNGS_TAG" \
+  "${HASEN_GRID_MG_HEATBATH_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_RUNGS:-none}" \
+  "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" "$GRID_MG_ENV" \
   "$DEVICE_MEM_MB" "$VERBOSE_MEM" "$GPU_MON_MS" "${GRID_ARGS[*]}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"

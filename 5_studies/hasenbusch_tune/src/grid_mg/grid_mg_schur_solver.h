@@ -21,6 +21,12 @@
 //   hard  true residual > rsd_tol_factor * tol  => H.ForceRebuildNow(), re-solve once,
 //         GRID_ASSERT if still above the factor.
 // Spec: __docs/2026_09_29_pure_grid_m2_mg_solver_design.md §1 and §2 item 6.
+//
+// M3: the same class also fills a rung's HeatbathSolver slot (HASEN_GRID_MG_HEATBATH_RUNGS):
+// refresh() calls it with linop = Vpc = SchurDifferentiableOperator(NumOp), the rung's HEAVIER
+// mass ladder[k+1], and the contract is the same (Vpc^dag Vpc)^-1 on Odd; the outer GCR runs on
+// that linop, so only the preconditioner is at the donor mass. Built non-donor at cg_tol_act
+// with ImportIfHierarchyStale() (below).
 
 #pragma once
 
@@ -60,9 +66,33 @@ class GridMGSchurSolver : public RungSolverBase {
     GRID_ASSERT(tol_ > 0.0);
   }
 
+  // M3, the MG heatbath (HASEN_GRID_MG_HEATBATH_RUNGS): a NON-donor solver whose solve can run
+  // before the donor's SetGauge of the same gauge field. The heatbath of a sharing rung is one:
+  // with HASEN_STRANGE_RUNGS putting the donor on the strange level and the sharer on light,
+  // Integrator::refresh (levels in order) refreshes the sharer first, and at the first
+  // trajectory the hierarchy would have no gauge at all (Build() asserts). With this on,
+  // SetGauge(U) imports U into the hierarchy unless its CURRENT generation already carries U
+  // (GridMGHierarchy::SetGaugeIfNew, a fingerprint check tagged by generation), so the solve
+  // never depends on the refresh order. A donor always imports and ignores this switch.
+  void ImportIfHierarchyStale()
+  {
+    import_if_stale_ = true;
+    H_.TrackGauge();
+  }
+
   void SetGauge(const LatticeGaugeField &U) override
   {
-    if (donor_) H_.SetGauge(U);
+    if (donor_) {
+      H_.SetGauge(U);
+    } else if (import_if_stale_) {
+      if (H_.SetGaugeIfNew(U)) {
+        ++stale_imports_;
+        if (H_.Params().verbose >= 1)
+          std::cout << GridLogMessage << Tag() << "hierarchy did not carry this gauge field "
+                    << "(the donor has not imported it yet): imported it here, gen "
+                    << H_.Generation() << std::endl;
+      }
+    }
   }
 
   void operator()(LinearOperatorBase<LatticeFermion> &linop, const LatticeFermion &src,
@@ -103,8 +133,10 @@ class GridMGSchurSolver : public RungSolverBase {
     return last_[which - 1];
   }
   long long Calls() const { return calls_; }
+  long long StaleImports() const { return stale_imports_; }
   RealD Tolerance() const { return tol_; }
   bool Donor() const { return donor_; }
+  bool ImportsIfHierarchyStale() const { return import_if_stale_; }
   const std::string &Name() const { return name_; }
 
  private:
@@ -194,7 +226,9 @@ class GridMGSchurSolver : public RungSolverBase {
   int cb_;
   std::string name_;
   bool donor_;
+  bool import_if_stale_ = false;  // M3 heatbath mode, ImportIfHierarchyStale()
   long long calls_ = 0;
+  long long stale_imports_ = 0;
   SolveStats last_[2];
 };
 

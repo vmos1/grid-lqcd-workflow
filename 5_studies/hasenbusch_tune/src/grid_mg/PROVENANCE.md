@@ -1,14 +1,18 @@
 # src/grid_mg/ provenance
 
 ## What this directory is
-Updated on 2026-09-29 19:00 CDT · perlmutter
+Updated on 2026-09-30 16:56 CDT · perlmutter
 
 The Grid multigrid rung solver of the pure-Grid HMC (campaign `pure-grid-hmc`, milestone
-M2): the gq-mg campaign's `best2` three-level fp32 multigrid, lifted out of the benchmark
-probe and packaged as an `OperatorFunction` that a Hasenbusch ratio action can use for its
-derivative and action solves. Spec: `__docs/2026_09_29_pure_grid_m2_mg_solver_design.md`,
-section 2 (these files) and section 4 item 1 (the test). The driver integration (spec
-section 3) is a separate step.
+M2): the gq-mg campaign's three-level fp32 multigrid (`best2` at M2, GMG3 by default since
+M3, see below), lifted out of the benchmark probe and packaged as an `OperatorFunction` that
+a Hasenbusch ratio action can use for its derivative and action solves. Spec:
+`__docs/2026_09_29_pure_grid_m2_mg_solver_design.md`, section 2 (these files) and section 4
+item 1 (the test). The driver integration (spec section 3) is a separate step.
+
+M3 (2026-09-30) adds, in the same directory: the MG heatbath (a `GridMGSchurSolver` in a
+rung's heatbath slot), a mixed-precision CG rung solver (`mixed_cg_rung_solver.h`) for the
+ratio rungs' CG solves, and the GMG3 default. Section "M3 additions" below.
 
 Header-only; nothing here modifies Grid. Compiled against the staged stock tree
 `$PSCRATCH/grid_pure_hmc/stock-grid/3d3eff86f366.../Grid` with patches 01-04. Patch 04
@@ -34,7 +38,10 @@ had uncommitted edits there). Workflow repo HEAD at copy time:
 `best2` itself is the `grid=(...)` block of `runs/2026_9_29_mg_final_bench_c3/c3_final_bench.sh`.
 
 ## Files: verbatim and adapted
-Updated on 2026-09-29 19:00 CDT · perlmutter
+Updated on 2026-09-30 16:56 CDT · perlmutter
+
+(As copied at M2. The M3 edits to `grid_mg_params.h`, `grid_mg_hierarchy.h`,
+`grid_mg_schur_solver.h` and `ratio_action_rung_solver.h` are listed in "M3 additions".)
 
 - `mg_solvers.h`: the WHOLE `probe_mg_solvers.h`, verbatim, `ProbeMG` namespace kept, so
   `diff` against the probe shows only the edits. The probe file has no `bench_nvtx.h` include
@@ -111,6 +118,46 @@ Implementation choices where the spec was silent or had to be made concrete:
     `< 1e-1` (expected ~5e-2 at hops 1) with the probe's `Mpc^dag Mpc` control `> 1e-3`;
     level-1 stencil vs general apply `< 1e-4`; level-2 Galerkin `< 1e-4` (the probe's gate,
     expected ~1e-6); normal-equation true residual `<= 1e-10`.
+
+## M3 additions
+Updated on 2026-09-30 16:56 CDT · perlmutter
+
+All new code; nothing copied. Every addition is env-gated in the driver: with
+`HASEN_GRID_MG_HEATBATH_RUNGS`, `HASEN_GRID_MIXED_CG_RUNGS` and
+`HASEN_GRID_MIXED_CG_HEATBATH_RUNGS` unset, none of it is constructed.
+
+- GMG3 default (`grid_mg_params.h`). The gq-mg campaign's adopted recipe GMG3 is `best2`
+  with a 4-step fine post-smoother (`SMOOTHER_NSTEP=4`), 3.05 s vs 3.19 s per C3 Mpc solve
+  at 38 vs 33 outer iterations (ledger L172). `smoother_nstep` default 8 -> 4; every other
+  default is still best2's. `Summary()` now starts with `recipe <name>` (`Recipe()`: GMG3,
+  best2 = GMG3 with `GRID_MG_SMOOTHER_NSTEP=8`, or custom; `GRID_MG_VERBOSE` ignored); the
+  value list moved to `Values()`, text unchanged. The M2 validation runs of 2026-09-29 ran
+  best2: reproduce them with `GRID_MG_SMOOTHER_NSTEP=8`.
+- `gauge_fingerprint.h` (new): `GaugeTraceFingerprint(U)` = per-Lorentz-component
+  `sum_x tr U_mu(x)`, one `TraceIndex` + one global sum, compared bit for bit. Used by the two
+  items below.
+- `grid_mg_hierarchy.h`: `TrackGauge()`, `Carries(U)`, `SetGaugeIfNew(U)`. The M2 `SetGauge`
+  body moved verbatim to the private `ImportGaugeF`; with tracking off (every run without
+  the MG heatbath) `SetGauge` is exactly the M2 code. With tracking on, each import records
+  the fingerprint of U and of `opF.Umu` (the fp32 doubled links) tagged with the generation
+  it produced; `SetGaugeIfNew` imports unless the CURRENT generation carries U and the links
+  are still that import's.
+- `grid_mg_schur_solver.h`: `ImportIfHierarchyStale()`, the heatbath mode of a non-donor
+  solver: its `SetGauge` calls `H.SetGaugeIfNew(U)`. Needed because a sharing rung's
+  heatbath can run before the donor's `SetGauge` (driver comment at the M3 block:
+  `HASEN_STRANGE_RUNGS` putting donor and sharer on different integrator levels), and at the
+  first trajectory the hierarchy would have no gauge (Build() asserts).
+- `mixed_cg_rung_solver.h` (new): `MixedPrecCGRungSolver`, Grid's
+  `MixedPrecisionConjugateGradient` constructed as the driver's `MixedPrecCGWrapper` (the
+  tail's `CG_light_md`), plus a `SetGauge` that imports U into the fp32 operator. The
+  skip-redundant-import test is keyed to the operator (a registry per fp32 operator plus a
+  fingerprint of its current links), not to the solver: a per-solver test would be wrong
+  after a rejected trajectory, when another importer of the same fp32 operator (the next
+  rung's deriv solver, the tail's MP deriv, the hierarchy) has changed it.
+- `ratio_action_rung_solver.h`: the renamed fork copy is unchanged apart from one comment
+  line; a second, new class `TwoFlavourSchurCloverRatioActionHeatbathRung` keeps the plain
+  CG deriv / S solvers (separate objects, the base's tolerances) and syncs only a
+  `RungSolverBase` heatbath's gauge in `refresh`.
 
 ## Build trap found while building
 Updated on 2026-09-29 19:00 CDT · perlmutter

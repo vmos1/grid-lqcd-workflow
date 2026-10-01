@@ -1,16 +1,22 @@
-// grid_mg_params.h  (pure-Grid HMC, M2: the `best2` multigrid as a rung solver)
+// grid_mg_params.h  (pure-Grid HMC, M2/M3: the gq-mg multigrid as a rung solver)
 //
-// Every tunable of the Grid multigrid rung solver, with the `best2` recipe of the gq-mg
-// campaign as the defaults (runs/2026_9_29_mg_final_bench_c3/c3_final_bench.sh, `grid=(...)`
-// block; __docs/2026_09_29_grid_multigrid_experimentation.md §5), mapped from the probe's
-// command-line knobs (probe_grid_mg_schur_clover.cc) as named in each comment.
-// Spec: __docs/2026_09_29_pure_grid_m2_mg_solver_design.md §2 item 3.
+// Every tunable of the Grid multigrid rung solver, with the GMG3 recipe of the gq-mg campaign
+// as the defaults, mapped from the probe's command-line knobs (probe_grid_mg_schur_clover.cc)
+// as named in each comment. Spec: __docs/2026_09_29_pure_grid_m2_mg_solver_design.md §2 item 3.
+//
+// GMG3 (the gq-mg campaign's adopted recipe, M3 default since 2026-09-30) = `best2`
+// (runs/2026_9_29_mg_final_bench_c3/c3_final_bench.sh, `grid=(...)` block;
+// __docs/2026_09_29_grid_multigrid_experimentation.md §5) with ONE change: the fine
+// post-smoother runs 4 GCR steps instead of 8 (probe SMOOTHER_NSTEP=4). At C3 it takes more
+// outer iterations (38 vs 33) but each is cheaper: 3.05 s vs 3.19 s per Mpc solve (ledger
+// L172). Every other default below is best2's. GRID_MG_SMOOTHER_NSTEP=8 restores best2 (the M2
+// validation runs of 2026-09-29 used it).
 //
 // GridMGParams::from_env() is the ONLY place in the grid_mg/ code that reads the environment.
 // Unset variable = the default below. A malformed value, or a GRID_MG_* variable this file
 // does not know (a typo would otherwise be silently ignored), aborts with a message.
 //
-// Two differences from the probe's best2 row, both from the spec:
+// Two differences from the probe's best2/GMG3 rows, both from the spec:
 //   * the hierarchy coarsens SchurDiagMooeeOperator (the operator the HMC action solves),
 //     not the probe's SCHUR=one; the One route is deferred (spec §6);
 //   * the outer restart cap is 1000 GCR cycles (the benchmark ran MAXITER=200).
@@ -71,7 +77,8 @@ struct GridMGParams {
   RealD smoother_tol = 0.1;     // GRID_MG_SMOOTHER_TOL      (SMOOTHER_TOL)
   int smoother_maxiter = 1;     // GRID_MG_SMOOTHER_MAXITER  (SMOOTHER_MAXITER)
   int smoother_mmax = 1;        // GRID_MG_SMOOTHER_MMAX     (SMOOTHER_MMAX)
-  int smoother_nstep = 8;       // GRID_MG_SMOOTHER_NSTEP    (SMOOTHER_NSTEP)
+  // GMG3: 4 fine post-smoother steps (best2 ran 8; the only GMG3 change, see the file header).
+  int smoother_nstep = 4;       // GRID_MG_SMOOTHER_NSTEP    (SMOOTHER_NSTEP; best2 = 8)
 
   // ---- level 1: stencil apply of the coarse Mpc + coarse_shift, FlexibleGCR solve ----
   RealD coarse_shift = 0.001;  // GRID_MG_COARSE_SHIFT    (probe hard-codes 0.001)
@@ -128,8 +135,25 @@ struct GridMGParams {
     return s;
   }
 
-  // One line with every effective value, for the driver's [Ladder] banner and the test.
-  std::string Summary() const
+  // Which recipe the effective values are: the GMG3 defaults, best2 (GMG3 with the 8-step fine
+  // smoother), or anything else. GRID_MG_VERBOSE is logging, not recipe, and is ignored.
+  std::string Recipe() const
+  {
+    GridMGParams d;
+    d.verbose = verbose;
+    const std::string mine = Values();
+    if (mine == d.Values()) return "GMG3 (best2 + 4-step fine post-smoother, the default)";
+    d.smoother_nstep = 8;
+    if (mine == d.Values()) return "best2 (GMG3 with GRID_MG_SMOOTHER_NSTEP=8)";
+    return "custom (GMG3 defaults + GRID_MG_* overrides)";
+  }
+
+  // One line with the recipe name and every effective value, for the driver's [Ladder] banner
+  // and the test.
+  std::string Summary() const { return "recipe " + Recipe() + " | " + Values(); }
+
+  // Every effective value, one line.
+  std::string Values() const
   {
     std::ostringstream os;
     os << "nbasis " << nbasis << " (x2 = " << 2 * nbasis << ") nbasis2 " << nbasis2 << " hops "

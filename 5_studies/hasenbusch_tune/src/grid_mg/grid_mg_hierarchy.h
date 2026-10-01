@@ -17,6 +17,11 @@
 //                opF.ImportGauge(UmuF); ++generation. A hierarchy that is not built yet, or has
 //                a soft-tier rebuild pending, is marked needs-build. Nothing else: the coarse
 //                levels stay frozen between rebuilds (the hybrid's "thin update").
+//   SetGaugeIfNew(U)  (M3, the MG heatbath) imports U only if the CURRENT generation's import
+//                was not of U: the gauge fingerprint (gauge_fingerprint.h) of U and of opF's
+//                doubled links are recorded per generation once TrackGauge() is on; a
+//                fingerprint recorded at an older generation never counts. TrackGauge() off
+//                (every run without HASEN_GRID_MG_HEATBATH_RUNGS) = SetGauge exactly as in M2.
 //   Build()      destroys every level object and re-creates it (re-coarsening in place is not
 //                possible: _A lives on the padded grid after ExchangeCoarseLinks), reseeding
 //                the setup RNGs from params.seed first, so a build is a pure function of the
@@ -32,6 +37,7 @@
 
 #include <Grid/Grid.h>
 
+#include "gauge_fingerprint.h"
 #include "grid_mg_params.h"
 #include "mg_components.h"
 #include "mg_solvers.h"
@@ -186,16 +192,29 @@ class GridMGHierarchy {
   // ---- gauge update: fp32 import only (the "thin update") ------------------------------
   void SetGauge(const LatticeGaugeField &U)
   {
-    if (!ws_gauge_) {
-      ws_gauge_.reset(new precisionChangeWorkspace(GridF_, U.Grid()));
-      ws_gauge_in_ = U.Grid();
-    }
-    GRID_ASSERT(U.Grid() == ws_gauge_in_);
-    precisionChange(UmuF_, U, *ws_gauge_);
-    opF_.ImportGauge(UmuF_);
-    ++generation_;
-    if (!built_) needs_build_ = true;
-    if (rebuild_pending_) needs_build_ = true;
+    ImportGaugeF(U);
+    if (track_gauge_) RecordGauge(GaugeTraceFingerprint(U));  // M3 only; off = the M2 path
+  }
+
+  // ---- M3: gauge identity per generation (the MG heatbath, HASEN_GRID_MG_HEATBATH_RUNGS) ----
+  // From now on every import records the fingerprint of U and of opF's doubled links, tagged
+  // with the generation it produced. Call before the first SetGauge (the driver does, when it
+  // builds the heatbath solvers); an earlier untracked generation simply never matches.
+  void TrackGauge() { track_gauge_ = true; }
+  bool TracksGauge() const { return track_gauge_; }
+  // True iff the current generation's import was of a field with U's fingerprint AND opF still
+  // holds the links that import produced (another importer into the same fp32 operator, e.g. a
+  // mixed-CG heatbath on the rung below, is detected by the second check).
+  bool Carries(const LatticeGaugeField &U) const { return Carries(GaugeTraceFingerprint(U)); }
+  // Import U unless the current generation already carries it. Returns true if it imported.
+  bool SetGaugeIfNew(const LatticeGaugeField &U)
+  {
+    GRID_ASSERT(track_gauge_);
+    const GaugeFingerprint fp = GaugeTraceFingerprint(U);
+    if (Carries(fp)) return false;
+    ImportGaugeF(U);
+    RecordGauge(fp);
+    return true;
   }
 
   // ---- (re)build every level on the current fp32 operator --------------------------------
@@ -404,6 +423,36 @@ class GridMGHierarchy {
  private:
   std::string Tag() const { return "[GridMG " + name_ + "] "; }
 
+  // The M2 SetGauge body: fp64 U -> persistent fp32 UmuF_ -> opF_.ImportGauge; ++generation.
+  void ImportGaugeF(const LatticeGaugeField &U)
+  {
+    if (!ws_gauge_) {
+      ws_gauge_.reset(new precisionChangeWorkspace(GridF_, U.Grid()));
+      ws_gauge_in_ = U.Grid();
+    }
+    GRID_ASSERT(U.Grid() == ws_gauge_in_);
+    precisionChange(UmuF_, U, *ws_gauge_);
+    opF_.ImportGauge(UmuF_);
+    ++generation_;
+    if (!built_) needs_build_ = true;
+    if (rebuild_pending_) needs_build_ = true;
+  }
+  // M3: tag the import just made (generation_) with U's fingerprint and opF's doubled links'.
+  void RecordGauge(const GaugeFingerprint &fpU)
+  {
+    fp_gauge_ = fpU;
+    fp_links_ = GaugeTraceFingerprint(opF_.Umu);
+    fp_generation_ = generation_;
+  }
+  bool Carries(const GaugeFingerprint &fpU) const
+  {
+    // The generation check: a fingerprint recorded for an older generation (an untracked
+    // import happened since) never counts.
+    if (!track_gauge_ || generation_ == 0 || fp_generation_ != generation_) return false;
+    if (fpU != fp_gauge_) return false;
+    return GaugeTraceFingerprint(opF_.Umu) == fp_links_;
+  }
+
   void DestroyLevels()
   {
     // Reverse order of creation: every object below references something above it.
@@ -483,6 +532,10 @@ class GridMGHierarchy {
   int builds_ = 0;
   double last_setup_s_ = 0.0;
   std::string build_reason_;
+  // M3 gauge identity (TrackGauge); unused when off.
+  bool track_gauge_ = false;
+  int fp_generation_ = -1;
+  GaugeFingerprint fp_gauge_, fp_links_;
 };
 
 }  // namespace Grid

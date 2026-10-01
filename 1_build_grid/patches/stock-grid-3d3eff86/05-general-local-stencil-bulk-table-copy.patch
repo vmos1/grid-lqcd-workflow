@@ -1,0 +1,26 @@
+--- a/Grid/stencil/GeneralLocalStencil.h
++++ b/Grid/stencil/GeneralLocalStencil.h
+@@ -88,6 +88,11 @@
+     this->_entries.resize(npoints* osites);
+     this->_entries_p = &_entries[0];
+ 
++    // Fill the table on the host and copy it to the device once at the end:
++    // a per-entry acceleratorPut is one synchronous small memcpy per entry
++    // (~1e8 of them for the depth-2 padded gauge-force workspace at 48^3x96).
++    std::vector<GeneralStencilEntry> entries_host(npoints*osites);
++
+     thread_for(site, osites, {
+ 	Coordinate Coor;
+ 	Coordinate NbrCoor;
+@@ -145,9 +150,10 @@
+ 	  ////////////////////////////////////////////////
+ 	  // Store in look up table
+ 	  ////////////////////////////////////////////////
+-	  acceleratorPut(this->_entries[lex],SE);
++	  entries_host[lex] = SE;
+ 	}
+       });
++    acceleratorCopyToDevice(&entries_host[0],&this->_entries[0],entries_host.size()*sizeof(GeneralStencilEntry));
+   }
+   
+ };
