@@ -250,7 +250,7 @@ done
 # otherwise; override with VAR=0. A binary that predates a switch runs without it, with a
 # warning. (HASEN_GRID_BATCH_SMEAR is inert in FORCES_ONLY, which never enters update_P.)
 # Force-cost analysis s.7.5; one-page summary 2026_10_02_pure_grid_speedup_summary.md.
-for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SMEAR HASEN_GRID_IMPORT_SKIP; do
+for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SMEAR HASEN_GRID_IMPORT_SKIP HASEN_GRID_SHARE_FIELDSTRENGTH HASEN_GRID_GPU_CLOVER_INV HASEN_GRID_CLOVER_STENCIL; do
   if [ -z "${!v:-}" ]; then
     if [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ]; then
       export "$v=1"

@@ -68,6 +68,21 @@ same order. The include resolves through `-I$HB/src`, which
 `build_test_fused_clover.sh` all pass, so these three headers now need it.
 They still include no path that exists only in the fork.
 
+## Local edits: item D clover derivative (2026-10-02)
+Updated on 2026-10-02 08:59 CDT · perlmutter
+
+`Grid/qcd/action/pseudofermion/QCDLogDetCompactCloverEOAction.h` (sha256 before
+`3248272c68f23a516023689c3a974ecbf719fab5c135317bf8fa6386d0ec242a`, after
+`f281d8f0aaa68cda63b85f4a12d2c388487c19030b07af9339df870efd6664df`): adds
+`#include "clover_force/clover_cmunu.h"`; in `deriv_cpu` and `deriv_gpu` the
+`Cmunu` loop gains an `if (CloverStapleCacheEnabled())` branch
+(`HASEN_GRID_CLOVER_STAPLE_CACHE=1`, cached link products, bit-identical) and
+`deriv_gpu` an `if (CloverStencilEnabled())` branch (`HASEN_GRID_CLOVER_STENCIL=1`,
+PaddedCell + GeneralLocalStencil, bit-identical); the two `setCheckerboard` calls become
+`CloverSetCheckerboard`, which is `acceleratorSetCheckerboard` under
+`HASEN_GRID_DEVICE_CB=1` (patch 06's switch, read the same way) and the original
+call otherwise. All switches default off; off, the original statements run.
+
 ## Dependencies on Grid
 Updated on 2026-09-29 15:06 CDT · perlmutter
 

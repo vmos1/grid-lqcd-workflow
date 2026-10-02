@@ -55,8 +55,17 @@
 // Memory per instance: two half-grid PropagatorFields (= one full-grid one, the size of one
 // body's Lambda); Finish adds six full-grid colour-matrix lambdas and a half-grid Gamma.Lambda
 // temporary, which is less than one body's Lambda + Slambda peak.
+//
+// Item D (clover_cmunu.h, both default off, both bit-identical): HASEN_GRID_CLOVER_STAPLE_CACHE=1
+// runs the Cmunu loop with the lambda-independent link products cached per gauge field (372 ->
+// 204 Cshifts per pass on a cache hit); HASEN_GRID_CLOVER_STENCIL=1 replaces the whole loop by
+// one PaddedCell exchange per field and site-local kernels (takes precedence over the cache);
+// HASEN_GRID_DEVICE_CB=1 (patch 06's switch) also moves the 12 lambda setCheckerboard copies of
+// FinishLinks to the device.
 
 #include <Grid/Grid.h>
+
+#include "clover_force/clover_cmunu.h"
 
 #include <set>
 #include <string>
@@ -203,9 +212,36 @@ class FusedCloverForce {
           Slambda = Gamma(positive_sigma[k]) * (*L);
           lambda_h = TraceIndex<SpinIndex>(Slambda);  // WilsonImpl::TraceSpinImpl (WilsonImpl.h:183-185)
           lambda_h.Checkerboard() = L->Checkerboard();  // TraceIndex returns the default cb
-          setCheckerboard(lambda[k], lambda_h);
+          // Host setCheckerboard, or the device-side copy under HASEN_GRID_DEVICE_CB=1
+          // (clover_cmunu.h; patch 06's switch). Copy only: bit-identical.
+          CloverSetCheckerboard(lambda[k], lambda_h);
         }
       }
+    }
+
+    // HASEN_GRID_CLOVER_STENCIL=1: the whole loop below as one PaddedCell exchange per field
+    // and site-local kernels (clover_cmunu.h, stage 2), then the same link product (line 322).
+    if (CloverStencilEnabled()) {
+      const RealD factor = 2.0 * csw_r;  // line 316, signed as below
+      RealD sf[4][4];
+      for (int mu = 0; mu < 4; mu++)
+        for (int nu = 0; nu < 4; nu++) sf[mu][nu] = (mu == nu) ? 0.0 : ((mu < nu) ? factor : -factor);
+      const GaugeLinkField *lam[6] = {&lambda[0], &lambda[1], &lambda[2], &lambda[3], &lambda[4], &lambda[5]};
+      std::vector<GaugeLinkField> force_mu(Nd, fgrid);
+      CloverCmunuStencil<Impl>::Instance().ForceMu(Ulinks, lam, sigma_idx, sf, force_mu);
+      force_out = Zero();
+      for (int mu = 0; mu < 4; mu++) pokeLorentz(force_out, Ulinks[mu] * force_mu[mu], mu);
+      return;
+    }
+
+    // HASEN_GRID_CLOVER_STAPLE_CACHE=1: the same Cmunu with its lambda-independent link
+    // products cached per gauge field (clover_cmunu.h; bit-identical). Off: the stock call.
+    CloverStapleCache<Impl> *cache = nullptr;
+    double t_loop0 = 0;
+    if (CloverStapleCacheEnabled()) {
+      cache = &CloverStapleCache<Impl>::Instance();
+      cache->Prepare(Ulinks);
+      t_loop0 = usecond();
     }
 
     // Patch lines 310-323: same statements, same (mu,nu) order.
@@ -218,10 +254,14 @@ class FusedCloverForce {
         const RealD factor = 2.0 * csw_r;  // line 316 (its csw_t branch is unreachable)
         // sigma_{mu nu} = -sigma_{nu mu}: the sign goes into the factor (file header).
         const RealD signed_factor = (mu < nu) ? factor : -factor;
-        force_mu -= signed_factor * WilsonCloverHelpers<Impl>::Cmunu(Ulinks, lambda[sigma_idx[mu][nu]], mu, nu);
+        if (cache)
+          force_mu -= signed_factor * cache->Cmunu(Ulinks, lambda[sigma_idx[mu][nu]], mu, nu);
+        else
+          force_mu -= signed_factor * WilsonCloverHelpers<Impl>::Cmunu(Ulinks, lambda[sigma_idx[mu][nu]], mu, nu);
       }
       pokeLorentz(force_out, Ulinks[mu] * force_mu, mu);  // line 322
     }
+    if (cache) cache->EndPass(usecond() - t_loop0);
   }
 };
 

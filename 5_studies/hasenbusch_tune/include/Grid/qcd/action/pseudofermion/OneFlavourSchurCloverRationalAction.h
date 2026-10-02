@@ -10,6 +10,10 @@
 // The force includes clover corrections (MooDeriv, MeeDeriv chain rule).
 
 #include <Grid/qcd/action/fermion/WilsonCloverFermion.h>
+// A3: every ImportGauge into FermOp goes through the exact-skip guard (HASEN_GRID_IMPORT_SKIP=1,
+// default off = plain ImportGauge). The strange operator is also imported by the MP deriv and by
+// the strange log-det action, all guarded, so the guard sees ALL imports into it (hazard 1).
+#include "gauge_import/import_guard.h"
 
 NAMESPACE_BEGIN(Grid);
 
@@ -71,7 +75,7 @@ public:
     eta = eta * scale;
     pickCheckerboard(Odd, etaOdd, eta);
 
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     SchurDifferentiableOperator<Impl> Mpc(FermOp);
     ConjugateGradientMultiShift<FermionField> msCG(param.MaxIter, PowerQuarter);
@@ -79,7 +83,7 @@ public:
   }
 
   RealD S(const GaugeField &U) override {
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     FermionField Y(FermOp.FermionRedBlackGrid());
 
@@ -105,7 +109,7 @@ public:
     GaugeField tmp(FermOp.GaugeGrid());
     GridBase *fcbgrid = FermOp.FermionRedBlackGrid();
 
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     SchurDifferentiableOperator<Impl> Mpc(FermOp);
     ConjugateGradientMultiShift<FermionField> msCG(param.MaxIter, PowerNegHalf);

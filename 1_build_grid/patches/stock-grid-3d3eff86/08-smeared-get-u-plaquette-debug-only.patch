@@ -1,0 +1,53 @@
+diff --git a/Grid/qcd/smearing/GaugeConfiguration.h b/Grid/qcd/smearing/GaugeConfiguration.h
+index 6f6fd016..cb53a4b0 100644
+--- a/Grid/qcd/smearing/GaugeConfiguration.h
++++ b/Grid/qcd/smearing/GaugeConfiguration.h
+@@ -284,29 +284,38 @@ public:
+   virtual GaugeField &get_U(bool smeared = false)
+   {
+     // get the config, thin links by default
++    // Patch 08: the plaquette below exists only for a GridLogDebug print; computing it costs a
++    // full-lattice reduction per call (~10 s per 48^3x96 trajectory), so do it only when Debug
++    // logging is active. Nothing else reads impl_plaq: the returned field is unchanged.
+     if (smeared)
+     {
+       if (smearingLevels)
+       {
+-        RealD impl_plaq =
+-	  WilsonLoops<Gimpl>::avgPlaquette(SmearedSet[smearingLevels - 1]);
+-        std::cout << GridLogDebug << "getting Usmr Plaq: " << impl_plaq
+-                  << std::endl;
++        if (GridLogDebug.isActive()) {
++          RealD impl_plaq =
++	    WilsonLoops<Gimpl>::avgPlaquette(SmearedSet[smearingLevels - 1]);
++          std::cout << GridLogDebug << "getting Usmr Plaq: " << impl_plaq
++                    << std::endl;
++        }
+         return get_SmearedU();
+       }
+       else
+       {
+-        RealD impl_plaq = WilsonLoops<Gimpl>::avgPlaquette(*ThinLinks);
+-        std::cout << GridLogDebug << "getting Thin Plaq: " << impl_plaq
+-                  << std::endl;
++        if (GridLogDebug.isActive()) {
++          RealD impl_plaq = WilsonLoops<Gimpl>::avgPlaquette(*ThinLinks);
++          std::cout << GridLogDebug << "getting Thin Plaq: " << impl_plaq
++                    << std::endl;
++        }
+         return *ThinLinks;
+       }
+     }
+     else
+     {
+-      RealD impl_plaq = WilsonLoops<Gimpl>::avgPlaquette(*ThinLinks);
+-      std::cout << GridLogDebug << "getting Thin Plaq: " << impl_plaq
+-                << std::endl;
++      if (GridLogDebug.isActive()) {
++        RealD impl_plaq = WilsonLoops<Gimpl>::avgPlaquette(*ThinLinks);
++        std::cout << GridLogDebug << "getting Thin Plaq: " << impl_plaq
++                  << std::endl;
++      }
+       return *ThinLinks;
+     }
+   }

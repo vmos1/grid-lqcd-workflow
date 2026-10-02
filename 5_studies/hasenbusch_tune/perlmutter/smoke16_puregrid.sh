@@ -102,10 +102,12 @@ fi
 #   LAMBDA_MN2                             fork-only MN2 knob; stock Integrator_algorithm.h
 #                                          has no such env
 #   INTEGRATOR_VERBOSE_MEM                 MemoryManager::Print gate (patch 03)
-#   STRANGE_EVEN, NO_METROP, IMPORT_CFG    reset, then set below as needed
+#   NO_METROP, IMPORT_CFG                  reset, then set below as needed
+#   STRANGE_EVEN is KEPT since 2026-10-02: it is a pure-Grid option (even-parity strange
+#   pseudofermion, paired automatically with the odd-block log-det, L189); the caller sets it.
 while read -r v; do
   unset "$v"
-done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|STRANGE_EVEN$|NO_METROP$|IMPORT_CFG$)' | grep -v -E '^(HASEN_GRID_|GRID_MG_)')
+done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|NO_METROP$|IMPORT_CFG$)' | grep -v -E '^(HASEN_GRID_|GRID_MG_)')
 # Kept on purpose (not scrubbed): every HASEN_GRID_* switch of the pure-Grid rung solvers
 # and GRID_MG_*, the multigrid tunables. HASEN_GRID_MG_RUNGS (M2,
 # 2026_09_29_pure_grid_m2_mg_solver_design.md) and, since M3, HASEN_GRID_MG_HEATBATH_RUNGS,
@@ -118,7 +120,7 @@ N_QUDA_ENV=$(compgen -e | grep -c '^QUDA_' || true)
 # otherwise; override with VAR=0 (a bit-identity check against an older reference run needs
 # all four at 0). A binary that predates a switch runs without it, with a warning.
 # Force-cost analysis s.7.5; one-page summary 2026_10_02_pure_grid_speedup_summary.md.
-for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SMEAR HASEN_GRID_IMPORT_SKIP; do
+for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SMEAR HASEN_GRID_IMPORT_SKIP HASEN_GRID_SHARE_FIELDSTRENGTH HASEN_GRID_GPU_CLOVER_INV HASEN_GRID_CLOVER_STENCIL; do
   if [ -z "${!v:-}" ]; then
     if [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ]; then
       export "$v=1"
@@ -273,7 +275,7 @@ printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GR
   "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" "$MPICH_GPU_IPC_ENABLED" "$MPICH_RDMA_ENABLED_CUDA" \
   "${HASEN_GRID_MG_RUNGS:-none}" "${HASEN_GRID_MG_HEATBATH_RUNGS:-none}" \
   "${HASEN_GRID_MIXED_CG_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" \
-  "$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
+  "$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_|STRANGE_EVEN$)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
   "${GRID_ARGS[*]}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"

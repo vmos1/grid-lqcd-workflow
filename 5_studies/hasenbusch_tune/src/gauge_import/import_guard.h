@@ -17,10 +17,16 @@
 //
 // HASEN_GRID_IMPORT_SKIP_VERBOSE=1: one line per guarded call on the boss rank with cumulative
 // skipped/performed counts for that operator.
+//
+// C2: every PERFORMED import (skip on or off) goes through ImportGaugeDispatch (fast_import.h):
+// with HASEN_GRID_SHARE_FIELDSTRENGTH=1 and/or HASEN_GRID_GPU_CLOVER_INV=1 it runs
+// FastImportGauge(op, U), otherwise the stock op.ImportGauge(U), untouched.
 #include <Grid/Grid.h>
 #include <cstdlib>
 #include <map>
 #include <memory>
+
+#include "gauge_import/fast_import.h"
 
 namespace Grid {
 
@@ -56,7 +62,7 @@ inline ImportGuardState<GF> &ImportGuardRegistry() {
 template <class Op, class GF>
 void GuardedImportGauge(Op &op, const GF &U) {
   if (!ImportSkipEnabled()) {
-    op.ImportGauge(U);
+    ImportGaugeDispatch(op, U);
     return;
   }
   auto &e = ImportGuardRegistry<GF>().reg[static_cast<const void *>(&op)];
@@ -73,7 +79,7 @@ void GuardedImportGauge(Op &op, const GF &U) {
   if (same) {
     ++e.skipped;
   } else {
-    op.ImportGauge(U);
+    ImportGaugeDispatch(op, U);
     if (!e.last || e.last->Grid() != U.Grid()) e.last.reset(new GF(U.Grid()));
     *e.last = U;
     ++e.performed;

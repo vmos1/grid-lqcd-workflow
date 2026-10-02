@@ -18,10 +18,22 @@
 //
 // det(M) = det(Mee) * det(Mpc)
 // For Nf=2: S_logdet = -ln det(Mee†Mee) = -2 Σ_{x∈even} ln|det(Mee(x))|
+//
+// Parity (constructor argument, default Even = the behaviour above, byte-identical): the block
+// whose log-det this monomial carries must be the one the partner pseudofermion's Schur complement
+// divides out.  Odd-checkerboard pseudofermion (Grid's SchurDiagMooee on Odd, the MP strange):
+// det S_oo = det M / det Mee -> Even.  Even-checkerboard pseudofermion (Schur on Even,
+// OneFlavourSchurCloverRationalActionEven): det S_ee = det M / det Moo -> Odd.  With clover,
+// det Mee != det Moo (site-local blocks (4+m) + csw/2 σF on different sites), so the pairing is
+// physics, not convention.  Odd: S() and both deriv paths run the same code on the odd block
+// (DiagonalOdd/TriangleOdd, DiagonalInvOdd/TriangleInvOdd); Lambda lives on odd sites, Even = 0.
+// Exactness check (src/logdet_parity/test_logdet_parity.cc): S_odd(U) == S_even(U shifted by
+// one site in x), and likewise the force, to roundoff.
 
 #include <Grid/qcd/action/fermion/CompactWilsonCloverFermion.h>
 #include <Grid/algorithms/blas/BatchedBlas.h>
 #include "gauge_import/import_guard.h"
+#include "clover_force/clover_cmunu.h"  // item D: staple cache + CloverSetCheckerboard (default off)
 #ifdef GRID_CUDA
 #include <cublas_v2.h>
 #endif
@@ -41,8 +53,10 @@ public:
 
   typedef CompactWilsonCloverFermion<Impl, CloverHelpers> FermionOperator;
 
-  QCDLogDetCompactCloverEOAction(FermionOperator &Op, int nf = 2)
-      : FermOp(Op), Nf(nf) {}
+  QCDLogDetCompactCloverEOAction(FermionOperator &Op, int nf = 2, int parity = Even)
+      : FermOp(Op), Nf(nf), Parity(parity) {
+    GRID_ASSERT(parity == Even || parity == Odd);
+  }
 
   ~QCDLogDetCompactCloverEOAction() {
     if (n_deriv_ > 0) {
@@ -59,7 +73,10 @@ public:
     }
   }
 
-  std::string action_name() override { return "QCDLogDetCompactCloverEOAction"; }
+  // Even keeps the historical name (log lines unchanged); Odd says which block it carries.
+  std::string action_name() override {
+    return Parity == Odd ? "QCDLogDetCompactCloverEOAction_Moo" : "QCDLogDetCompactCloverEOAction";
+  }
 
   std::string LogParameters() override {
     std::stringstream os;
@@ -75,12 +92,28 @@ public:
   // Reconstruct the full even-parity clover block Mee from the compact
   // Diagonal/Triangle storage into a transient scratch CloverField on the
   // RB (even) grid.  ConvertLayout sets the scratch checkerboard to match.
+  // Parity == Odd: the odd block Moo instead (same RB grid object, checkerboard Odd); the names
+  // and every caller are kept from the even-only version so the diff stays local.  The callers'
+  // scratch is constructed on the default (Even) checkerboard and ConvertLayout's conformable()
+  // checks it against the source's, so the Odd branches set it first.
   void ReconstructEven(CloverField &out) {
+    if (Parity == Odd) {
+      out.Checkerboard() = Odd;
+      CompactWilsonCloverHelpers<Impl>::ConvertLayout(
+          FermOp.DiagonalOdd, FermOp.TriangleOdd, out);
+      return;
+    }
     CompactWilsonCloverHelpers<Impl>::ConvertLayout(
         FermOp.DiagonalEven, FermOp.TriangleEven, out);
   }
-  // Same for Mee^{-1} from the inverse Diagonal/Triangle storage.
+  // Same for Mee^{-1} (Moo^{-1} with Parity == Odd) from the inverse Diagonal/Triangle storage.
   void ReconstructInvEven(CloverField &out) {
+    if (Parity == Odd) {
+      out.Checkerboard() = Odd;
+      CompactWilsonCloverHelpers<Impl>::ConvertLayout(
+          FermOp.DiagonalInvOdd, FermOp.TriangleInvOdd, out);
+      return;
+    }
     CompactWilsonCloverHelpers<Impl>::ConvertLayout(
         FermOp.DiagonalInvEven, FermOp.TriangleInvEven, out);
   }
@@ -262,7 +295,7 @@ public:
     auto t_cb0 = usecond();
     CloverField Lambda(fgrid);
     Lambda = Zero();
-    setCheckerboard(Lambda, CTInvEven);
+    CloverSetCheckerboard(Lambda, CTInvEven);  // device-side under HASEN_GRID_DEVICE_CB=1 (clover_cmunu.h)
     t_setcb_us_ += usecond() - t_cb0;
 
     auto t_lnk0 = usecond();
@@ -288,6 +321,17 @@ public:
         Gamma::Algebra::MinusSigmaZT};
 
     auto t_cmn0 = usecond();
+    // HASEN_GRID_CLOVER_STAPLE_CACHE=1: Cmunu with cached link products (clover_cmunu.h,
+    // bit-identical; CloverHelpers::Cmunu is WilsonCloverHelpers<Impl>::Cmunu). Off: stock call.
+    CloverStapleCache<Impl> *cache = nullptr;
+    double t_loop0 = 0;
+    if (CloverStapleCacheEnabled()) {
+      // Only the helpers whose Cmunu is the stock WilsonCloverHelpers one (not exp-clover).
+      GRID_ASSERT((std::is_same<CloverHelpers, CompactCloverHelpers<Impl>>::value));
+      cache = &CloverStapleCache<Impl>::Instance();
+      cache->Prepare(Ulinks);
+      t_loop0 = usecond();
+    }
     GaugeLinkField force_mu(fgrid), lambda(fgrid);
     GaugeField clover_force(fgrid);
     int count = 0;
@@ -301,11 +345,15 @@ public:
                                              : 2.0 * FermOp.csw_r;
         CloverField Slambda = Gamma(sigma[count]) * Lambda;
         lambda = TraceIndex<SpinIndex>(Slambda);
-        force_mu -= factor * CloverHelpers::Cmunu(Ulinks, lambda, mu, nu);
+        if (cache)
+          force_mu -= factor * cache->Cmunu(Ulinks, lambda, mu, nu);
+        else
+          force_mu -= factor * CloverHelpers::Cmunu(Ulinks, lambda, mu, nu);
         count++;
       }
       pokeLorentz(clover_force, Ulinks[mu] * force_mu, mu);
     }
+    if (cache) cache->EndPass(usecond() - t_loop0);
 
     // S = -Nf * ln|det Mee|.
     // clover_force = Tr(Mee^{-1} dMee/dU) in UdSdU convention.
@@ -367,6 +415,9 @@ public:
       CloverField Slambda_e =
           Gamma(positive_sigma[k]) * CTInvEven;
       lambda_e[k] = TraceIndex<SpinIndex>(Slambda_e);
+      // TraceIndex returns a fresh Lattice on the default (Even) checkerboard; carry the block's
+      // so setCheckerboard below fills the right sites.  No-op for Even; required for Odd.
+      lambda_e[k].Checkerboard() = CTInvEven.Checkerboard();
     }
 
     // Push to full-grid Lattice<ColourMatrix> (only Even populated, Odd = 0)
@@ -376,11 +427,45 @@ public:
         GaugeLinkField(fgrid), GaugeLinkField(fgrid), GaugeLinkField(fgrid)};
     for (int k = 0; k < 6; ++k) {
       lambda_full[k] = Zero();
-      setCheckerboard(lambda_full[k], lambda_e[k]);
+      CloverSetCheckerboard(lambda_full[k], lambda_e[k]);  // device-side under HASEN_GRID_DEVICE_CB=1
     }
     t_setcb_us_ += usecond() - t_cb0;
 
     auto t_cmn0 = usecond();
+    // HASEN_GRID_CLOVER_STENCIL=1: the loop below as one PaddedCell exchange per field and
+    // site-local kernels (clover_cmunu.h, stage 2), same factors and link product.
+    if (CloverStencilEnabled()) {
+      GRID_ASSERT((std::is_same<CloverHelpers, CompactCloverHelpers<Impl>>::value));
+      RealD sf[4][4];
+      for (int mu = 0; mu < 4; mu++)
+        for (int nu = 0; nu < 4; nu++) {
+          RealD factor = (nu == 3 || mu == 3) ? 2.0 * FermOp.csw_t : 2.0 * FermOp.csw_r;
+          sf[mu][nu] = (mu == nu) ? 0.0 : ((mu < nu) ? factor : -factor);
+        }
+      const GaugeLinkField *lam[6] = {&lambda_full[0], &lambda_full[1], &lambda_full[2],
+                                      &lambda_full[3], &lambda_full[4], &lambda_full[5]};
+      std::vector<GaugeLinkField> fmu(Nd, fgrid);
+      CloverCmunuStencil<Impl>::Instance().ForceMu(Ulinks, lam, sigma_idx, sf, fmu);
+      GaugeField clover_force(fgrid);
+      clover_force = Zero();
+      for (int mu = 0; mu < 4; mu++) pokeLorentz(clover_force, Ulinks[mu] * fmu[mu], mu);
+      dSdU = RealD(Nf) * clover_force;
+      t_cmunu_us_ += usecond() - t_cmn0;
+      t_total_us_ += usecond() - t_total0;
+      n_deriv_++;
+      return;
+    }
+    // HASEN_GRID_CLOVER_STAPLE_CACHE=1: Cmunu with cached link products (clover_cmunu.h,
+    // bit-identical). Off: the stock call.
+    CloverStapleCache<Impl> *cache = nullptr;
+    double t_loop0 = 0;
+    if (CloverStapleCacheEnabled()) {
+      // Only the helpers whose Cmunu is the stock WilsonCloverHelpers one (not exp-clover).
+      GRID_ASSERT((std::is_same<CloverHelpers, CompactCloverHelpers<Impl>>::value));
+      cache = &CloverStapleCache<Impl>::Instance();
+      cache->Prepare(Ulinks);
+      t_loop0 = usecond();
+    }
     GaugeLinkField force_mu(fgrid);
     GaugeField clover_force(fgrid);
     clover_force = Zero();
@@ -395,11 +480,15 @@ public:
         // (signed) lambda copy.
         RealD signed_factor = (mu < nu) ? factor : -factor;
         int k = sigma_idx[mu][nu];
-        force_mu -= signed_factor *
-                    CloverHelpers::Cmunu(Ulinks, lambda_full[k], mu, nu);
+        if (cache)
+          force_mu -= signed_factor * cache->Cmunu(Ulinks, lambda_full[k], mu, nu);
+        else
+          force_mu -= signed_factor *
+                      CloverHelpers::Cmunu(Ulinks, lambda_full[k], mu, nu);
       }
       pokeLorentz(clover_force, Ulinks[mu] * force_mu, mu);
     }
+    if (cache) cache->EndPass(usecond() - t_loop0);
     dSdU = RealD(Nf) * clover_force;
     t_cmunu_us_ += usecond() - t_cmn0;
     t_total_us_ += usecond() - t_total0;
@@ -409,6 +498,7 @@ public:
 private:
   FermionOperator &FermOp;
   int Nf;
+  int Parity;  // Even (default): -Nf ln|det Mee|; Odd: -Nf ln|det Moo|
 
   // Per-component timers (accumulate across deriv calls; printed on destruct).
   uint64_t n_deriv_ = 0;

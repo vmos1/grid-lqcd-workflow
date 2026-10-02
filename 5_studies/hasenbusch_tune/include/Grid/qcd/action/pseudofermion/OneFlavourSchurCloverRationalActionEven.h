@@ -1,10 +1,13 @@
 #pragma once
 // EVEN-parity variant of OneFlavourSchurCloverRationalAction.
 //
-// Identical action — the partition function is unchanged whether we sample
-// PhiOdd ~ exp[-φ† (M_pc_oo†M_pc_oo)^(-1/2) φ] or
-// PhiEven ~ exp[-φ† (M_pc_ee†M_pc_ee)^(-1/2) φ], because det(M_pc_oo) =
-// det(M_pc_ee) by the Schur identity.
+// NOT the identical action on its own (corrected 2026-10-02): det(M_pc_oo) = det M / det M_ee
+// and det(M_pc_ee) = det M / det M_oo, and with a clover term det M_ee != det M_oo. Sampling
+// PhiEven ~ exp[-φ† (M_pc_ee†M_pc_ee)^(-1/2) φ] instead of PhiOdd therefore requires the
+// partner log-det monomial on the OTHER block: -ln|det M_oo| (QCDLogDetCompactCloverEOAction
+// with parity Odd), not the even block it was paired with from 2026-06-24 to 2026-10-02
+// (that sampled |det M| det M_ee / det M_oo; grid_qcd docs
+// 2026_10_02_strange_logdet_parity_mismatch.md, L189). The driver pairs the two automatically.
 //
 // Reason for an even-parity variant: QUDA's `computeCloverForceQuda`
 // hardcodes EVEN_EVEN_ASYMMETRIC matpc and expects the X_k solutions on
@@ -19,6 +22,10 @@
 // already parity-agnostic in SchurDifferentiableOperator).
 
 #include <Grid/qcd/action/fermion/WilsonCloverFermion.h>
+// A3: every ImportGauge into FermOp goes through the exact-skip guard (HASEN_GRID_IMPORT_SKIP=1,
+// default off = plain ImportGauge). The strange operator is also imported by the MP deriv and by
+// the strange log-det action, all guarded, so the guard sees ALL imports into it (hazard 1).
+#include "gauge_import/import_guard.h"
 
 NAMESPACE_BEGIN(Grid);
 
@@ -80,7 +87,7 @@ public:
     eta = eta * scale;
     pickCheckerboard(Even, etaEven, eta);
 
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     SchurDifferentiableOperator<Impl> Mpc(FermOp);
     ConjugateGradientMultiShift<FermionField> msCG(param.MaxIter, PowerQuarter);
@@ -88,7 +95,7 @@ public:
   }
 
   RealD S(const GaugeField &U) override {
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     FermionField Y(FermOp.FermionRedBlackGrid());
 
@@ -112,7 +119,7 @@ public:
     GaugeField tmp(FermOp.GaugeGrid());
     GridBase *fcbgrid = FermOp.FermionRedBlackGrid();
 
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     SchurDifferentiableOperator<Impl> Mpc(FermOp);
     ConjugateGradientMultiShift<FermionField> msCG(param.MaxIter, PowerNegHalf);

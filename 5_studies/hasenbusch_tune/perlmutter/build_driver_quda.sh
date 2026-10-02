@@ -63,7 +63,10 @@ fi
 GRID_BUILD=$(cd "$(dirname "$GRID_CONFIG")" && pwd)
 
 CXX=$($GRID_CONFIG --cxx)
-CXXFLAGS="$($GRID_CONFIG --cxxflags) -I${TXQCD_PROD} -I${GRID_TXQCD} -I${GRID_BUILD}/Grid"
+# -I<hb>/src: the shared driver's project headers ("clover_force/...", "gauge_import/...",
+# "grid_mg/..."), resolved the same way build_driver_stock.sh resolves them (2026-10-02; the
+# hybrid build failed on clover_force/clover_cmunu.h without it).
+CXXFLAGS="$($GRID_CONFIG --cxxflags) -I${HERE}/../src -I${TXQCD_PROD} -I${GRID_TXQCD} -I${GRID_BUILD}/Grid"
 # CXX_STD=c++20 overrides grid-config's -std (in both --cxx and --cxxflags).
 # Needed for sources that include QUDA's INTERNAL headers (e.g. via
 # Grid/util/QudaForcePrimitives.h / QudaSchurOpForce.h): the pinned QUDA is

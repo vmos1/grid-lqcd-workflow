@@ -641,7 +641,41 @@ int main(int argc, char **argv) {
             << " degree=" << rat_degree << std::endl;
   OneFlavourRationalParams strange_rat(rat_lo, rat_hi, cg_max, cg_tol, rat_degree, 64,
                                        100, 1e-6, 1e-4);
-  QCDLogDetCloverEOAction<WilsonImplR> StrangeLogDet(StrangeFermOp, 1);
+  // Strange EO log-det, the partner of the strange pseudofermion's Schur complement: with the
+  // pseudofermion on the ODD checkerboard (the default MP action, det S_oo = det M / det M_ee) it
+  // is -ln|det(M_ee)|; with the pseudofermion on the EVEN checkerboard (STRANGE_EVEN, or the QUDA
+  // force path QUDA_FORCE, det S_ee = det M / det M_oo) it is -ln|det(M_oo)|. With clover
+  // det M_ee != det M_oo, so this pairing is physics, not convention: the hybrid ran the even
+  // pseudofermion with the even log-det from 2026-06-24 to 2026-10-02 and sampled
+  // |det M| det M_ee / det M_oo (__docs/2026_10_02_strange_logdet_parity_mismatch.md, L189).
+  // The block follows the pseudofermion automatically (the same tests that select it below).
+  // HASEN_GRID_STRANGE_LOGDET_ODD=1|0 forces it (0 with an even pseudofermion reproduces the old
+  // mis-paired action, for comparison runs only, and says so loudly). Same block as
+  // gen_qcd_hasenbusch_tune_compact_schur.cc, here with the non-compact log-det class.
+  const bool strange_even_pf = [] {
+    if (std::getenv("STRANGE_EVEN") != nullptr) return true;
+#ifdef GRID_HAVE_QUDA
+    if (std::getenv("QUDA_FORCE") != nullptr) return true;
+#endif
+    return false;
+  }();
+  const bool strange_logdet_odd = [strange_even_pf] {
+    const char *e = std::getenv("HASEN_GRID_STRANGE_LOGDET_ODD");
+    if (e && e[0] == '1') return true;
+    if (e && e[0] == '0') return false;
+    return strange_even_pf;
+  }();
+  QCDLogDetCloverEOAction<WilsonImplR> StrangeLogDet(StrangeFermOp, 1,
+                                                     strange_logdet_odd ? Odd : Even);
+  std::cout << GridLogMessage << "[StrangeLogDet] block = " << (strange_logdet_odd ? "M_oo" : "M_ee")
+            << " (strange pseudofermion on " << (strange_even_pf ? "EVEN" : "ODD")
+            << " sites" << (strange_logdet_odd == strange_even_pf ? ", correctly paired)" : ")")
+            << std::endl;
+  if (strange_logdet_odd != strange_even_pf)
+    std::cout << GridLogMessage
+              << "[StrangeLogDet] WARNING: HASEN_GRID_STRANGE_LOGDET_ODD overrides the pairing:"
+              << " this run samples |det M| times det M_ee / det M_oo (or its inverse) at the"
+              << " strange mass, NOT the target ensemble (L189). Comparison runs only." << std::endl;
   StrangeLogDet.is_smeared = true;
   // QUDA_FORCE=1 (Phase D) routes the strange Nf=1 RHMC deriv through
   // computeCloverForceQuda (PyQUDA dagger=YES convention, cos=1.0 vs PathA).
