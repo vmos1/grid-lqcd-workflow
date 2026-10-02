@@ -114,6 +114,19 @@ done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|
 # default binary behaviour; the ENV line below records them.
 N_QUDA_ENV=$(compgen -e | grep -c '^QUDA_' || true)
 [ "$N_QUDA_ENV" -eq 0 ] || die "QUDA_* variables still set after clearing"
+# ---- production defaults (2026-10-02): every validated speed-up ON unless the caller says
+# otherwise; override with VAR=0 (a bit-identity check against an older reference run needs
+# all four at 0). A binary that predates a switch runs without it, with a warning.
+# Force-cost analysis s.7.5; one-page summary 2026_10_02_pure_grid_speedup_summary.md.
+for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SMEAR HASEN_GRID_IMPORT_SKIP; do
+  if [ -z "${!v:-}" ]; then
+    if [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ]; then
+      export "$v=1"
+    else
+      echo "WARNING: $BIN predates $v: running without it" >&2
+    fi
+  fi
+done
 
 # ---- 4. Physics (16^3x48 cl3 ensemble) ---------------------------------------
 # Every value is exported even where it equals a compiled default, so neither
@@ -179,12 +192,14 @@ export TUNE_CG_TOL_STRANGE=1e-9
 # (6_benchmarks/grid_quda_wilson_clover/perlmutter/run_probe_grid_mg.sh; port
 # plan 2026_09_29_pure_grid_port_plan.md s.3.1 and s.7: never evaluate pure Grid
 # under chroma_match_sop_48.sh's --comms-sequential --shm-mpi 1 settings), with
-# MPICH GPU IPC + RDMA OFF for multi-rank GPU runs (port plan s.7 "CUDA IPC";
-# _SUM.md perlmutter-ops). On one node with --shm-mpi 0 the halo goes through
-# Grid's own nvlink shm, so the two MPICH knobs only guard against the IPC hang.
+# MPICH GPU IPC + GPU-direct RDMA ON by default since 2026-10-02 (L187; the June "=0"
+# rule predated the select_gpu + --gpu-bind=none model). Caller-overridable (=0). On one
+# node with --shm-mpi 0 the halo goes through Grid's own nvlink shm, so these mostly
+# affect Cshift and the MG coarse halos here.
 export SLURM_CPU_BIND=cores
 export MPICH_GPU_SUPPORT_ENABLED=1
-export MPICH_GPU_IPC_ENABLED=0 MPICH_RDMA_ENABLED_CUDA=0
+export MPICH_GPU_IPC_ENABLED=${MPICH_GPU_IPC_ENABLED:-1} MPICH_RDMA_ENABLED_CUDA=${MPICH_RDMA_ENABLED_CUDA:-1}
+export MPICH_GPU_EAGER_REGISTER_HOST_MEM=${MPICH_GPU_EAGER_REGISTER_HOST_MEM:-0} MPICH_GPU_NO_ASYNC_MEMCPY=${MPICH_GPU_NO_ASYNC_MEMCPY:-0}
 export MPICH_OFI_NIC_POLICY=GPU                           # halo-nic fix (L122); inert on 1 node
 export OMP_NUM_THREADS=8                                  # run_probe_grid_mg.sh
 # Decomposition: 4 ranks split T, as every 4-rank 16^3 driver recipe does
