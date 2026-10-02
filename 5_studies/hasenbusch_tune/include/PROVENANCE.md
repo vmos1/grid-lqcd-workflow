@@ -44,6 +44,30 @@ byte-identical (`cp -p`); the sha256 was checked on both source and copy.
 Re-verify a copy against the fork with `sha256sum` on both paths; a mismatch
 means one side was edited and this table is stale.
 
+## Local edits: M5 fused clover force (2026-10-01)
+Updated on 2026-10-01 12:07 CDT · perlmutter
+
+Three copies were edited here and now differ from the fork on purpose; the
+fork was not touched. For these three files this copy is the upstream from
+now on, and the sha256 values in the table above are the copy-time ones.
+
+| File (under `include/`) | Edit | sha256 after the edit |
+|---|---|---|
+| `Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioAction.h` | fused branch in `deriv` | `ae71973efdaadc916bd1c62f8abcf466c619e7129efd80fd589d14af85bfa401` |
+| `Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverAction.h` | fused branch in `deriv` | `9e31b1c263735807c2089603fab04b85ad09118111a44da8fffd8427ddd41829` |
+| `Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalActionMP.h` | fused branch in `deriv` | `c8c263711ce8c4e32aa520e680801eb79ca06d31e600de0f81361b50ed24a7b5` |
+
+Each edit only adds code: an `#include "clover_force/fused_clover_force.h"`
+and, in `deriv`, an `if (FusedCloverForceEnabled())` branch that accumulates
+the MooDeriv/MeeDeriv outer products and runs one clover pass
+(`src/clover_force/fused_clover_force.h`, switch
+`HASEN_GRID_FUSED_CLOVER_FORCE=1`, parsed by the driver). With the switch
+off, which is the default, the original statements run unchanged and in the
+same order. The include resolves through `-I$HB/src`, which
+`build_driver_stock.sh`, `build_test_grid_mg.sh` and
+`build_test_fused_clover.sh` all pass, so these three headers now need it.
+They still include no path that exists only in the fork.
+
 ## Dependencies on Grid
 Updated on 2026-09-29 15:06 CDT · perlmutter
 

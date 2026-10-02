@@ -21,6 +21,7 @@
 
 #include <Grid/qcd/action/fermion/CompactWilsonCloverFermion.h>
 #include <Grid/algorithms/blas/BatchedBlas.h>
+#include "gauge_import/import_guard.h"
 #ifdef GRID_CUDA
 #include <cublas_v2.h>
 #endif
@@ -183,7 +184,7 @@ public:
 #endif
 
   RealD S(const GaugeField &U) override {
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     // Reconstruct the full even-parity clover block on demand from the compact
     // Diagonal/Triangle storage.  Transient: lives only for this call.
@@ -248,7 +249,7 @@ public:
   void deriv_cpu(const GaugeField &U, GaugeField &dSdU) {
     auto t_total0 = usecond();
     auto t_imp0 = usecond();
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
     t_import_us_ += usecond() - t_imp0;
 
     GridBase *fgrid = FermOp.GaugeGrid();
@@ -326,7 +327,7 @@ public:
   void deriv_gpu(const GaugeField &U, GaugeField &dSdU) {
     auto t_total0 = usecond();
     auto t_imp0 = usecond();
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
     t_import_us_ += usecond() - t_imp0;
 
     GridBase *fgrid  = FermOp.GaugeGrid();

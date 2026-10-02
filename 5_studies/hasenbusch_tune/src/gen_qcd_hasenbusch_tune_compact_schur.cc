@@ -46,6 +46,10 @@
 //   HASEN_GRID_MIXED_CG_HEATBATH_RUNGS  Ratio rungs (none in HASEN_GRID_MG_HEATBATH_RUNGS)
 //                  whose heatbath runs Grid mixed-precision CG (cg_tol_act).  All three:
 //                  unset = the plain Grid CG route, byte-identical.
+//   HASEN_GRID_FUSED_CLOVER_FORCE  1 = fused clover force (M5 fix 2, src/clover_force/): the
+//                  ratio rungs, the tail and the strange MP RHMC accumulate their MooDeriv/MeeDeriv
+//                  outer products and run ONE clover-derivative pass per force call.  Unset,
+//                  empty or 0 = the per-call derivatives, byte-identical; other values exit(1).
 //   N_TRAJ         Number of trajectories (default 5)
 //   MDSTEPS        MD steps per trajectory (default 20)
 //   IMPORT_CFG     Path to starting gauge config (NERSC or Chroma LIME)
@@ -86,6 +90,9 @@
 #include "grid_mg/grid_mg_schur_solver.h"
 #include "grid_mg/mixed_cg_rung_solver.h"
 #include "grid_mg/ratio_action_rung_solver.h"
+// Fused clover force (HASEN_GRID_FUSED_CLOVER_FORCE): header-only, src/clover_force/; the
+// carried action headers include it too.  Nothing in it runs unless the variable is 1.
+#include "clover_force/fused_clover_force.h"
 #ifdef GRID_HAVE_QUDA
 #include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverQudaForceRationalActionMP.h>
 #include <Grid/qcd/action/pseudofermion/TwoFlavourSchurCloverRatioActionQuda.h>
@@ -455,6 +462,28 @@ int main(int argc, char **argv) {
                      SchurDifferentiableOperator<WilsonImplR>,
                      SchurDifferentiableOperator<WilsonImplF>>
       CG_strange_md(1e-6, cg_max, 50, &RBGridF, StrangeSchurOpD, StrangeSchurOpF);
+
+  // ── HASEN_GRID_FUSED_CLOVER_FORCE: fused clover force (M5 fix 2) ────────────
+  // 1 = the carried TwoFlavourSchurCloverRatioAction, TwoFlavourSchurCloverAction (tail) and
+  // OneFlavourSchurCloverRationalActionMP (strange) derivs accumulate their MooDeriv/MeeDeriv
+  // outer products into one field and run ONE clover pass per force call
+  // (src/clover_force/fused_clover_force.h; __docs/2026_09_30_pure_grid_force_cost_analysis.md
+  // section 5 fix 2).  Hopping derivatives, LogDets and STRANGE_EVEN are untouched.  Exact up to
+  // summation order.  Strict parse: unset, empty or 0 = per-call derivatives (byte-identical,
+  // nothing printed); 1 = on (one log line here, one per action at its first fused pass).
+  if (const char *v = std::getenv("HASEN_GRID_FUSED_CLOVER_FORCE"); v && *v) {
+    const std::string s(v);
+    if (s == "1") {
+      FusedCloverForceEnabled() = true;
+      std::cout << GridLogMessage
+                << "HASEN_GRID_FUSED_CLOVER_FORCE=1: fused clover force ON (ratio rungs, tail, "
+                   "strange MP RHMC: one accumulated outer product, one clover pass per force call)"
+                << std::endl;
+    } else if (s != "0") {
+      std::cerr << "HASEN_GRID_FUSED_CLOVER_FORCE=" << v << ": must be 0 or 1.\n";
+      exit(1);
+    }
+  }
 
   // ── Actions ───────────────────────────────────────────────────────────────
   // EO-SCHUR light sector (vs the full-operator "Tail" in the compact driver).

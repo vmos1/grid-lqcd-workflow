@@ -1,0 +1,44 @@
+--- a/Grid/qcd/action/pseudofermion/EvenOddSchurDifferentiable.h
++++ b/Grid/qcd/action/pseudofermion/EvenOddSchurDifferentiable.h
+@@ -49,6 +49,21 @@
+
+   SchurDifferentiableOperator (Matrix &Mat) : SchurDiagMooeeOperator<Matrix,FermionField>(Mat) {};
+
++  // Assemble the full force from its half-checkerboard pieces. The host
++  // setCheckerboard is a thread_for that forces a host view (and a full
++  // device-to-host / host-to-device round trip); the accelerator variant stays
++  // on the device. Runtime gate HASEN_GRID_DEVICE_CB=1 (default off).
++  static void AssembleForce(GaugeField &Force,const GaugeField &ForceE,const GaugeField &ForceO) {
++    static const bool device_cb = [](){ const char *e = getenv("HASEN_GRID_DEVICE_CB"); return e && e[0]=='1'; }();
++    if (device_cb) {
++      acceleratorSetCheckerboard(Force,ForceE);
++      acceleratorSetCheckerboard(Force,ForceO);
++    } else {
++      setCheckerboard(Force,ForceE);
++      setCheckerboard(Force,ForceO);
++    }
++  }
++
+   void MpcDeriv(GaugeField &Force,const FermionField &U,const FermionField &V) {
+
+     GridBase *fgrid   = this->_Mat.FermionGrid();
+@@ -88,8 +103,7 @@
+     GRID_ASSERT(ForceE.Checkerboard()==Even);
+     GRID_ASSERT(ForceO.Checkerboard()==Odd);
+
+-    setCheckerboard(Force,ForceE);
+-    setCheckerboard(Force,ForceO);
++    AssembleForce(Force,ForceE,ForceO);
+     Force=-Force;
+
+     delete forcecb;
+@@ -127,8 +141,7 @@
+     GRID_ASSERT(ForceE.Checkerboard()==Even);
+     GRID_ASSERT(ForceO.Checkerboard()==Odd);
+
+-    setCheckerboard(Force,ForceE);
+-    setCheckerboard(Force,ForceO);
++    AssembleForce(Force,ForceE,ForceO);
+     Force=-Force;
+
+     delete forcecb;

@@ -13,6 +13,10 @@
 //   3. Even-site chain rule: Moe Mee^{-1} dMee/dU Mee^{-1} Meo
 
 #include <Grid/qcd/action/fermion/WilsonCloverFermion.h>
+// M5 fused clover force (opt-in, HASEN_GRID_FUSED_CLOVER_FORCE=1): resolved through -I$HB/src
+// (build_driver_stock.sh, build_test_*.sh). Local edit, not in the Grid-TXQCD fork copy.
+#include "clover_force/fused_clover_force.h"
+#include "gauge_import/import_guard.h"
 
 NAMESPACE_BEGIN(Grid);
 
@@ -56,7 +60,7 @@ public:
     gaussian(pRNG, eta);
     pickCheckerboard(Odd, etaOdd, eta);
 
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
     SchurDifferentiableOperator<Impl> PCop(FermOp);
 
     PCop.MpcDag(etaOdd, PhiOdd);
@@ -64,7 +68,7 @@ public:
   }
 
   RealD S(const GaugeField &U) override {
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     FermionField X(FermOp.FermionRedBlackGrid());
     FermionField Y(FermOp.FermionRedBlackGrid());
@@ -81,7 +85,7 @@ public:
   }
 
   void deriv(const GaugeField &U, GaugeField &dSdU) override {
-    FermOp.ImportGauge(U);
+    GuardedImportGauge(FermOp, U);
 
     GridBase *fcbgrid = FermOp.FermionRedBlackGrid();
     FermionField X(fcbgrid);
@@ -100,6 +104,25 @@ public:
     dSdU = tmp;
     Mpc.MpcDagDeriv(tmp, X, Y);
     dSdU = dSdU + tmp;
+
+    if (FusedCloverForceEnabled()) {
+      // M5 fused clover force (HASEN_GRID_FUSED_CLOVER_FORCE=1, src/clover_force/
+      // fused_clover_force.h): the four MooDeriv/MeeDeriv calls of the else branch become
+      // four outer products (each result is added with +1 there) and ONE clover pass.
+      FusedCloverForce<Impl> fused(fcbgrid);
+      fused.AccumulateMoo(1.0, Y, X);            // FermOp.MooDeriv(Y, X) -> dSdU + tmp
+      fused.AccumulateMoo(1.0, X, Y);            // FermOp.MooDeriv(X, Y) -> dSdU + tmp
+      FermionField W_e(fcbgrid), Z_e(fcbgrid), tmp1(fcbgrid);
+      FermOp.Meooe(X, tmp1);
+      FermOp.MooeeInv(tmp1, W_e);
+      FermOp.MeooeDag(Y, tmp1);
+      FermOp.MooeeInvDag(tmp1, Z_e);
+      fused.AccumulateMee(1.0, Z_e, W_e);        // FermOp.MeeDeriv(Z_e, W_e) -> dSdU + tmp
+      fused.AccumulateMee(1.0, W_e, Z_e);        // FermOp.MeeDeriv(W_e, Z_e) -> dSdU + tmp
+      fused.Finish(FermOp, tmp, "TwoFlavourSchurCloverAction");
+      dSdU = dSdU + tmp;
+      return;
+    }
 
     // 2. Odd-site clover force from dMoo/dU
     FermOp.MooDeriv(tmp, Y, X, DaggerNo);

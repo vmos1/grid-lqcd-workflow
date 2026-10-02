@@ -152,17 +152,32 @@ export RAT_LO=0.4 RAT_HI=35.0 RAT_DEGREE=20               # strange RHMC bounds 
 # C3 = the w3 ladder with the tail on strange's level
 # (submit_scripts/hasenbusch_tune/2026_8_21_lvlroute_w3_tailmiddle_extend_2011_2020.sh,
 # on top of the SOP): 4 ratio rungs PF0..PF3 + bare-det tail at -0.1870.
-export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
 # The integrator / level knobs below are INERT in FORCES_ONLY: the driver returns
 # before the Integrator is constructed (driver FORCES_ONLY block). They are exported
-# so the driver still validates the C3 layout (tail=middle requires the 3-level
-# integrator), prints it in the [Ladder] banner, and so this env block equals the C3
-# HMC's. TRAJL is not required in FORCES_ONLY (driver exempts it); set for the same reason.
-export HASEN_STRANGE_LEVEL=middle
-export HASEN_STRANGE_INNER_MULT=1
-export HASEN_TAIL_LEVEL=middle
+# so the driver still validates the layout, prints it in the [Ladder] banner, and so
+# this env block equals the HMC's. TRAJL is not required in FORCES_ONLY (driver exempts
+# it); set for the same reason.
+# LADDER_PROFILE=baseG (default since 2026-10-01) or c3. baseG is the SOP's baseline of the Grid-vs-Chroma
+# comparison, 2026_08_24_grid_vs_chroma_comparison_summary.md: ladder
+# -0.2416,-0.2400,-0.2320,-0.2180,-0.1870, tail inner, MDSTEPS=12; SOP lines 23-30).
+LADDER_PROFILE=${LADDER_PROFILE:-baseG}
+case "$LADDER_PROFILE" in
+  c3)
+    export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
+    export HASEN_STRANGE_LEVEL=middle
+    export HASEN_STRANGE_INNER_MULT=1
+    export HASEN_TAIL_LEVEL=middle
+    export MDSTEPS=6                                      # C3 (SOP has 12)
+    ;;
+  baseG)
+    export HASEN_LADDER=-0.2416,-0.2400,-0.2320,-0.2180,-0.1870   # SOP: base+G
+    unset HASEN_STRANGE_LEVEL HASEN_STRANGE_INNER_MULT
+    export HASEN_TAIL_LEVEL=inner                         # SOP
+    export MDSTEPS=12                                     # SOP
+    ;;
+  *) die "LADDER_PROFILE must be c3 or baseG, got $LADDER_PROFILE" ;;
+esac
 export INTEGRATOR=ForceGradient                           # SOP section B
-export MDSTEPS=6                                          # C3 (SOP has 12)
 export GAUGE_INNER_MULT=2                                 # SOP section B
 export TRAJL=0.35355339059327379                          # SOP section B
 
@@ -231,17 +246,19 @@ for v in HASEN_GRID_MG_HEATBATH_RUNGS HASEN_GRID_MIXED_CG_RUNGS HASEN_GRID_MIXED
     unset "$v"
   fi
 done
-GRID_MG_ENV=$(compgen -e | grep '^GRID_MG_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
+GRID_MG_ENV=$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_FUSED)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
 
 # ---- 9. MPI / comms / threads -------------------------------------------------------
 # The probe's pure-Grid flag set, exactly as smoke16_puregrid.sh
 # (6_benchmarks/grid_quda_wilson_clover/perlmutter/run_probe_grid_mg.sh). NOT the
 # SOP's --shm-mpi 1 --comms-sequential: those inflate Grid's clover solve 5.16x (L130).
-# MPICH GPU IPC + RDMA off for multi-rank GPU runs (port plan s.7 "CUDA IPC");
+# MPICH GPU IPC + RDMA off for multi-rank GPU runs (port plan s.7 "CUDA IPC", a June
+# hang rule that predates the select_gpu model); caller-overridable since 10-01 for the
+# comms A/B (force-cost analysis doc s.7.3 item F), defaults unchanged.
 # NIC policy GPU = the halo-nic fix (L122), live here: 4 nodes, inter-node halos.
 export SLURM_CPU_BIND=cores
 export MPICH_GPU_SUPPORT_ENABLED=1
-export MPICH_GPU_IPC_ENABLED=0 MPICH_RDMA_ENABLED_CUDA=0
+export MPICH_GPU_IPC_ENABLED=${MPICH_GPU_IPC_ENABLED:-0} MPICH_RDMA_ENABLED_CUDA=${MPICH_RDMA_ENABLED_CUDA:-0}
 export MPICH_OFI_NIC_POLICY=GPU
 export OMP_NUM_THREADS=8                                  # run_probe_grid_mg.sh
 # Decomposition 1.2.2.4 = the SOP's and the MG probe's C3 split: local 48.24.24.24,
@@ -342,7 +359,7 @@ case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
 printf 'ENV FORCES48_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s MODE=FORCES_ONLY FORCES_SAMPLES=%s FORCES_SKIP=none LATT=%s MPI=%s NODES=%s NTASKS=%s IMPORT_CFG=%s SEED=%s LADDER=%s STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s TAIL_LEVEL=%s INTEGRATOR=%s MDSTEPS=%s GAUGE_INNER_MULT=%s TRAJL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s MPICH_NIC=%s OMP=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" DEVICE_MEM_MB=%s VERBOSE_MEM=%s GPU_MON_MS=%s GRID_FLAGS="%s"\n' \
   "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
   "$FORCES_SAMPLES" "$LATT" "$MPI_GEOM" "$NODES" "$NTASKS" "$(basename "$IMPORT_CFG")" \
-  "$HMC_SEED_OFFSET" "$HASEN_LADDER" "$HASEN_STRANGE_LEVEL" "$HASEN_STRANGE_INNER_MULT" \
+  "$HMC_SEED_OFFSET" "$HASEN_LADDER" "${HASEN_STRANGE_LEVEL:-default}" "${HASEN_STRANGE_INNER_MULT:-default}" \
   "$HASEN_TAIL_LEVEL" "$INTEGRATOR" "$MDSTEPS" "$GAUGE_INNER_MULT" "$TRAJL" \
   "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \
   "$RAT_LO" "$RAT_HI" "$RAT_DEGREE" "$TUNE_CG_TOL_DERIV" "$TUNE_CG_TOL_ACTION" \

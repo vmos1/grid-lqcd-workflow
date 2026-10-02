@@ -30,6 +30,10 @@
 // left to guard).
 
 #include <Grid/qcd/action/fermion/WilsonCloverFermion.h>
+// M5 fused clover force (opt-in, HASEN_GRID_FUSED_CLOVER_FORCE=1): resolved through -I$HB/src
+// (build_driver_stock.sh, build_test_*.sh). Local edit, not in the Grid-TXQCD fork copy.
+#include "clover_force/fused_clover_force.h"
+#include "gauge_import/import_guard.h"
 
 NAMESPACE_BEGIN(Grid);
 
@@ -99,8 +103,8 @@ public:
     FermionField etaOdd(NumOp.FermionRedBlackGrid());
     pickCheckerboard(Odd, etaOdd, eta);
 
-    NumOp.ImportGauge(U);
-    DenOp.ImportGauge(U);
+    GuardedImportGauge(NumOp, U);
+    GuardedImportGauge(DenOp, U);
 
     SchurDifferentiableOperator<Impl> Mpc(DenOp);
     SchurDifferentiableOperator<Impl> Vpc(NumOp);
@@ -118,8 +122,8 @@ public:
   // S = phi^dag Vpc (Mpc^dag Mpc)^-1 Vpc^dag phi
   //////////////////////////////////////////////////////
   RealD S(const GaugeField &U) override {
-    NumOp.ImportGauge(U);
-    DenOp.ImportGauge(U);
+    GuardedImportGauge(NumOp, U);
+    GuardedImportGauge(DenOp, U);
 
     SchurDifferentiableOperator<Impl> Mpc(DenOp);
     SchurDifferentiableOperator<Impl> Vpc(NumOp);
@@ -143,8 +147,8 @@ public:
   //       + phi^dag Vpc (Mpc^dag Mpc)^-1 dVpc^dag  phi
   //////////////////////////////////////////////////////
   void deriv(const GaugeField &U, GaugeField &dSdU) override {
-    NumOp.ImportGauge(U);
-    DenOp.ImportGauge(U);
+    GuardedImportGauge(NumOp, U);
+    GuardedImportGauge(DenOp, U);
 
     GridBase *fcbgrid = NumOp.FermionRedBlackGrid();
     SchurDifferentiableOperator<Impl> Mpc(DenOp);
@@ -178,6 +182,32 @@ public:
     // (X, PhiOdd) / (Y, X) argument pairing established above.
     GaugeField tmp(dSdU.Grid());
 
+    if (FusedCloverForceEnabled()) {
+      // M5 fused clover force (HASEN_GRID_FUSED_CLOVER_FORCE=1, src/clover_force/
+      // fused_clover_force.h): the eight MooDeriv/MeeDeriv calls of the else branch become
+      // eight outer products, each with the sign its call's result is added with below
+      // (-1 DenOp, +1 NumOp), and ONE clover pass. Same spinors, same pairings, same
+      // Meooe/MooeeInv chains. Exact by linearity because NumOp and DenOp share the links
+      // (both imported U above) and csw; the clover force does not depend on the mass.
+      GRID_ASSERT(NumOp.csw_r == DenOp.csw_r && NumOp.csw_t == DenOp.csw_t);
+      FusedCloverForce<Impl> fused(fcbgrid);
+      fused.AccumulateMoo(-1.0, Y, X);           // DenOp.MooDeriv(Y, X)   -> dSdU - tmp
+      fused.AccumulateMoo(-1.0, X, Y);           // DenOp.MooDeriv(X, Y)   -> dSdU - tmp
+      FermionField W_e(fcbgrid), Z_e(fcbgrid), tmp1(fcbgrid);
+      DenOp.Meooe(X, tmp1);         DenOp.MooeeInv(tmp1, W_e);
+      DenOp.MeooeDag(Y, tmp1);      DenOp.MooeeInvDag(tmp1, Z_e);
+      fused.AccumulateMee(-1.0, Z_e, W_e);       // DenOp.MeeDeriv(Z_e, W_e) -> dSdU - tmp
+      fused.AccumulateMee(-1.0, W_e, Z_e);       // DenOp.MeeDeriv(W_e, Z_e) -> dSdU - tmp
+      fused.AccumulateMoo(+1.0, PhiOdd, X);      // NumOp.MooDeriv(PhiOdd, X) -> dSdU + tmp
+      fused.AccumulateMoo(+1.0, X, PhiOdd);      // NumOp.MooDeriv(X, PhiOdd) -> dSdU + tmp
+      FermionField W_v(fcbgrid), Z_v(fcbgrid);
+      NumOp.Meooe(X, tmp1);         NumOp.MooeeInv(tmp1, W_v);
+      NumOp.MeooeDag(PhiOdd, tmp1); NumOp.MooeeInvDag(tmp1, Z_v);
+      fused.AccumulateMee(+1.0, Z_v, W_v);       // NumOp.MeeDeriv(Z_v, W_v) -> dSdU + tmp
+      fused.AccumulateMee(+1.0, W_v, Z_v);       // NumOp.MeeDeriv(W_v, Z_v) -> dSdU + tmp
+      fused.Finish(DenOp, tmp, "TwoFlavourSchurCloverRatioAction");
+      dSdU = dSdU + tmp;
+    } else {
     // DenOp odd-diagonal (Moo) force -- same (Y,X) pairing as the Mpc hopping terms.
     DenOp.MooDeriv(tmp, Y, X, DaggerNo);   dSdU = dSdU - tmp;
     DenOp.MooDeriv(tmp, X, Y, DaggerYes);  dSdU = dSdU - tmp;
@@ -202,6 +232,7 @@ public:
     NumOp.MeooeDag(PhiOdd, tmp1); NumOp.MooeeInvDag(tmp1, Z_v);
     NumOp.MeeDeriv(tmp, Z_v, W_v, DaggerNo);   dSdU = dSdU + tmp;
     NumOp.MeeDeriv(tmp, W_v, Z_v, DaggerYes);  dSdU = dSdU + tmp;
+    }
 
     // No separate EvenEven stochastic term: this class only ever represents
     // the odd-parity Schur complement.  The clover M_ee DETERMINANT (as

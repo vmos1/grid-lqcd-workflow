@@ -258,7 +258,7 @@ printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GR
   "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" "$MPICH_GPU_IPC_ENABLED" "$MPICH_RDMA_ENABLED_CUDA" \
   "${HASEN_GRID_MG_RUNGS:-none}" "${HASEN_GRID_MG_HEATBATH_RUNGS:-none}" \
   "${HASEN_GRID_MIXED_CG_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" \
-  "$(compgen -e | grep '^GRID_MG_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
+  "$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
   "${GRID_ARGS[*]}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"

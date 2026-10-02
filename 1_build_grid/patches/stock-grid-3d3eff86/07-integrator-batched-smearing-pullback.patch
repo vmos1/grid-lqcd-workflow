@@ -1,0 +1,272 @@
+diff --git a/Grid/qcd/hmc/integrators/Integrator.h b/Grid/qcd/hmc/integrators/Integrator.h
+index d7dd65c..935b05a 100644
+--- a/Grid/qcd/hmc/integrators/Integrator.h
++++ b/Grid/qcd/hmc/integrators/Integrator.h
+@@ -122,12 +122,42 @@ public:
+   } update_P_hireps{};
+ 
+  
++  //////////////////////////////////////////////////////////////////////////////////////////
++  // Runtime gates of the batched smearing pullback (update_P_batched below).  Read once
++  // (function-local statics).  Strict parse: unset, empty or 0 = off; 1 = on; else exit.
++  //////////////////////////////////////////////////////////////////////////////////////////
++  static bool batch_smear_gate(const char *name) {
++    const char *v = std::getenv(name);
++    if (v == nullptr || *v == '\0') return false;
++    const std::string s(v);
++    if (s == "1") return true;
++    if (s == "0") return false;
++    std::cerr << name << "=" << v << ": must be 0 or 1." << std::endl;
++    exit(EXIT_FAILURE);
++    return false;
++  }
++  static bool batch_smear_on(void) {
++    static const bool on = batch_smear_gate("HASEN_GRID_BATCH_SMEAR");
++    return on;
++  }
++  static bool batch_smear_check(void) {
++    static const bool chk = batch_smear_gate("HASEN_GRID_BATCH_SMEAR_CHECK");
++    return chk;
++  }
++
+   void update_P(MomentaField& Mom, Field& U, int level, double ep) {
+     // input U actually not used in the fundamental case
+     // Fundamental updates, include smearing
+ 
+     GRID_ASSERT(as.size()==LevelForces.size());
+     
++    // HASEN_GRID_BATCH_SMEAR=1: one smearing pullback per call (update_P_batched).
++    // Off (default): the stock per-action loop below, unchanged.
++    if (batch_smear_on()) {
++      update_P_batched(Mom, U, level, ep);
++      return;
++    }
++
+     Field level_force(U.Grid()); level_force =Zero();
+     for (int a = 0; a < as[level].actions.size(); ++a) {
+ 
+@@ -196,6 +226,211 @@ public:
+ 
+   }
+ 
++  //////////////////////////////////////////////////////////////////////////////////////////
++  // Batched smearing pullback.  Gate HASEN_GRID_BATCH_SMEAR=1 (default off: update_P runs
++  // the stock loop above).  Every momentum update goes through update_P(Mom,U,level,ep),
++  // including ForceGradient::FG_update_P (both of its calls), so all integrators batch.
++  //
++  // The stout chain rule Smearer.smeared_force() is linear in its argument, and so are
++  // projectForce (Ta) and the default momentum filter.  For the smeared actions of a level
++  //   sum_a Ta(Ta(pullback(F_a))) == Ta(Ta(pullback(sum_a F_a)))   (up to summation order),
++  // where F_a = dS_a/dU_smeared.  So each smeared action's RAW derivative (what
++  // ActionBase::deriv(ConfigurationBase&,...) computes before its pullback: deriv on
++  // Smearer.get_U(true)) is summed, unprojected, into force_sm, and smeared_force runs ONCE
++  // per call instead of once per smeared action.  Unsmeared actions (is_smeared=false, e.g.
++  // the gauge action) keep the stock call deriv(Smearer, force) and the stock projection,
++  // filter, logging and momentum update.  Assumes no smeared action overrides
++  // deriv(ConfigurationBase&,...) (stock JacobianAction does, but it is unsmeared).
++  //
++  // Logging.  A smeared action's per-action lines are labelled "(raw, pre-pullback)": norms
++  // of Ta(dS/dU_smeared), NOT the post-pullback numbers of the stock lines, and its deriv_log
++  // (deriv_num, "Force average size", FORCES summaries) holds the raw numbers too.  The
++  // level's pulled-back smeared sum is logged once as "[level] batched smeared force ...",
++  // with the stock norm definitions.  The LevelForces total keeps its stock meaning (post
++  // pullback, all actions).  deriv_us of a smeared action now excludes the pullback; the
++  // pullback time goes to LevelForces[level]'s deriv timer, printed by print_timer.
++  //
++  // HASEN_GRID_BATCH_SMEAR_CHECK=1 (read only with the gate on): also pulls back each
++  // smeared action separately (the stock way), sums those, and prints per call the relative
++  // difference to the batched force.  Diagnostic only: the momentum update is unchanged.
++  //////////////////////////////////////////////////////////////////////////////////////////
++  void update_P_batched(MomentaField& Mom, Field& U, int level, double ep) {
++
++    const bool check = batch_smear_check();
++    static bool announced = false;
++    if (!announced) {
++      announced = true;
++      std::cout << GridLogMessage << "HASEN_GRID_BATCH_SMEAR=1: batched smearing pullback ON"
++                << " (one smeared_force per update_P call; smeared per-action force lines are"
++                << " RAW, pre-pullback)" << std::endl;
++      if (check)
++        std::cout << GridLogMessage << "HASEN_GRID_BATCH_SMEAR_CHECK=1: per-action pullbacks"
++                  << " also computed and compared (diagnostic, slower)" << std::endl;
++    }
++
++    int n_smeared = 0;
++    for (int a = 0; a < as[level].actions.size(); ++a)
++      if (as[level].actions.at(a)->is_smeared) n_smeared++;
++
++    Field level_force(U.Grid()); level_force =Zero();
++
++    // Running sum of the RAW smeared-action derivatives, unprojected (smeared_force needs the
++    // full U_s*Sigma).  Allocated once per call, only on a level that has smeared actions.
++    std::unique_ptr<Field> force_sm;
++    std::unique_ptr<Field> force_ref;  // CHECK: stock per-action pullbacks, summed
++    if (n_smeared > 0) {
++      force_sm.reset(new Field(U.Grid())); *force_sm = Zero();
++      if (check) { force_ref.reset(new Field(U.Grid())); *force_ref = Zero(); }
++    }
++
++    for (int a = 0; a < as[level].actions.size(); ++a) {
++
++      double start_full = usecond();
++      Field force(U.Grid());
++      conformable(U.Grid(), Mom.Grid());
++
++      double start_force = usecond();
++
++      auto act = as[level].actions.at(a);
++      const bool smeared = act->is_smeared;
++
++      bool _verbose_mem = std::getenv("INTEGRATOR_VERBOSE_MEM") != nullptr;
++      if (_verbose_mem) MemoryManager::Print();
++      act->deriv_timer_start();
++      if (smeared) act->deriv(Smearer.get_U(true), force);  // RAW dS/dU_smeared, no pullback
++      else         act->deriv(Smearer, force);              // stock call
++      act->deriv_timer_stop();
++      if (_verbose_mem) MemoryManager::Print();
++
++      auto name = act->action_name();
++
++      if (smeared) {
++        *force_sm = *force_sm + force;
++        if (check) {
++          Field fref(force);
++          Smearer.smeared_force(fref);
++          fref = FieldImplementation::projectForce(fref);
++          MomFilter->applyFilter(fref);
++          *force_ref = *force_ref + fref;
++        }
++      }
++
++      force = FieldImplementation::projectForce(force); // Ta (smeared: for the raw log only)
++      double end_force = usecond();
++
++      Real force_abs, impulse_abs, force_max, impulse_max;
++      if (!smeared) {
++        // Stock path for an unsmeared action.
++        MomFilter->applyFilter(force);
++
++        std::cout << GridLogIntegrator << " update_P : Level [" << level <<"]["<<a <<"] "<<name<<" dt "<<ep<<  std::endl;
++
++        level_force = level_force+force;
++
++        force_abs   = std::sqrt(norm2(force)/U.Grid()->gSites());
++        impulse_abs = force_abs * ep * HMC_MOMENTUM_DENOMINATOR;
++        force_max   = std::sqrt(maxLocalNorm2(force));
++        impulse_max = force_max * ep * HMC_MOMENTUM_DENOMINATOR;
++
++        act->deriv_log(force_abs,force_max,impulse_abs,impulse_max);
++
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] dt           : " << ep <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Force average: " << force_abs <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Force max    : " << force_max <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Fdt average  : " << impulse_abs <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Fdt max      : " << impulse_max <<" "<<name<<std::endl;
++
++        Mom -= force * ep* HMC_MOMENTUM_DENOMINATOR;;
++      } else {
++        // Smeared action: log the RAW force (Ta of dS/dU_smeared); momentum update deferred.
++        std::cout << GridLogIntegrator << " update_P : Level [" << level <<"]["<<a <<"] "<<name<<" dt "<<ep<<" (smeared: raw force, pullback batched)"<<  std::endl;
++
++        force_abs   = std::sqrt(norm2(force)/U.Grid()->gSites());
++        impulse_abs = force_abs * ep * HMC_MOMENTUM_DENOMINATOR;
++        force_max   = std::sqrt(maxLocalNorm2(force));
++        impulse_max = force_max * ep * HMC_MOMENTUM_DENOMINATOR;
++
++        act->deriv_log(force_abs,force_max,impulse_abs,impulse_max);
++
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] dt           : " << ep <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Force average (raw, pre-pullback): " << force_abs <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Force max     (raw, pre-pullback): " << force_max <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Fdt average   (raw, pre-pullback): " << impulse_abs <<" "<<name<<std::endl;
++        std::cout << GridLogIntegrator<< "["<<level<<"]["<<a<<"] Fdt max       (raw, pre-pullback): " << impulse_max <<" "<<name<<std::endl;
++      }
++
++      double end_full = usecond();
++      double time_full  = (end_full - start_full) / 1e3;
++      double time_force = (end_force - start_force) / 1e3;
++      std::cout << GridLogMessage << "["<<level<<"]["<<a<<"] P update elapsed time: " << time_full << " ms (force: " << time_force << " ms)"
++                << (smeared ? " [raw deriv, pullback batched]" : "") << std::endl;
++
++    }
++
++    if (n_smeared > 0) {
++      // ONE chain-rule pullback for all smeared actions of this level.
++      Field &fsm = *force_sm;
++      double start_full = usecond();
++      LevelForces[level].actions.at(0)->deriv_timer_start();
++      Smearer.smeared_force(fsm);
++      LevelForces[level].actions.at(0)->deriv_timer_stop();
++      fsm = FieldImplementation::projectForce(fsm); // Ta, as the stock loop applies per action
++      double end_force = usecond();
++
++      MomFilter->applyFilter(fsm);
++
++      level_force = level_force+fsm;
++
++      Real force_abs   = std::sqrt(norm2(fsm)/U.Grid()->gSites());
++      Real impulse_abs = force_abs * ep * HMC_MOMENTUM_DENOMINATOR;
++      Real force_max   = std::sqrt(maxLocalNorm2(fsm));
++      Real impulse_max = force_max * ep * HMC_MOMENTUM_DENOMINATOR;
++
++      std::cout << GridLogIntegrator<< "["<<level<<"] batched smeared dt           : " << ep <<" ("<<n_smeared<<" smeared actions, one pullback)"<<std::endl;
++      std::cout << GridLogIntegrator<< "["<<level<<"] batched smeared force average: " << force_abs <<std::endl;
++      std::cout << GridLogIntegrator<< "["<<level<<"] batched smeared force max    : " << force_max <<std::endl;
++      std::cout << GridLogIntegrator<< "["<<level<<"] batched smeared Fdt average  : " << impulse_abs <<std::endl;
++      std::cout << GridLogIntegrator<< "["<<level<<"] batched smeared Fdt max      : " << impulse_max <<std::endl;
++
++      if (check) {
++        Field diff(U.Grid());
++        diff = fsm - *force_ref;
++        RealD n2d = norm2(diff);
++        RealD n2r = norm2(*force_ref);
++        RealD mxd = std::sqrt(maxLocalNorm2(diff));
++        RealD mxr = std::sqrt(maxLocalNorm2(*force_ref));
++        std::streamsize prec = std::cout.precision();
++        std::cout.precision(6);
++        std::cout << GridLogMessage << "["<<level<<"] HASEN_GRID_BATCH_SMEAR_CHECK"
++                  << " norm2(batched-unbatched)/norm2(unbatched) = " << n2d/n2r
++                  << "  sqrt = " << std::sqrt(n2d/n2r)
++                  << "  max-norm ratio = " << mxd/mxr
++                  << "  (" << n_smeared << " smeared actions, dt " << ep << ")" << std::endl;
++        std::cout.precision(prec);
++      }
++
++      Mom -= fsm * ep* HMC_MOMENTUM_DENOMINATOR;;
++      double end_full = usecond();
++      double time_full  = (end_full - start_full) / 1e3;
++      double time_force = (end_force - start_full) / 1e3;
++      std::cout << GridLogMessage << "["<<level<<"] batched smeared P update elapsed time: " << time_full << " ms (pullback+Ta: " << time_force << " ms)"  << std::endl;
++    }
++
++    {
++      // total force
++      Real force_abs   = std::sqrt(norm2(level_force)/U.Grid()->gSites()); //average per-site norm.  nb. norm2(latt) = \sum_x norm2(latt[x])
++      Real impulse_abs = force_abs * ep * HMC_MOMENTUM_DENOMINATOR;
++
++      Real force_max   = std::sqrt(maxLocalNorm2(level_force));
++      Real impulse_max = force_max * ep * HMC_MOMENTUM_DENOMINATOR;
++      LevelForces[level].actions.at(0)->deriv_log(force_abs,force_max,impulse_abs,impulse_max);
++    }
++
++    // Force from the other representations (never smeared: stock)
++    as[level].apply(update_P_hireps, Representations, Mom, U, ep);
++
++  }
++
+   void update_U(Field& U, double ep) 
+   {
+     update_U(P, U, ep);
+@@ -315,6 +550,12 @@ public:
+ 		  <<"["<<level<<"]["<< actionID<<"] "
+ 		  << as[level].actions.at(actionID)->deriv_us*1.0e-6<<" s"<< std::endl;
+       }
++      if (batch_smear_on()) {
++	std::cout << GridLogMessage
++		  << LevelForces[level].actions.at(0)->action_name()
++		  <<"["<<level<<"] batched smeared pullback "
++		  << LevelForces[level].actions.at(0)->deriv_us*1.0e-6<<" s"<< std::endl;
++      }
+     }
+     std::cout << GridLogMessage << "--------------------------- "<<std::endl;
+     std::cout << GridLogMessage << " Dslash counts "<<std::endl;

@@ -237,12 +237,28 @@ export RAT_LO=0.4 RAT_HI=35.0 RAT_DEGREE=20               # strange RHMC bounds 
 # on top of the SOP): 4 ratio rungs PF0..PF3 + bare-det tail at -0.1870, 3-level
 # ForceGradient: light rungs + LogDets outer (MDSTEPS=6), strange + tail middle
 # (x1), gauge inner (x2).
-export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
-export HASEN_STRANGE_LEVEL=middle
-export HASEN_STRANGE_INNER_MULT=1
-export HASEN_TAIL_LEVEL=middle
+# LADDER_PROFILE=baseG (default since 2026-10-01) or c3 (the production C3 above). baseG is the
+# SOP's baseline, the configuration of the Grid-vs-Chroma comparison 2026_08_24_grid_vs_chroma_comparison_summary.md:
+# ladder -0.2416,-0.2400,-0.2320,-0.2180,-0.1870, tail on the inner (gauge) level, MDSTEPS=12,
+# strange level at the driver default; chroma_match_sop_48.sh lines 23-30).
+LADDER_PROFILE=${LADDER_PROFILE:-baseG}
+case "$LADDER_PROFILE" in
+  c3)
+    export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
+    export HASEN_STRANGE_LEVEL=middle
+    export HASEN_STRANGE_INNER_MULT=1
+    export HASEN_TAIL_LEVEL=middle
+    export MDSTEPS=6                                      # C3 (SOP has 12)
+    ;;
+  baseG)
+    export HASEN_LADDER=-0.2416,-0.2400,-0.2320,-0.2180,-0.1870   # SOP: base+G
+    unset HASEN_STRANGE_LEVEL HASEN_STRANGE_INNER_MULT
+    export HASEN_TAIL_LEVEL=inner                         # SOP
+    export MDSTEPS=12                                     # SOP
+    ;;
+  *) die "LADDER_PROFILE must be c3 or baseG, got $LADDER_PROFILE" ;;
+esac
 export INTEGRATOR=ForceGradient                           # SOP section B
-export MDSTEPS=6                                          # C3 (SOP has 12)
 export GAUGE_INNER_MULT=2                                 # SOP section B
 # TRAJL is MANDATORY: the driver exits "FATAL: TRAJL is not set" before the config load.
 export TRAJL=0.35355339059327379                          # sqrt(2)/4, SOP section B
@@ -307,17 +323,19 @@ while read -r v; do
   [ "$N_STR" -gt 0 ] || die "$v is set but $BIN does not contain that name (typo, or an older binary); unset it"
   HASEN_GRID_EXTRA="$HASEN_GRID_EXTRA$v=${!v} "
 done < <(compgen -e | grep '^HASEN_GRID_' | grep -v -x -E 'HASEN_GRID_(MG_RUNGS|MG_HEATBATH_RUNGS|MIXED_CG_RUNGS|MIXED_CG_HEATBATH_RUNGS)')
-GRID_MG_ENV=$(compgen -e | grep '^GRID_MG_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
+GRID_MG_ENV=$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_FUSED)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
 
 # ---- 9. MPI / comms / threads -------------------------------------------------------
 # The probe's pure-Grid flag set, exactly as forces48_puregrid.sh
 # (6_benchmarks/grid_quda_wilson_clover/perlmutter/run_probe_grid_mg.sh). NOT the
 # SOP's --shm-mpi 1 --comms-sequential: those inflate Grid's clover solve 5.16x (L130).
-# MPICH GPU IPC + RDMA off for multi-rank GPU runs (port plan s.7 "CUDA IPC");
+# MPICH GPU IPC + RDMA off for multi-rank GPU runs (port plan s.7 "CUDA IPC", a June
+# hang rule that predates the select_gpu model, retracted by L187: both =1 are 9-35%
+# faster per force piece); caller-overridable since 10-01, defaults unchanged for now.
 # NIC policy GPU = the halo-nic fix (L122), live here: 4 nodes, inter-node halos.
 export SLURM_CPU_BIND=cores
 export MPICH_GPU_SUPPORT_ENABLED=1
-export MPICH_GPU_IPC_ENABLED=0 MPICH_RDMA_ENABLED_CUDA=0
+export MPICH_GPU_IPC_ENABLED=${MPICH_GPU_IPC_ENABLED:-0} MPICH_RDMA_ENABLED_CUDA=${MPICH_RDMA_ENABLED_CUDA:-0}
 export MPICH_OFI_NIC_POLICY=GPU
 export OMP_NUM_THREADS=8                                  # run_probe_grid_mg.sh
 # 1.2.2.4 = the SOP's and the MG probe's C3 split: local 48.24.24.24.
@@ -384,7 +402,7 @@ RNG_MIN=$(( 104 * (V + 1) ))      # RNG_SITMO (stock Config.h): 13 x uint64 per 
                                   # (Lattice_rng.h RngStateCount) + the serial RNG. The
                                   # hybrid chain's ckpoint_rng files are >= exactly this.
 # Physics fingerprint: a resume must continue the same action and integrator.
-PHYS="$LATT:$HASEN_LADDER:$MASS_LIGHT:$MASS_STRANGE:$CSW:$BETA:$U0:$STOUT_RHO/$STOUT_NSMEAR:$RAT_LO/$RAT_HI/$RAT_DEGREE:$INTEGRATOR:$MDSTEPS:$GAUGE_INNER_MULT:$TRAJL:$HASEN_STRANGE_LEVEL/$HASEN_STRANGE_INNER_MULT/$HASEN_TAIL_LEVEL:$TUNE_CG_TOL_DERIV/$TUNE_CG_TOL_ACTION/$TUNE_CG_TOL_STRANGE"
+PHYS="$LATT:$HASEN_LADDER:$MASS_LIGHT:$MASS_STRANGE:$CSW:$BETA:$U0:$STOUT_RHO/$STOUT_NSMEAR:$RAT_LO/$RAT_HI/$RAT_DEGREE:$INTEGRATOR:$MDSTEPS:$GAUGE_INNER_MULT:$TRAJL:${HASEN_STRANGE_LEVEL:-default}/${HASEN_STRANGE_INNER_MULT:-default}/$HASEN_TAIL_LEVEL:$TUNE_CG_TOL_DERIV/$TUNE_CG_TOL_ACTION/$TUNE_CG_TOL_STRANGE"
 
 PREV= PREV_LOG= PREV_ENV= PREV_LAT= PREV_RNG= PREV_RNG_CSUM= PREV_PLAQ= RESUME_N=
 prev_field() { printf '%s\n' "$PREV_ENV" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
@@ -586,7 +604,7 @@ ENV_KV=(
   "RESUME_RNG_CSUM=${PREV_RNG_CSUM:-none}" "RESUME_PLAQ=${PREV_PLAQ:-none}"
   "CKPT_DIR=$CKPT_DIR" "CKPT_FS=$CKPT_FS" "CKPT_INTERVAL=$CKPT_INTERVAL" "SMEARED_CKPT=no"
   "LATT=$LATT" "MPI=$MPI_GEOM" "NODES=$NODES" "NTASKS=$NTASKS"
-  "LADDER=$HASEN_LADDER" "STRANGE_LEVEL=$HASEN_STRANGE_LEVEL" "STRANGE_INNER_MULT=$HASEN_STRANGE_INNER_MULT"
+  "LADDER=$HASEN_LADDER" "STRANGE_LEVEL=${HASEN_STRANGE_LEVEL:-default}" "STRANGE_INNER_MULT=${HASEN_STRANGE_INNER_MULT:-default}"
   "TAIL_LEVEL=$HASEN_TAIL_LEVEL" "INTEGRATOR=$INTEGRATOR" "MDSTEPS=$MDSTEPS" "GAUGE_INNER_MULT=$GAUGE_INNER_MULT"
   "TRAJL=$TRAJL" "MASS_LIGHT=$MASS_LIGHT" "MASS_STRANGE=$MASS_STRANGE" "CSW=$CSW" "BETA=$BETA" "U0=$U0"
   "STOUT_RHO=$STOUT_RHO" "STOUT_NSMEAR=$STOUT_NSMEAR" "RAT=$RAT_LO/$RAT_HI/$RAT_DEGREE"
