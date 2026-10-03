@@ -29,6 +29,9 @@
 #   HASEN_GRID_MIXED_CG_HEATBATH_RUNGS  M3 routes, default unset; see section 8.
 #   DEVICE_MEM_MB        default 8000 (--device-mem, Grid's device lattice cache in MB)
 #   FORCES_SAMPLES       default 2 (see section 7)
+#   FO_PROFILE           production (default) or screen: the ladder-screening SOP (heatbath
+#                        routing of the trajectory launcher, deriv tol 1e-8, strange and gauge
+#                        skipped; ~50 s per steady-state sample at 48^3, analysis s.7.9)
 #   INTEGRATOR_VERBOSE_MEM  default 1; "" or 0 = off (see section 10: INERT here)
 #   GPU_MON_MS           default 2000 (nvidia-smi sampling period); 0 = no sampler
 #   SRUN_EXTRA           appended verbatim to srun (e.g. --overlap)
@@ -175,8 +178,30 @@ case "$LADDER_PROFILE" in
     export HASEN_TAIL_LEVEL=inner                         # SOP
     export MDSTEPS=12                                     # SOP
     ;;
-  *) die "LADDER_PROFILE must be c3 or baseG, got $LADDER_PROFILE" ;;
+  # c1 and c2 (2026-10-02): the other two tuned candidates of the c1c2c3 campaign, taken from
+  # the ENV lines of the hybrid chains runs/2026_8_13_u1a_accept10_seed300_48 (C1 = u1a: four
+  # masses, three ratio rungs, a heavy bare-det tail at +0.3044 on the light level, 2 levels,
+  # MDSTEPS 12) and runs/2026_8_10_3level_w3_mdsteps5_48 (C2 = w3@5: C3's ladder in the 3-level
+  # layout with the tail on the gauge level, MDSTEPS 5). Layout and MDSTEPS are inert in
+  # FORCES_ONLY but validated and printed by the driver.
+  c1)
+    export HASEN_LADDER=-0.2416,-0.2250,-0.1870,0.3044
+    unset HASEN_STRANGE_LEVEL HASEN_STRANGE_INNER_MULT
+    export HASEN_TAIL_LEVEL=outer
+    export MDSTEPS=12
+    ;;
+  c2)
+    export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
+    export HASEN_STRANGE_LEVEL=middle
+    export HASEN_STRANGE_INNER_MULT=1
+    export HASEN_TAIL_LEVEL=inner
+    export MDSTEPS=5
+    ;;
+  *) die "LADDER_PROFILE must be c1, c2, c3 or baseG, got $LADDER_PROFILE" ;;
 esac
+# Ratio rungs of the ladder: N masses -> rungs 0..N-2 (the last mass is the tail). The screen
+# profile's routing defaults below follow it.
+FO_NRUNG=$(( $(printf '%s\n' "$HASEN_LADDER" | tr ',' '\n' | wc -l) - 1 ))
 export INTEGRATOR=ForceGradient                           # SOP section B
 export GAUGE_INNER_MULT=2                                 # SOP section B
 export TRAJL=0.35355339059327379                          # SOP section B
@@ -213,6 +238,34 @@ export TUNE_CG_TOL_STRANGE=1e-9
 # strange multishift (RAT_DEGREE=20 shifted solutions) runs while the hierarchy is alive.
 export FORCES_ONLY=1
 export FORCES_SAMPLES=$FO_SAMPLES
+
+# ---- FO_PROFILE (2026-10-02): production (default, everything above, nothing skipped) or
+# screen = the hybrid's ladder-screening SOP (forces_only_sop_48.sh, forces-only-tol campaign,
+# L068/L071) in pure Grid: heatbaths on the hierarchy and in mixed-precision CG exactly as the
+# trajectory launcher routes them (a caller's own lists win), deriv tolerance 1e-8 (SCREENING
+# only: 1.096x there, never production), strange and gauge forces skipped. The forces a screen
+# run reports are screening numbers; they go into ladder comparisons, never into a production
+# or three-way table. Recorded on the ENV line (FORCES_SKIP, TOL_DRV, GRID_MG_HB, GRID_MIXED*).
+FO_PROFILE=${FO_PROFILE:-production}
+case "$FO_PROFILE" in
+  production) FO_SKIP_TAG=none ;;
+  screen)
+    export TUNE_CG_TOL_DERIV=1e-8
+    # Routing defaults follow the ladder (FO_NRUNG ratio rungs; MG on 0,1,2 by default): the
+    # heatbaths of rungs 0,1 on the hierarchy, rung 3 (if any) in mixed-precision CG, the other
+    # heatbaths in mixed-precision CG. A caller's own lists win.
+    export HASEN_GRID_MG_HEATBATH_RUNGS=${HASEN_GRID_MG_HEATBATH_RUNGS:-0,1}
+    if [ "$FO_NRUNG" -ge 4 ]; then
+      export HASEN_GRID_MIXED_CG_RUNGS=${HASEN_GRID_MIXED_CG_RUNGS:-3}
+      export HASEN_GRID_MIXED_CG_HEATBATH_RUNGS=${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-2,3}
+    else
+      export HASEN_GRID_MIXED_CG_HEATBATH_RUNGS=${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-2}
+    fi
+    export FORCES_SKIP_STRANGE=1
+    export FORCES_SKIP_GAUGE=1
+    FO_SKIP_TAG=strange,gauge ;;
+  *) die "FO_PROFILE must be production or screen, got '$FO_PROFILE'" ;;
+esac
 
 # ---- 8. Grid multigrid route ------------------------------------------------------
 # HASEN_GRID_MG_RUNGS=0,1,2: rung 0 (-0.2416) donates the one fp32 three-level
@@ -370,9 +423,9 @@ GRID_SHA=${GRID_HASH_LINE:0:40}
 GRID_SHA=${GRID_SHA:-unknown}
 case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
 
-printf 'ENV FORCES48_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s MODE=FORCES_ONLY FORCES_SAMPLES=%s FORCES_SKIP=none LATT=%s MPI=%s NODES=%s NTASKS=%s IMPORT_CFG=%s SEED=%s LADDER=%s STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s TAIL_LEVEL=%s INTEGRATOR=%s MDSTEPS=%s GAUGE_INNER_MULT=%s TRAJL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s MPICH_NIC=%s OMP=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" DEVICE_MEM_MB=%s VERBOSE_MEM=%s GPU_MON_MS=%s GRID_FLAGS="%s"\n' \
+printf 'ENV FORCES48_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s MODE=FORCES_ONLY FORCES_SAMPLES=%s FORCES_SKIP=%s FO_PROFILE=%s LATT=%s MPI=%s NODES=%s NTASKS=%s IMPORT_CFG=%s SEED=%s LADDER=%s STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s TAIL_LEVEL=%s INTEGRATOR=%s MDSTEPS=%s GAUGE_INNER_MULT=%s TRAJL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s MPICH_NIC=%s OMP=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" DEVICE_MEM_MB=%s VERBOSE_MEM=%s GPU_MON_MS=%s GRID_FLAGS="%s"\n' \
   "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
-  "$FORCES_SAMPLES" "$LATT" "$MPI_GEOM" "$NODES" "$NTASKS" "$(basename "$IMPORT_CFG")" \
+  "$FORCES_SAMPLES" "$FO_SKIP_TAG" "$FO_PROFILE" "$LATT" "$MPI_GEOM" "$NODES" "$NTASKS" "$(basename "$IMPORT_CFG")" \
   "$HMC_SEED_OFFSET" "$HASEN_LADDER" "${HASEN_STRANGE_LEVEL:-default}" "${HASEN_STRANGE_INNER_MULT:-default}" \
   "$HASEN_TAIL_LEVEL" "$INTEGRATOR" "$MDSTEPS" "$GAUGE_INNER_MULT" "$TRAJL" \
   "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \

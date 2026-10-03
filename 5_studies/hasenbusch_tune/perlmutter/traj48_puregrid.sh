@@ -40,6 +40,9 @@
 #   INTEGRATOR_VERBOSE_MEM  default 0 (off); 1 = MemoryManager::Print per force call
 #   GPU_MON_MS          default 2000 (nvidia-smi sampling period); 0 = no sampler
 #   SRUN_EXTRA          appended verbatim to srun (e.g. --overlap)
+#   DIAG_TOL_STRANGE, DIAG_MDSTEPS, DIAG_TRAJL  diagnostic overrides (2026-10-02, physics review
+#                       tests T1-T3): strange multishift tolerance, MD steps, trajectory length.
+#                       Unset = production. The ENV line records the values actually used.
 #
 # Output: runs/<YYYY_M_D>_<RUN>/hmc.log (unpadded date). Line 1 is the ENV provenance
 # line; per the conventions entry of __docs/_SUM.md that line, not this script, is the
@@ -256,12 +259,32 @@ case "$LADDER_PROFILE" in
     export HASEN_TAIL_LEVEL=inner                         # SOP
     export MDSTEPS=12                                     # SOP
     ;;
-  *) die "LADDER_PROFILE must be c3 or baseG, got $LADDER_PROFILE" ;;
+  # c1 and c2 (2026-10-02): the other two tuned candidates of the c1c2c3 campaign, from the ENV
+  # lines of the hybrid chains runs/2026_8_13_u1a_accept10_seed300_48 (C1 = u1a: four masses,
+  # three ratio rungs, a heavy bare-det tail at +0.3044 on the light level, 2 levels, MDSTEPS 12)
+  # and runs/2026_8_10_3level_w3_mdsteps5_48 (C2 = w3@5: C3's ladder in the 3-level layout with
+  # the tail on the gauge level, MDSTEPS 5). The rung routes below assume four ratio rungs: with
+  # c1 set HASEN_GRID_MIXED_CG_RUNGS= (empty) and HASEN_GRID_MIXED_CG_HEATBATH_RUNGS=2 yourself.
+  c1)
+    export HASEN_LADDER=-0.2416,-0.2250,-0.1870,0.3044
+    unset HASEN_STRANGE_LEVEL HASEN_STRANGE_INNER_MULT
+    export HASEN_TAIL_LEVEL=outer
+    export MDSTEPS=12
+    ;;
+  c2)
+    export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
+    export HASEN_STRANGE_LEVEL=middle
+    export HASEN_STRANGE_INNER_MULT=1
+    export HASEN_TAIL_LEVEL=inner
+    export MDSTEPS=5
+    ;;
+  *) die "LADDER_PROFILE must be c1, c2, c3 or baseG, got $LADDER_PROFILE" ;;
 esac
+export MDSTEPS=${DIAG_MDSTEPS:-$MDSTEPS}                        # DIAG_MDSTEPS: diagnostic override of the profile (header)
 export INTEGRATOR=ForceGradient                           # SOP section B
 export GAUGE_INNER_MULT=2                                 # SOP section B
 # TRAJL is MANDATORY: the driver exits "FATAL: TRAJL is not set" before the config load.
-export TRAJL=0.35355339059327379                          # sqrt(2)/4, SOP section B
+export TRAJL=${DIAG_TRAJL:-0.35355339059327379}       # sqrt(2)/4, SOP section B. DIAG_TRAJL: diagnostic override (header)
 
 # ---- 7. Trajectories, seed, tolerances --------------------------------------------
 export N_TRAJ
@@ -272,7 +295,7 @@ export N_TRAJ
 # PRODUCTION tolerances (chroma_match_sop_48.sh section C; __docs/_SUM.md conventions).
 export TUNE_CG_TOL_DERIV=1e-11
 export TUNE_CG_TOL_ACTION=1e-12
-export TUNE_CG_TOL_STRANGE=1e-9
+export TUNE_CG_TOL_STRANGE=${DIAG_TOL_STRANGE:-1e-9}   # DIAG_TOL_STRANGE: diagnostic override (header)
 # Metropolis ON: NO_METROP unset (section 4) -> NoMetropolisUntil=0, MetropolisTest=true
 # (driver HMCparameters block). NoMetropolisUntil counts from each run's own
 # StartTrajectory (HMC.h evolve), so it would restart on every segment: never set it.
