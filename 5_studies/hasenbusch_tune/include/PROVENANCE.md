@@ -102,3 +102,20 @@ GPU clover-inverse path, and cuBLAS host pointer mode). The headers here use
 only `GridBLAS::Init()` and `GridBLAS::gridblasHandle`, which stock provides
 (`InstantiateGPU` appears in comments only), so the difference is expected to
 affect performance only. A compile against stock has not been run yet.
+
+## Local edits 2026-10-05 (not in the fork)
+Updated on 2026-10-05 13:07 CDT · perlmutter
+
+The three strange-action headers now diverge from the fork copy (pure-Grid only; the fork
+headers are not edited, and the driver refuses the new knobs when built against them):
+`OneFlavourSchurRationalExtras` (separate MD degree and MD tolerance for the x^−1/2 force
+approximation, a run-time bounds check modelled on stock `Bounds.h`), selected by the macro
+`HASEN_STRANGE_RATIONAL_EXTRAS` and the driver variables `RAT_DEGREE_MD`,
+`TUNE_CG_TOL_STRANGE_MD`, `RAT_BOUNDS_CHECK_FREQ`, `RAT_BOUNDS_CHECK_TOL`,
+`RAT_BOUNDS_CHECK_ABORT` (all default to the previous behaviour; binary `_stock_m8` is
+bit-identical to `_stock_m7b` with them unset). Reason: ledger L191 (the strange interval missed
+the smeared spectrum unnoticed). Validation: `runs/2026_10_5_ratmd2_*` (16³).
+sha256 after the edit:
+- `OneFlavourSchurCloverRationalAction.h` 01ea58287e542f5f4c97eae8f3815ff37e42705f11ddc91ff8042dc50ee013a0
+- `OneFlavourSchurCloverRationalActionMP.h` ac489dd72a6924fbf42b82d7cbcd2266d5a1c8c9051c54c099be994d2089291a
+- `OneFlavourSchurCloverRationalActionEven.h` 860b1e4404685c5f76d3ee785213efce61ab6de2d7e9c1c62cfa23e0e6cebd95

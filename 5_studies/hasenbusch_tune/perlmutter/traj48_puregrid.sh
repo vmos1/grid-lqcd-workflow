@@ -43,6 +43,8 @@
 #   DIAG_TOL_STRANGE, DIAG_MDSTEPS, DIAG_TRAJL  diagnostic overrides (2026-10-02, physics review
 #                       tests T1-T3): strange multishift tolerance, MD steps, trajectory length.
 #                       Unset = production. The ENV line records the values actually used.
+#   DIAG_RAT_LO, DIAG_RAT_HI, DIAG_RAT_DEGREE  diagnostic overrides of the strange rational
+#                       approximation (2026-10-03, test T4: is the dH floor the [0.4, 35] interval?).
 #
 # Output: runs/<YYYY_M_D>_<RUN>/hmc.log (unpadded date). Line 1 is the ENV provenance
 # line; per the conventions entry of __docs/_SUM.md that line, not this script, is the
@@ -232,7 +234,17 @@ export MASS_LIGHT=-0.2416                                 # must equal HASEN_LAD
 export MASS_STRANGE=-0.2050
 # STOUT: params.h defaults (0.125 / 1), which every production 48^3 run inherited.
 export STOUT_RHO=0.125 STOUT_NSMEAR=1
-export RAT_LO=0.4 RAT_HI=35.0 RAT_DEGREE=20               # strange RHMC bounds (48^3 values)
+export RAT_LO=${DIAG_RAT_LO:-7e-4} RAT_HI=${DIAG_RAT_HI:-35.0} RAT_DEGREE=${DIAG_RAT_DEGREE:-20}   # strange RHMC bounds, 48^3. lo 7e-4 since 2026-10-03 (L191: smeared lambda_min ~3e-3, Chroma lowerMin 7e-4), was 0.4. DIAG_RAT_*: header
+# Strange bounds check (binary m8 and later, L191, 2026-10-06): every 10th refresh, tolerance 1e-6,
+# abort on FAIL. RAT_BOUNDS_CHECK_FREQ=0 turns it off, RAT_BOUNDS_CHECK_ABORT=0 only warns.
+export RAT_BOUNDS_CHECK_FREQ=${RAT_BOUNDS_CHECK_FREQ:-10} RAT_BOUNDS_CHECK_TOL=${RAT_BOUNDS_CHECK_TOL:-1e-6} RAT_BOUNDS_CHECK_ABORT=${RAT_BOUNDS_CHECK_ABORT:-1}
+RAT_BC_TAG=$RAT_BOUNDS_CHECK_FREQ/$RAT_BOUNDS_CHECK_TOL/$RAT_BOUNDS_CHECK_ABORT
+if ! grep -q -a -F RAT_BOUNDS_CHECK_FREQ "$BIN"
+then
+  echo "WARNING: $BIN predates the strange bounds check: running without it" >/dev/stderr
+  unset RAT_BOUNDS_CHECK_FREQ RAT_BOUNDS_CHECK_TOL RAT_BOUNDS_CHECK_ABORT
+  RAT_BC_TAG=none-binary
+fi
 
 # ---- 6. C3 ladder, level layout, integrator (LIVE here) ---------------------------
 # C3 = the w3 ladder with the tail on strange's level
@@ -442,7 +454,7 @@ RNG_MIN=$(( 104 * (V + 1) ))      # RNG_SITMO (stock Config.h): 13 x uint64 per 
                                   # (Lattice_rng.h RngStateCount) + the serial RNG. The
                                   # hybrid chain's ckpoint_rng files are >= exactly this.
 # Physics fingerprint: a resume must continue the same action and integrator.
-PHYS="$LATT:$HASEN_LADDER:$MASS_LIGHT:$MASS_STRANGE:$CSW:$BETA:$U0:$STOUT_RHO/$STOUT_NSMEAR:$RAT_LO/$RAT_HI/$RAT_DEGREE:$INTEGRATOR:$MDSTEPS:$GAUGE_INNER_MULT:$TRAJL:${HASEN_STRANGE_LEVEL:-default}/${HASEN_STRANGE_INNER_MULT:-default}/$HASEN_TAIL_LEVEL:$TUNE_CG_TOL_DERIV/$TUNE_CG_TOL_ACTION/$TUNE_CG_TOL_STRANGE"
+PHYS="$LATT:$HASEN_LADDER:$MASS_LIGHT:$MASS_STRANGE:$CSW:$BETA:$U0:$STOUT_RHO/$STOUT_NSMEAR:$RAT_LO/$RAT_HI/$RAT_DEGREE:$INTEGRATOR:$MDSTEPS:$GAUGE_INNER_MULT:$TRAJL:${HASEN_STRANGE_LEVEL:-default}/${HASEN_STRANGE_INNER_MULT:-default}/$HASEN_TAIL_LEVEL:$TUNE_CG_TOL_DERIV/$TUNE_CG_TOL_ACTION/$TUNE_CG_TOL_STRANGE${RAT_DEGREE_MD:+:RATMD=$RAT_DEGREE_MD}${TUNE_CG_TOL_STRANGE_MD:+:TOLMD=$TUNE_CG_TOL_STRANGE_MD}"
 
 PREV= PREV_LOG= PREV_ENV= PREV_LAT= PREV_RNG= PREV_RNG_CSUM= PREV_PLAQ= RESUME_N=
 prev_field() { printf '%s\n' "$PREV_ENV" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
@@ -648,6 +660,7 @@ ENV_KV=(
   "TAIL_LEVEL=$HASEN_TAIL_LEVEL" "INTEGRATOR=$INTEGRATOR" "MDSTEPS=$MDSTEPS" "GAUGE_INNER_MULT=$GAUGE_INNER_MULT"
   "TRAJL=$TRAJL" "MASS_LIGHT=$MASS_LIGHT" "MASS_STRANGE=$MASS_STRANGE" "CSW=$CSW" "BETA=$BETA" "U0=$U0"
   "STOUT_RHO=$STOUT_RHO" "STOUT_NSMEAR=$STOUT_NSMEAR" "RAT=$RAT_LO/$RAT_HI/$RAT_DEGREE"
+  "RAT_DEGREE_MD=${RAT_DEGREE_MD:-$RAT_DEGREE}" "TOL_STRANGE_MD=${TUNE_CG_TOL_STRANGE_MD:-$TUNE_CG_TOL_STRANGE}" "RAT_BOUNDS_CHECK=$RAT_BC_TAG"
   "TOL_DRV=$TUNE_CG_TOL_DERIV" "TOL_ACT=$TUNE_CG_TOL_ACTION" "TOL_STRANGE=$TUNE_CG_TOL_STRANGE"
   "GRID_MG_RUNGS=${HASEN_GRID_MG_RUNGS:-none}" "GRID_MG_HEATBATH_RUNGS=${HASEN_GRID_MG_HEATBATH_RUNGS:-none}"
   "GRID_MIXED_CG_RUNGS=${HASEN_GRID_MIXED_CG_RUNGS:-none}" "GRID_MIXED_CG_HEATBATH_RUNGS=${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}"

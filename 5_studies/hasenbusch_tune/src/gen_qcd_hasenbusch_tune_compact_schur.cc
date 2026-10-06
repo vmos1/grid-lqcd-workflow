@@ -1288,12 +1288,69 @@ int main(int argc, char **argv) {
   // Strange RHMC. Bounds and degree matched to Chroma's rat_3strange monomial.
   // Env-overridable for spectra where lo=1e-4 sits below lambda_min (phantom poles
   // that QUDA's multishift cannot invert); e.g. 48^3 b6.3 needs RAT_LO~0.4 RAT_HI~35.
+  // CORRECTION 2026-10-05 (L191): 0.4 came from THIN links; the smeared-link strange spectrum at
+  // 48^3 b6.3 reaches lambda_min ~3e-3, so 0.4 left the action and force approximations wrong
+  // on the lowest modes. The launchers use RAT_LO 7e-4 (Chroma's); RAT_BOUNDS_CHECK_FREQ checks it.
   const RealD rat_lo = TXQCDProduction::detail::env_real("RAT_LO", 1e-4);
   const RealD rat_hi = TXQCDProduction::detail::env_real("RAT_HI", 100.0);
   int rat_degree = 20;
   if (const char *rd = std::getenv("RAT_DEGREE"); rd && *rd) rat_degree = std::atoi(rd);
   std::cout << GridLogMessage << "Strange rational: lo=" << rat_lo << " hi=" << rat_hi
             << " degree=" << rat_degree << std::endl;
+  // Force (MD) approximation and run-time bounds check (2026-10-05, L191; carried
+  // OneFlavourSchurCloverRationalAction.h, OneFlavourSchurRationalExtras). Unset = the behaviour
+  // before, bit for bit: the force x^(-1/2) at RAT_DEGREE and TUNE_CG_TOL_STRANGE, no check.
+  //   RAT_DEGREE_MD           degree of the force x^(-1/2) (default RAT_DEGREE); x^(+-1/4) for
+  //                           S and the heatbath keep RAT_DEGREE
+  //   TUNE_CG_TOL_STRANGE_MD  force multishift tolerance (default TUNE_CG_TOL_STRANGE); S and
+  //                           the heatbath keep TUNE_CG_TOL_STRANGE
+  //   RAT_BOUNDS_CHECK_FREQ   0 = off (default); n = check at refreshes 1, 1+n, 1+2n, ...
+  //   RAT_BOUNDS_CHECK_TOL    margin on |1 - Q r(Q)^p| on the refresh noise above p x the
+  //                           approximation's own Remez error (default 1e-6)
+  //   RAT_BOUNDS_CHECK_ABORT  0 = WARNING line and continue (default), 1 = abort
+  // The OneFlavourRationalParams slots mdtolerance (1e-6), BoundsCheckFreq (100) and
+  // BoundsCheckTol (1e-4) below are not read by the carried actions; their values are unchanged.
+  const int rat_degree_md = TXQCDProduction::detail::env_int("RAT_DEGREE_MD", rat_degree);
+  const RealD cg_tol_strange_md =
+      TXQCDProduction::detail::env_real("TUNE_CG_TOL_STRANGE_MD", cg_tol_strange);
+  const int rat_bc_freq = TXQCDProduction::detail::env_int("RAT_BOUNDS_CHECK_FREQ", 0);
+  const RealD rat_bc_tol = TXQCDProduction::detail::env_real("RAT_BOUNDS_CHECK_TOL", 1e-6);
+  bool rat_bc_abort = false;
+  if (const char *v = std::getenv("RAT_BOUNDS_CHECK_ABORT"); v && *v) {
+    const std::string s(v);
+    if (s == "1") rat_bc_abort = true;
+    else if (s != "0") {
+      std::cerr << "RAT_BOUNDS_CHECK_ABORT=" << v << ": must be 0 or 1.\n";
+      exit(1);
+    }
+  }
+  if (rat_degree_md < 1 || rat_bc_freq < 0 || !(cg_tol_strange_md > 0.0) || !(rat_bc_tol > 0.0)) {
+    std::cerr << "RAT_DEGREE_MD=" << rat_degree_md << " RAT_BOUNDS_CHECK_FREQ=" << rat_bc_freq
+              << " TUNE_CG_TOL_STRANGE_MD=" << cg_tol_strange_md << " RAT_BOUNDS_CHECK_TOL="
+              << rat_bc_tol << ": need degree >= 1, freq >= 0, tolerances > 0.\n";
+    exit(1);
+  }
+  std::cout << GridLogMessage << "Strange rational: degree_action=" << rat_degree
+            << " degree_md=" << rat_degree_md << " tol_action=" << cg_tol_strange
+            << " tol_md=" << cg_tol_strange_md << " bounds_check_freq=" << rat_bc_freq
+            << " bounds_check_tol=" << rat_bc_tol << " bounds_check_abort=" << rat_bc_abort
+            << std::endl;
+#ifdef HASEN_STRANGE_RATIONAL_EXTRAS
+  OneFlavourSchurRationalExtras strange_x;
+  strange_x.md_degree = rat_degree_md;
+  strange_x.md_tolerance = cg_tol_strange_md;
+  strange_x.bounds_check_freq = rat_bc_freq;
+  strange_x.bounds_check_tol = rat_bc_tol;
+  strange_x.bounds_check_abort = rat_bc_abort;
+#else
+  // Grid-TXQCD fork copies of the strange action headers: one degree and tolerance, no check.
+  if (rat_degree_md != rat_degree || cg_tol_strange_md != cg_tol_strange || rat_bc_freq != 0) {
+    std::cerr << "RAT_DEGREE_MD, TUNE_CG_TOL_STRANGE_MD and RAT_BOUNDS_CHECK_FREQ need the carried"
+              << " strange action headers (include/, build_driver_stock.sh); this build uses the"
+              << " fork's.\n";
+    exit(1);
+  }
+#endif
   OneFlavourRationalParams strange_rat(rat_lo, rat_hi, cg_max, cg_tol_strange, rat_degree, 64, 100, 1e-6, 1e-4);
   // FermOp template args must be the compact operator types (defaults are the
   // non-compact WilsonCloverFermion).  The action body is operator-generic.
@@ -1311,6 +1368,11 @@ int main(int argc, char **argv) {
   std::unique_ptr<OneFlavourSchurCloverQudaForceRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>
       StrangeQuda;
   if (std::getenv("QUDA_FORCE") != nullptr) {
+    if (rat_degree_md != rat_degree || cg_tol_strange_md != cg_tol_strange || rat_bc_freq != 0) {
+      std::cerr << "RAT_DEGREE_MD, TUNE_CG_TOL_STRANGE_MD and RAT_BOUNDS_CHECK_FREQ are not"
+                << " implemented on the QUDA_FORCE strange path.\n";
+      exit(1);
+    }
     QudaCloverParams qp;
     qp.mass = mass_strange; qp.csw = csw; qp.anti_periodic_t = true;
     qp.tol = cg_tol_strange; qp.max_iter = cg_max;
@@ -1347,7 +1409,11 @@ int main(int argc, char **argv) {
     // grid-quda comparison is same-pseudofermion; default unset -> stock ODD.
     StrangeEven = std::make_unique<
         OneFlavourSchurCloverRationalActionEven<WilsonImplR, WCF>>(
+#ifdef HASEN_STRANGE_RATIONAL_EXTRAS
+        StrangeOp, strange_rat, strange_x);
+#else
         StrangeOp, strange_rat);
+#endif
     StrangeEven->is_smeared = true;
     StrangePtr = StrangeEven.get();
     std::cout << GridLogMessage
@@ -1356,7 +1422,11 @@ int main(int argc, char **argv) {
   } else {
     StrangeBase = std::make_unique<
         OneFlavourSchurCloverRationalActionMP<WilsonImplR, WilsonImplF, WCF, WCF_f>>(
+#ifdef HASEN_STRANGE_RATIONAL_EXTRAS
+        StrangeOp, StrangeOpF, &RBGridF, strange_rat, 50, strange_x);
+#else
         StrangeOp, StrangeOpF, &RBGridF, strange_rat, 50);
+#endif
     StrangeBase->is_smeared = true;
     StrangePtr = StrangeBase.get();
   }

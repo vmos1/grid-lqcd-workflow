@@ -60,11 +60,15 @@ class OneFlavourSchurCloverRationalActionMP
   typedef FermOpF_ FermOpF;
   typedef typename ImplD::GaugeField GaugeField;
 
+  // x: separate force degree/tolerance and the refresh-time bounds check (base header); the force
+  // multishift below runs on PowerNegHalf, i.e. at x.md_degree and x.md_tolerance.
   OneFlavourSchurCloverRationalActionMP(FermOpD &opD, FermOpF &opF,
                                         GridBase *sp_rbgrid,
                                         OneFlavourRationalParams &p,
-                                        int reliable_update_freq = 50)
-      : Base(opD, p), opF_(opF), sp_rbgrid_(sp_rbgrid),
+                                        int reliable_update_freq = 50,
+                                        const OneFlavourSchurRationalExtras &x =
+                                            OneFlavourSchurRationalExtras())
+      : Base(opD, p, x), opF_(opF), sp_rbgrid_(sp_rbgrid),
         reliable_freq_(reliable_update_freq) {}
 
   void deriv(const GaugeField &U, GaugeField &dSdU) override {

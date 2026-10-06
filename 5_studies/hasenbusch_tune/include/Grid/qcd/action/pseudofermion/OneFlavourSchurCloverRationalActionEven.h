@@ -26,6 +26,8 @@
 // default off = plain ImportGauge). The strange operator is also imported by the MP deriv and by
 // the strange log-det action, all guarded, so the guard sees ALL imports into it (hazard 1).
 #include "gauge_import/import_guard.h"
+// OneFlavourSchurRationalExtras and the bounds check (separate force degree/tolerance, L191).
+#include <Grid/qcd/action/pseudofermion/OneFlavourSchurCloverRationalAction.h>
 
 NAMESPACE_BEGIN(Grid);
 
@@ -40,29 +42,37 @@ public:
   typedef FermionOp FermionOperator;
 
   Params param;
+  OneFlavourSchurRationalExtras extras;
   MultiShiftFunction PowerQuarter;
   MultiShiftFunction PowerNegQuarter;
-  MultiShiftFunction PowerNegHalf;
+  MultiShiftFunction PowerNegHalf;  // the force (MD) approximation: extras.md_degree / md_tolerance
+  RealD RemezErrorAction = 0.0;     // AlgRemez errors of x^(1/4) and of the force's x^(1/2)
+  RealD RemezErrorMD = 0.0;
 
 protected:
   FermionOperator &FermOp;
   FermionField PhiEven;
+  long refreshes = 0;
 
 public:
-  OneFlavourSchurCloverRationalActionEven(FermionOperator &Op, Params &p)
-      : FermOp(Op), PhiEven(Op.FermionRedBlackGrid()), param(p) {
+  OneFlavourSchurCloverRationalActionEven(FermionOperator &Op, Params &p,
+                                          const OneFlavourSchurRationalExtras &x =
+                                              OneFlavourSchurRationalExtras())
+      : FermOp(Op), PhiEven(Op.FermionRedBlackGrid()), param(p), extras(x) {
     AlgRemez remez(param.lo, param.hi, param.precision);
+    const int md_degree = extras.md_degree > 0 ? extras.md_degree : param.degree;
+    const RealD md_tol = extras.md_tolerance > 0.0 ? extras.md_tolerance : param.tolerance;
 
     std::cout << GridLogMessage << "Generating degree " << param.degree
               << " for x^(1/4)" << std::endl;
-    remez.generateApprox(param.degree, 1, 4);
+    RemezErrorAction = remez.generateApprox(param.degree, 1, 4);
     PowerQuarter.Init(remez, param.tolerance, false);
     PowerNegQuarter.Init(remez, param.tolerance, true);
 
-    std::cout << GridLogMessage << "Generating degree " << param.degree
+    std::cout << GridLogMessage << "Generating degree " << md_degree
               << " for x^(1/2)" << std::endl;
-    remez.generateApprox(param.degree, 1, 2);
-    PowerNegHalf.Init(remez, param.tolerance, true);
+    RemezErrorMD = remez.generateApprox(md_degree, 1, 2);
+    PowerNegHalf.Init(remez, md_tol, true);
   }
 
   std::string action_name() override {
@@ -92,6 +102,12 @@ public:
     SchurDifferentiableOperator<Impl> Mpc(FermOp);
     ConjugateGradientMultiShift<FermionField> msCG(param.MaxIter, PowerQuarter);
     msCG(Mpc, etaEven, PhiEven);
+
+    const long n = ++refreshes;
+    if (extras.bounds_check_freq > 0 && (n - 1) % extras.bounds_check_freq == 0)
+      OneFlavourSchurRationalBoundsCheck<FermionField>(Mpc, etaEven, PowerNegQuarter, PowerNegHalf,
+                                                       RemezErrorAction, RemezErrorMD, param,
+                                                       extras, action_name(), n);
   }
 
   RealD S(const GaugeField &U) override {
