@@ -1,6 +1,6 @@
 # grid_qcd on Perlmutter: account, queues, paths, traps
 
-Updated on 2026-10-06 12:39 CDT · perlmutter
+Updated on 2026-10-06 14:17 CDT · perlmutter
 
 Read by agents on every session run on Perlmutter, per rule 7 of the workspace
 `AGENTS.md`. Shell environment is `perlmutter.sh` beside this file. General
@@ -40,6 +40,9 @@ cancel unbounded sets. The wrappers are write-denied to the agent, and only
 the user adds their allow rule; an agent refusing to widen its own permissions
 is correct. `salloc` can print `QOSMaxSubmitJobPerUserLimit` and still have
 created the allocation: `squeue -u $USER` after any allocation error.
+During a Slurm controller stall `release_alloc.sh` can report "already gone"
+while the job still runs (and is still charged). Re-check with `squeue -u $USER`
+and retry the release.
 
 ## Node binding
 
@@ -72,6 +75,10 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
   "not found". A ~10 s death that names a shell variable and exits 1 is a
   missing `--export`, not the loader; read the last line first.
 - Login nodes are shared: `configure` there, `make -j` inside an allocation.
+  Exception: a single-TU build against prebuilt Grid and QUDA libs (the CG
+  benchmark, `Benchmark_comms_host_device`) takes ~1 min on one login core and
+  is fine there. Grid's own device TUs are the slow ones (~1.3 h per TU) and
+  `Benchmark_dwf_fp32` is ~40 min: keep those on a compute node.
 
 ## Python environment
 
