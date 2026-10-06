@@ -616,6 +616,96 @@ void create_subspace_gcr(GridParallelRNG &RNG,
 }
 
 // ---------------------------------------------------------------------------
+// Wave 2: QUDA's null-vector relaxation, CG on Mpc^dag Mpc from the noise (method `cg`)
+// ---------------------------------------------------------------------------
+//
+// QUDA relaxes each null vector by CG on the even-odd NORMAL operator Mpc^dag Mpc with a ZERO
+// source and the random vector as the INITIAL GUESS, stopping at a residual 5e-6 RELATIVE TO THE
+// INITIAL RESIDUAL or after 500 iterations, one round. Stock Grid's ConjugateGradient reproduces
+// that exactly, with no Grid edit:
+//
+//     b = -A x0,  solve A delta = b from delta = 0,  x = x0 + delta      (A = Mpc^dag Mpc)
+//
+// The residual of the shifted problem is b - A delta = -A (x0 + delta), i.e. the residual of the
+// zero-source solve at x0 + delta, so the two CGs generate identical r, p, alpha, beta and
+// x0 + delta_k IS the zero-source iterate x_k. Grid stops at |r_k| <= tol |b|, and |b| = |A x0| is
+// the zero-source solve's initial residual: Grid's relative rule on this source IS QUDA's rule.
+// ⚠️ The guess passed to Grid must be exactly zero (Grid tests norm2(psi) == 0 to skip its own
+// residual formation); a non-zero guess would make it form b - A.guess instead.
+//
+// Same noise generation and normalisation as create_subspace_gcr (one gaussian() per vector, in
+// the same order, so the noise sequence is unchanged) and the same checkerboard handling: `noise`
+// takes its checkerboard from FineField's default (Even), HermOp copies it to `b`, and CG copies
+// b's to `delta`. `Op` must implement HermOp/HermOpAndNorm; at level 1 it is a SchurOperatorBase,
+// whose HermOp is Mpc^dag Mpc (LinearOperator.h:336). ⛔ NOT usable at level 2: the operator the
+// level-2 generator drives (StencilCoarseApply or ShiftedNonHermitianLinearOperator, under a
+// CountingLinearOperator) GRID_ASSERTs in HermOp, so level 2 keeps create_subspace_gcr.
+template <class Aggregates>
+void create_subspace_cg(GridParallelRNG &RNG,
+                        LinearOperatorBase<typename Aggregates::FineField> &Op, Aggregates &Agg,
+                        int nn, RealD tol, Integer maxiter, bool quiet)
+{
+  typedef typename Aggregates::FineField FineField;
+  GridBase *FineGrid = Agg.FineGrid;
+  const bool boss = FineGrid->IsBoss();
+
+  // ErrorOnNoConverge = false: hitting the cap is QUDA's normal exit, not an error.
+  ConjugateGradient<FineField> CG(tol, maxiter, false);
+
+  FineField noise(FineGrid);
+  FineField b(FineGrid);
+  FineField delta(FineGrid);
+  FineField Mn(FineGrid);
+
+  long long total_iters = 0;
+  const double t_all = usecond();
+  for (int v = 0; v < nn; v++) {
+    const double t_v = usecond();
+
+    Agg.subspace[v] = Zero();
+    gaussian(RNG, noise);
+    noise = noise * RealD(std::pow(norm2(noise), -0.5));
+
+    if (!quiet) {
+      Op.Op(noise, Mn);
+      std::cout << GridLogMessage << "noise   [" << v << "] <n|Op|n> " << innerProduct(noise, Mn)
+                << std::endl;
+    }
+
+    // b = -A x0 (HermOp sets b's checkerboard from noise's).
+    Op.HermOp(noise, Mn);
+    b = RealD(-1.0) * Mn;
+    b.Checkerboard() = noise.Checkerboard();
+    delta = Zero();
+    delta.Checkerboard() = noise.Checkerboard();
+    CG(Op, b, delta);
+    // Grid leaves IterationsToComplete = maxiter + 1 when the cap is hit (loop index on exit).
+    const bool capped = (CG.IterationsToComplete > maxiter);
+    const Integer its = capped ? maxiter : CG.IterationsToComplete;
+    total_iters += its;
+
+    noise = noise + delta;
+    noise = noise * RealD(std::pow(norm2(noise), -0.5));
+
+    if (!quiet) {
+      Op.Op(noise, Mn);
+      std::cout << GridLogMessage << "filtered[" << v << "] <f|Op|f> " << innerProduct(noise, Mn)
+                << " <f|OpDagOp|f>" << norm2(Mn) << std::endl;
+    }
+
+    Agg.subspace[v] = noise;
+
+    if (boss)
+      std::cout << GridLogMessage << "cg null vector [" << v << "] iterations " << its
+                << (capped ? " (cap hit)" : "") << " time " << (usecond() - t_v) / 1.0e6 << " s"
+                << std::endl;
+  }
+  if (boss)
+    std::cout << GridLogMessage << "subspace cg: " << nn << " vectors, total iterations "
+              << total_iters << ", time " << (usecond() - t_all) / 1.0e6 << " s" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
 // Workstream B (plan v2 §6): Chebyshev-filtered null vectors, Grid's Aggregation::
 // CreateSubspaceChebyshev pattern (Aggregates.h:364-410) applied to the SCHUR operator.
 // ---------------------------------------------------------------------------
@@ -901,11 +991,13 @@ public:
 
 // Agreement + timing of an alternative apply against the reference one on the given vector.
 // Returns the relative difference; prints ms/apply for both (`reps` timed calls each, after
-// the agreement call has warmed both paths).
+// the agreement call has warmed both paths). `agree_tol` is the AGREES threshold: 1e-5 for the
+// fp32/fp64 applies (the default, output unchanged), 1e-3 for the fp16-storage apply, whose
+// links are rounded to binary16 (~3e-4 relative); a non-default value is printed on the line.
 template <class CoarseVector>
 double check_coarse_apply(const char *name, LinearOperatorBase<CoarseVector> &reference,
                           LinearOperatorBase<CoarseVector> &candidate, const CoarseVector &src,
-                          GridBase *UGrid, int reps, bool boss)
+                          GridBase *UGrid, int reps, bool boss, double agree_tol = 1.0e-5)
 {
   CoarseVector ref(src.Grid()), alt(src.Grid()), diff(src.Grid());
   ref.Checkerboard() = src.Checkerboard();
@@ -928,9 +1020,10 @@ double check_coarse_apply(const char *name, LinearOperatorBase<CoarseVector> &re
   const double ms_alt = time_it(candidate);
   if (boss) {
     std::cout << GridLogMessage << "coarse apply  " << name << "  rel diff vs general " << rel
-              << (rel < 1.0e-5 ? "  AGREES" : "  DISAGREES") << "  general " << ms_ref
-              << " ms/apply  " << name << " " << ms_alt << " ms/apply  (" << (ms_ref / ms_alt)
-              << "x)" << std::endl;
+              << (rel < agree_tol ? "  AGREES" : "  DISAGREES");
+    if (agree_tol != 1.0e-5) std::cout << " (tol " << agree_tol << ")";
+    std::cout << "  general " << ms_ref << " ms/apply  " << name << " " << ms_alt
+              << " ms/apply  (" << (ms_ref / ms_alt) << "x)" << std::endl;
   }
   return rel;
 }

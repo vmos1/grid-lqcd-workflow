@@ -46,6 +46,8 @@
 // operator-application counters. See __docs/2026_09_15_grid_mg_fix_plan.md.
 #include "bench_nvtx.h"
 #include "probe_mg_solvers.h"
+// fp16-storage coarse apply (COARSE_APPLY=stencil_h / COARSE2_APPLY=stencil_h).
+#include "probe_mg_half_apply.h"
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +55,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace Grid;
@@ -391,6 +394,236 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Wave 3: the level-2 problem REPLICATED on every rank (--probe-l2-split 1)
+// ---------------------------------------------------------------------------
+//
+// WHY. At C3 on 16 GPUs the level-2 lattice (6.4.4.8 = 768 sites x 32 dof) is 48 sites per
+// rank, so its GCR is pure latency: every inner product is a 16-rank allreduce and every apply
+// a halo exchange. The whole problem is only 57 MB of links, so every rank can hold ALL of it.
+//
+// THE SPLIT GRID. Grid's split-grid constructor GridCartesian(latt, simd, mpi_split, parent)
+// (Cartesian_full.h; used by tests/solver/Test_dwf_mrhs_cg_mpi.cc) with mpi_split 1.1.1.1 builds
+// a grid whose LOCAL volume is the global volume. Its CartesianCommunicator(processors, parent,
+// srank) constructor (Communicator_mpi3.cc) MPI_Comm_split()s the parent into single-rank
+// communicators (MPI_Comm_dup when there is only one rank), so norm2 / innerProduct / halo
+// exchange on it never leave the rank. The only communication left per level-2 solve is ONE
+// GlobalSumVector over the parent communicator, to assemble the source.
+//
+// THE TRANSFER, stock Grid only. unvectorizeToLexOrdArray gives a rank's LOCAL sites in local
+// lexicographic order; each is placed at its GLOBAL lexicographic index in a zeroed global-
+// volume array; GlobalSumVector over the parent sums the arrays (each site is non-zero on
+// exactly one rank, so the sum is a gather); vectorizeFromLexOrdArray fills the replicated
+// lattice. The reverse (extract) needs no communication: each rank reads back its own sites.
+// ⚠️ Host-side (CpuRead/CpuWrite views, thread_for): 200 KB per level-2 vector at C3.
+class ReplicaMap {
+public:
+  GridBase *dist = nullptr; // distributed grid (level 2 on all ranks)
+  GridBase *rep = nullptr;  // replicated grid (level 2, whole volume on every rank)
+  std::vector<int64_t> local_to_global; // dist local lexicographic site -> global lexicographic site
+  int64_t gsites = 0;
+
+  ReplicaMap(GridBase *dist_, GridBase *rep_) : dist(dist_), rep(rep_)
+  {
+    const int nd = dist->_ndimension;
+    GRID_ASSERT(rep->_ndimension == nd);
+    // Level-2 lattices live on plain Cartesian grids; a checkerboarded grid would need the cb
+    // folded into the index maps.
+    GRID_ASSERT(!dist->_isCheckerBoarded && !rep->_isCheckerBoarded);
+    for (int d = 0; d < nd; ++d) {
+      GRID_ASSERT(rep->_gdimensions[d] == dist->_gdimensions[d]);
+      GRID_ASSERT(rep->_ldimensions[d] == rep->_gdimensions[d]); // one rank holds everything
+    }
+    gsites = rep->lSites();
+    const int64_t lsites = dist->lSites();
+    local_to_global.resize(lsites);
+    Coordinate lcoor(nd), gcoor(nd);
+    for (int64_t l = 0; l < lsites; ++l) {
+      Lexicographic::CoorFromIndex(lcoor, l, dist->_ldimensions);
+      for (int d = 0; d < nd; ++d) gcoor[d] = lcoor[d] + dist->_lstart[d];
+      int64_t g = 0;
+      Lexicographic::IndexFromCoor(gcoor, g, dist->_gdimensions);
+      GRID_ASSERT(g >= 0 && g < gsites);
+      local_to_global[l] = g;
+    }
+  }
+};
+
+// Distributed -> replicated. Collective over the distributed grid's communicator.
+template <class vobj>
+void replicate_lattice(const ReplicaMap &map, const Lattice<vobj> &in, Lattice<vobj> &out,
+                       std::vector<typename vobj::scalar_object> &loc,
+                       std::vector<typename vobj::scalar_object> &glob)
+{
+  typedef typename vobj::scalar_object sobj;
+  typedef typename vobj::scalar_type scalar_type;
+  static_assert(std::is_same<scalar_type, ComplexF>::value || std::is_same<scalar_type, ComplexD>::value,
+                "replicate_lattice: complex lattices only");
+  typedef typename std::conditional<std::is_same<scalar_type, ComplexF>::value, RealF, RealD>::type real_type;
+  static_assert(sizeof(sobj) % sizeof(real_type) == 0, "replicate_lattice: site object not a real array");
+  GRID_ASSERT(in.Grid() == map.dist);
+  GRID_ASSERT(out.Grid() == map.rep);
+
+  unvectorizeToLexOrdArray(loc, in);
+  sobj zero;
+  zero = Zero();
+  glob.resize(map.gsites);
+  std::fill(glob.begin(), glob.end(), zero);
+  const int64_t lsites = static_cast<int64_t>(map.local_to_global.size());
+  for (int64_t l = 0; l < lsites; ++l) glob[map.local_to_global[l]] = loc[l];
+  const int64_t nreal = map.gsites * static_cast<int64_t>(sizeof(sobj) / sizeof(real_type));
+  GRID_ASSERT(nreal < (int64_t(1) << 31));
+  map.dist->GlobalSumVector(reinterpret_cast<real_type *>(&glob[0]), static_cast<int>(nreal));
+  vectorizeFromLexOrdArray(glob, out);
+  out.Checkerboard() = in.Checkerboard();
+}
+
+// Replicated -> distributed: each rank keeps its own sites. No communication.
+template <class vobj>
+void extract_lattice(const ReplicaMap &map, const Lattice<vobj> &in, Lattice<vobj> &out,
+                     std::vector<typename vobj::scalar_object> &loc,
+                     std::vector<typename vobj::scalar_object> &glob)
+{
+  GRID_ASSERT(in.Grid() == map.rep);
+  GRID_ASSERT(out.Grid() == map.dist);
+  unvectorizeToLexOrdArray(glob, in);
+  const int64_t lsites = static_cast<int64_t>(map.local_to_global.size());
+  loc.resize(lsites);
+  for (int64_t l = 0; l < lsites; ++l) loc[l] = glob[map.local_to_global[l]];
+  vectorizeFromLexOrdArray(loc, out);
+  out.Checkerboard() = in.Checkerboard();
+}
+
+// The level-2 operator on the replicated grid: Grid's OLD CoarsenedMatrix apply (the class
+// ProbeMG::StencilCoarseApply drives, same x-only red-black grid and hermitian=1) with the
+// general operator's links, transposed as StencilCoarseApply transposes them, then replicated.
+// Op = M + shift, exactly StencilCoarseApply::Op.
+//
+// One difference from StencilCoarseApply: a MISSING general point is allowed. In a dimension of
+// global extent 2 NonLocalStencilGeometry keeps only the -1 shift (Geometry.h: stencil_lo -1,
+// hi 0), which then carries the WHOLE coupling to the single neighbour x+1 == x-1; the old
+// geometry's +1 point gets a zero link, so the old apply adds that coupling exactly once. (At
+// extent 1 both are folded into the self point and both get zero.) That is the C2 level-2
+// lattice 2.2.2.4, where the distributed stencil apply is unavailable; C3's 6.4.4.8 has all 9.
+// The split check at setup (replicated apply vs the distributed GENERAL apply) falsifies any
+// mistake in either the transposition or this rule.
+template <class Fobj, class CComplex, int nbasis>
+class ReplicatedCoarseApply : public LinearOperatorBase<Lattice<iVector<CComplex, nbasis>>> {
+public:
+  typedef GeneralCoarsenedMatrix<Fobj, CComplex, nbasis> GeneralOp;
+  typedef CoarsenedMatrix<Fobj, CComplex, nbasis> OldOp;
+  typedef Lattice<iVector<CComplex, nbasis>> CoarseVector;
+  typedef Lattice<iMatrix<CComplex, nbasis>> CoarseMatrix;
+
+  GridRedBlackCartesian *RepRB = nullptr;
+  std::unique_ptr<OldOp> op;
+  RealD shift = 0.0;
+  int zero_points = 0; // old-geometry points with no general counterpart (extent <= 2)
+
+  ReplicatedCoarseApply(GeneralOp &general, GridCartesian *dist, GridCartesian *rep,
+                        const ReplicaMap &map, RealD shift_)
+      : shift(shift_)
+  {
+    // x-only checker mask: see StencilCoarseApply (the rb members are built, never applied).
+    Coordinate mask({1, 0, 0, 0});
+    RepRB = new GridRedBlackCartesian(rep, mask, 0);
+    op.reset(new OldOp(*rep, *RepRB, 1));
+
+    const int Nd = 4;
+    const Coordinate gdims = dist->GlobalDimensions();
+    CoarseMatrix Adist(dist);
+    std::vector<typename CoarseMatrix::scalar_object> loc, glob;
+    for (int point = 0; point < op->geom.npoint; ++point) {
+      const int dir = op->geom.directions[point];
+      const int disp = op->geom.displacements[point];
+      Coordinate want(Nd, 0);
+      want[dir] = disp;
+      int found = -1;
+      for (int p = 0; p < general.geom.npoint; ++p)
+        if (general.geom.shifts[p] == want) found = p;
+      if (found >= 0) {
+        // The general links live on the PADDED grid; Extract returns the interior on `dist`.
+        CoarseMatrix Aup = general.Cell.Extract(general._A[found]);
+        ProbeMG::transpose_site_matrices<CComplex, nbasis>(Adist, Aup);
+      } else {
+        GRID_ASSERT(disp != 0 && gdims[dir] <= 2);
+        Adist = Zero();
+        ++zero_points;
+      }
+      replicate_lattice(map, Adist, op->A[point], loc, glob);
+    }
+  }
+  ~ReplicatedCoarseApply()
+  {
+    op.reset();
+    delete RepRB;
+  }
+
+  void Op(const CoarseVector &in, CoarseVector &out) override
+  {
+    op->M(in, out);
+    if (shift != 0.0) out = out + shift * in;
+  }
+  void AdjOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+  void OpDiag(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+  void OpDir(const CoarseVector &in, CoarseVector &out, int dir, int disp) override { GRID_ASSERT(0); }
+  void OpDirAll(const CoarseVector &in, std::vector<CoarseVector> &out) override { GRID_ASSERT(0); }
+  void HermOpAndNorm(const CoarseVector &in, CoarseVector &out, RealD &n1, RealD &n2) override { GRID_ASSERT(0); }
+  void HermOp(const CoarseVector &in, CoarseVector &out) override { GRID_ASSERT(0); }
+};
+
+// "SplitCoarseSolve": the level-2 coarse solve as the level-2 MGPreconditioner sees it (src and
+// sol on the DISTRIBUTED level-2 grid), done by a solver that lives on the replicated grid:
+// replicate src, zero the replicated solution (the inner GCR runs with zero_guess), solve with
+// no inter-rank communication, keep this rank's sites of the solution.
+//
+// Timers: usecond() only, NO barriers. The local GCR synchronises at each of its reductions and
+// extract's CpuRead view waits for the last kernels, so the split is approximately right, but it
+// is a diagnostic; the solve time is the measurement.
+template <class Field>
+class SplitCoarseSolve : public LinearFunction<Field> {
+  typedef typename Field::vector_object vobj;
+  typedef typename vobj::scalar_object sobj;
+  const ReplicaMap &map_;
+  LinearFunction<Field> &inner_;
+  std::unique_ptr<Field> src_r_, sol_r_;
+  std::vector<sobj> loc_, glob_;
+
+public:
+  using LinearFunction<Field>::operator();
+  long long calls = 0;
+  double t_replicate = 0.0, t_solve = 0.0, t_extract = 0.0;
+  void reset_timers()
+  {
+    calls = 0;
+    t_replicate = t_solve = t_extract = 0.0;
+  }
+
+  SplitCoarseSolve(const ReplicaMap &map, LinearFunction<Field> &inner) : map_(map), inner_(inner) {}
+
+  void operator()(const Field &src, Field &sol) override
+  {
+    if (!src_r_) {
+      src_r_.reset(new Field(map_.rep));
+      sol_r_.reset(new Field(map_.rep));
+    }
+    const double t0 = usecond();
+    replicate_lattice(map_, src, *src_r_, loc_, glob_);
+    const double t1 = usecond();
+    *sol_r_ = Zero();
+    sol_r_->Checkerboard() = src.Checkerboard();
+    inner_(*src_r_, *sol_r_);
+    const double t2 = usecond();
+    extract_lattice(map_, *sol_r_, sol, loc_, glob_);
+    sol.Checkerboard() = src.Checkerboard();
+    const double t3 = usecond();
+    ++calls;
+    t_replicate += t1 - t0;
+    t_solve += t2 - t1;
+    t_extract += t3 - t2;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Command line
 // ---------------------------------------------------------------------------
 
@@ -582,10 +815,14 @@ int main(int argc, char **argv)
   //   general : GeneralCoarsenedMatrix::Mult -- the control (padded volume, PaddedCell exchange)
   //   stencil : Grid's old CoarsenedMatrix apply (CartesianStencil halo, interior only); hops=1
   //   mrhs    : Grid's MultiGeneralCoarsenedMatrix (batched cuBLAS, interior only); fp64 only
+  //   stencil_h : the stencil apply with its links stored in fp16 (fp32 arithmetic),
+  //             ProbeMG::HalfStencilCoarseApply (probe_mg_half_apply.h). SOLVE path only: the
+  //             level-2 setup keeps the fp32 stencil apply. hops=1, MG_PRECISION=single only.
   // See probe_mg_solvers.h for why each restriction exists.
   const std::string coarse_apply = read_string(argc, argv, "--probe-coarse-apply", "general");
   // N timed applications of each available apply on one random coarse vector, plus the
   // agreement gate against `general`. 0 = off. Builds every alternative, so costs memory.
+  // stencil_h is gated at the fp16 rounding level (1e-3), the fp32/fp64 applies at 1e-5.
   const int coarse_apply_check = read_int(argc, argv, "--probe-coarse-apply-check", 0);
   // Null-vector solve tolerance and inverse-iteration rounds. Grid hardcodes 1e-3 and 3
   // rounds (Aggregates.h:136); QUDA's setup_tol is 5e-6 (quda_grid_bridge.h:479).
@@ -604,6 +841,11 @@ int main(int argc, char **argv)
   //          knobs --probe-subspace-cheb-lo / -order, hi from a power method
   //   cheb_gcr  two-stage (handoff 09-28 §3): the cheb filter, then `rounds` rounds of the gcr
   //          inverse iteration STARTING from the filtered vector instead of fresh noise
+  //   cg     QUDA's own relaxation (wave 2): CG on Mpc^dag Mpc, zero source, noise as the
+  //          initial guess, tol relative to the initial residual, one round. Stock Grid CG
+  //          (see create_subspace_cg). Knobs --probe-subspace-cg-tol / -maxiter. Level 1 only.
+  //   cg_gcr two-stage, like cheb_gcr: the cg relaxation, then `rounds` rounds of the gcr
+  //          inverse iteration STARTING from the CG vector (same cg and gcr knobs)
   const std::string subspace_method = read_string(argc, argv, "--probe-subspace-method", "gcr");
   const double subspace_cheb_lo = read_double(argc, argv, "--probe-subspace-cheb-lo", 0.01);
   const int subspace_cheb_order = read_int(argc, argv, "--probe-subspace-cheb-order", 100);
@@ -612,6 +854,10 @@ int main(int argc, char **argv)
   // polynomial evaluated ABOVE hi blows up like cosh(order * acosh(x/hi)): 5% was not enough
   // at order 200 (NaN, 2026-09-28). See power_method_max in probe_mg_solvers.h.
   const double subspace_cheb_hi_factor = read_double(argc, argv, "--probe-subspace-cheb-hi-factor", 1.25);
+  // Method `cg` only: QUDA's setup_tol 5e-6 (relative to the initial residual) and setup_maxiter
+  // 500. Hitting the cap is QUDA's normal exit and is not an error here either.
+  const double subspace_cg_tol = read_double(argc, argv, "--probe-subspace-cg-tol", 5.0e-6);
+  const int subspace_cg_maxiter = read_int(argc, argv, "--probe-subspace-cg-maxiter", 500);
   // double | single: the operator the null vectors are generated on. `single` needs
   // --probe-mg-precision single, generates on the fp32 Schur operator and converts the vectors
   // UP for the fp64 hierarchy, so both hierarchies still share one null space. QUDA generates
@@ -644,8 +890,9 @@ int main(int argc, char **argv)
   const int l2_coarse_maxiter = read_int(argc, argv, "--probe-l2-coarse-maxiter", 50);
   const int l2_coarse_nstep = read_int(argc, argv, "--probe-l2-coarse-nstep", 8);
   const int l2_coarse_mmax = read_int(argc, argv, "--probe-l2-coarse-mmax", 8);
-  // general | stencil, as COARSE_APPLY but for the level-2 operator (768 sites at C3, so it
-  // hardly matters; stencil needs the coarse2 x-dim even).
+  // general | stencil | stencil_h, as COARSE_APPLY but for the level-2 operator (768 sites at
+  // C3, so it hardly matters; stencil needs the coarse2 x-dim even). stencil_h = the stencil
+  // apply with fp16 link storage; level 2 is the bottom level, so it only drives the level-2 GCR.
   const std::string coarse2_apply = read_string(argc, argv, "--probe-coarse2-apply", "general");
   // Level-2 solve on/off inside the level-2 V-cycle. 0 = smoother-only preconditioner for the
   // level-1 GCR (no level-2 aggregation is built): measures what the third level itself buys
@@ -658,6 +905,31 @@ int main(int argc, char **argv)
   // Persistent precision-change workspaces + temporaries in the fp64->fp32 adaptor. 0 = the
   // stock two-argument precisionChange, which rebuilds its site map every call.
   const int persistent_precchange = read_int(argc, argv, "--probe-persistent-precchange", 0);
+
+  // Wave 2: the diagonal SHIFTS, until now literals inherited from Grid's
+  // Test_general_coarse_wilson.cc (QUDA uses no shift anywhere). Defaults = the old literals, so
+  // the default reproduces every earlier number bit-for-bit.
+  //   smoother   the fine post-smoother runs on Mpc + shift (ShiftedSchurOperator, fp64 and fp32)
+  //   coarse     every level-1 coarse operator the coarse GCR drives: +shift on the general,
+  //              stencil and mrhs applies (fp64 and fp32). ⚠️ The level-2 null vectors and the
+  //              level-2 coarsening are driven by that same shifted operator, so this shift also
+  //              reaches level 2 through the Galerkin product, independently of l2-coarse.
+  //   l2-coarse  the level-2 operator the level-2 GCR drives (general or stencil apply)
+  const double smoother_shift = read_double(argc, argv, "--probe-smoother-shift", 0.01);
+  const double coarse_shift = read_double(argc, argv, "--probe-coarse-shift", 0.001);
+  const double l2_coarse_shift = read_double(argc, argv, "--probe-l2-coarse-shift", 0.001);
+
+  // Wave 3 (split): REPLICATE THE LEVEL-2 PROBLEM ON EVERY RANK, so the level-2 GCR does no
+  // inter-rank communication at all. Profile 2026-09-29 (C3, 16 GPUs): 79% of the V-cycle is
+  // the level-1 coarse solve, and at level 2 (768 sites x 32 dof, 57 MB of links) ~170 global
+  // reductions and ~29 halo exchanges per V-cycle cost more than the arithmetic. The level-2
+  // problem fits on ONE rank, so each rank holds all of it on a 1.1.1.1 split grid (its own
+  // communicator), receives the level-2 source by one GlobalSumVector per level-2 solve, solves
+  // locally, and keeps its own sites of the solution. Same GCR, same knobs, same shift; the
+  // apply is Grid's old CoarsenedMatrix stencil apply on the replicated links.
+  //   0  distributed level-2 GCR (the control, every earlier number)
+  //   1  replicated level-2 GCR (needs --probe-coarse-precon mg and --probe-l2-coarse-solve 1)
+  const int l2_split = read_int(argc, argv, "--probe-l2-split", 0);
 
   // Precision of the MG PRECONDITIONER (the outer solver and every gate stay in
   // double either way -- see PrecisionChangeAdaptor for why).
@@ -705,20 +977,28 @@ int main(int argc, char **argv)
     Grid_finalize();
     return 2;
   }
-  if (coarse_apply != "general" && coarse_apply != "stencil" && coarse_apply != "mrhs") {
-    std::cerr << "probe: --probe-coarse-apply must be general|stencil|mrhs" << std::endl;
+  if (coarse_apply != "general" && coarse_apply != "stencil" && coarse_apply != "mrhs" &&
+      coarse_apply != "stencil_h") {
+    std::cerr << "probe: --probe-coarse-apply must be general|stencil|mrhs|stencil_h" << std::endl;
     Grid_finalize();
     return 2;
   }
-  if (coarse_apply == "stencil" && stencil_hops != 1) {
-    std::cerr << "probe: --probe-coarse-apply stencil needs --probe-stencil-hops 1"
+  if ((coarse_apply == "stencil" || coarse_apply == "stencil_h") && stencil_hops != 1) {
+    std::cerr << "probe: --probe-coarse-apply " << coarse_apply << " needs --probe-stencil-hops 1"
               << " (Grid's old Geometry has no corner points)" << std::endl;
     Grid_finalize();
     return 2;
   }
+  if (coarse_apply == "stencil_h" && !mg_single) {
+    std::cerr << "probe: --probe-coarse-apply stencil_h needs --probe-mg-precision single"
+              << " (HalfStencilCoarseApply converts fp32 links only; there is no fp64 half apply)"
+              << std::endl;
+    Grid_finalize();
+    return 2;
+  }
   if (subspace_method != "gcr" && subspace_method != "relax" && subspace_method != "cheb" &&
-      subspace_method != "cheb_gcr") {
-    std::cerr << "probe: --probe-subspace-method must be gcr|relax|cheb|cheb_gcr" << std::endl;
+      subspace_method != "cheb_gcr" && subspace_method != "cg" && subspace_method != "cg_gcr") {
+    std::cerr << "probe: --probe-subspace-method must be gcr|relax|cheb|cheb_gcr|cg|cg_gcr" << std::endl;
     Grid_finalize();
     return 2;
   }
@@ -744,8 +1024,19 @@ int main(int argc, char **argv)
     Grid_finalize();
     return 2;
   }
-  if (coarse2_apply != "general" && coarse2_apply != "stencil") {
-    std::cerr << "probe: --probe-coarse2-apply must be general|stencil" << std::endl;
+  if (coarse2_apply != "general" && coarse2_apply != "stencil" && coarse2_apply != "stencil_h") {
+    std::cerr << "probe: --probe-coarse2-apply must be general|stencil|stencil_h" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (l2_split != 0 && l2_split != 1) {
+    std::cerr << "probe: --probe-l2-split must be 0|1" << std::endl;
+    Grid_finalize();
+    return 2;
+  }
+  if (l2_split && (coarse_precon != "mg" || !l2_coarse_solve)) {
+    std::cerr << "probe: --probe-l2-split 1 replicates the level-2 solve, so it needs"
+              << " --probe-coarse-precon mg and --probe-l2-coarse-solve 1" << std::endl;
     Grid_finalize();
     return 2;
   }
@@ -754,7 +1045,12 @@ int main(int argc, char **argv)
     Grid_finalize();
     return 2;
   }
-  if (skip_fp64_coarsen && coarse_apply_check > 0) {
+  // --probe-skip-fp64-coarsen with --probe-coarse-apply-check is ALLOWED (rejected until
+  // 2026-09-29). Skipping needs --probe-mg-precision single (above), and under single the fp64
+  // check block is never entered (it sits inside `if (!mg_single)`): only the fp32 check runs,
+  // against the fp32 general operator, so the unbuilt fp64 coarse operator is never applied.
+  // Kept as a hard guard in case that gating ever changes.
+  if (skip_fp64_coarsen && coarse_apply_check > 0 && !mg_single) {
     std::cerr << "probe: --probe-skip-fp64-coarsen is incompatible with --probe-coarse-apply-check"
               << " (the fp64 check applies the fp64 coarse operator)" << std::endl;
     Grid_finalize();
@@ -843,8 +1139,14 @@ int main(int argc, char **argv)
     std::cout << GridLogMessage << "outer    mmax/nstep " << outer_mmax << "/" << outer_nstep << std::endl;
     std::cout << GridLogMessage << "coarse   tol        " << coarse_tol << " (QUDA asks 0.1)"
               << std::endl;
+    std::cout << GridLogMessage << "shifts   smoother " << smoother_shift << " coarse " << coarse_shift
+              << " l2-coarse " << l2_coarse_shift << " (Grid test 0.01/0.001/0.001; QUDA none)"
+              << std::endl;
     std::cout << GridLogMessage << "coarse   apply      " << coarse_apply
               << " (check " << coarse_apply_check << ")" << std::endl;
+    if (coarse_apply == "stencil_h") // same text as the summary line, so `sort -u` folds them
+      std::cout << GridLogMessage << "coarse apply            stencil_h (fp16 link storage, fp32 arithmetic)"
+                << std::endl;
     std::cout << GridLogMessage << "coarse   precon     " << coarse_precon;
     if (coarse_precon == "mg")
       std::cout << "  block2 " << coordinate_string(Block2) << " nbasis2 " << kNbasis2
@@ -854,6 +1156,9 @@ int main(int argc, char **argv)
                 << l2_coarse_maxiter << "/" << l2_coarse_nstep << "/" << l2_coarse_mmax
                 << " coarse2-apply " << coarse2_apply;
     std::cout << std::endl;
+    if (l2_split)
+      std::cout << GridLogMessage << "level-2 solve      replicated on every rank (L2_SPLIT=1)"
+                << std::endl;
     std::cout << GridLogMessage << "subspace tol/rounds " << subspace_tol << "/" << subspace_rounds
               << " mmax " << subspace_mmax << " maxiter " << subspace_maxiter
               << " (QUDA setup_tol 5e-6)" << std::endl;
@@ -862,6 +1167,9 @@ int main(int argc, char **argv)
     if (subspace_method == "cheb" || subspace_method == "cheb_gcr")
       std::cout << " cheb lo " << subspace_cheb_lo << " order " << subspace_cheb_order
                 << " pm-iters " << subspace_pm_iters << " hi-factor " << subspace_cheb_hi_factor;
+    if (subspace_method == "cg" || subspace_method == "cg_gcr")
+      std::cout << " cg tol " << subspace_cg_tol << " maxiter " << subspace_cg_maxiter
+                << " (level 1; level 2 stays gcr)";
     std::cout << std::endl;
     std::cout << GridLogMessage << "fast-mg           " << fast_mg << " (gcr " << fast_gcr
               << ", project " << fast_project << ", persistent-temps " << persistent_temps
@@ -1085,6 +1393,9 @@ int main(int argc, char **argv)
     //   cheb_gcr  the cheb filter, then the gcr inverse iteration started from its output;
     //          the two stages are timed separately (one boss line) since the point is to see
     //          which of them the setup time went to
+    //   cg     QUDA's relaxation: stock Grid CG on Mpc^dag Mpc from the noise, zero source
+    //   cg_gcr the cg relaxation, then the gcr inverse iteration started from its output; the
+    //          two stages timed on one boss line, as for cheb_gcr
     // Generic over the precision: the fp32 path generates on the fp32 Schur operator and
     // converts the vectors UP into the fp64 Aggregation, so both hierarchies still share one
     // null space and everything downstream is unchanged.
@@ -1113,6 +1424,29 @@ int main(int argc, char **argv)
             std::cout << GridLogMessage << "cheb_gcr stages: chebyshev+pm " << (tc1 - tc0) / 1.0e6
                       << " s, gcr " << subspace_rounds << " round(s) " << (usecond() - tc1) / 1.0e6
                       << " s" << std::endl;
+        }
+      } else if (subspace_method == "cg" || subspace_method == "cg_gcr") {
+        // QUDA's relaxation: stock Grid CG on Op.HermOp = Mpc^dag Mpc (Op is the Schur
+        // operator here), zero source, noise as the guess, one round. Level 1 only: the level-2
+        // generator below keeps create_subspace_gcr (its operator's HermOp asserts).
+        const double tg0 = usecond();
+        ProbeMG::create_subspace_cg(rng, Op, Agg, kNbasis, subspace_cg_tol, subspace_cg_maxiter,
+                                    fast_gcr != 0);
+        if (subspace_method == "cg_gcr") {
+          // cg_gcr: then `rounds` rounds of the gcr inverse iteration STARTING from the CG
+          // vector (from_subspace=true), exactly as cheb_gcr chains its filter into the gcr.
+          accelerator_barrier();
+          UGrid->Barrier();
+          const double tg1 = usecond();
+          ProbeMG::create_subspace_gcr(rng, Op, Agg, kNbasis, subspace_tol, subspace_rounds,
+                                       subspace_mmax, subspace_mmax, subspace_maxiter, fast_gcr != 0,
+                                       fast_gcr != 0, false, true);
+          accelerator_barrier();
+          UGrid->Barrier();
+          if (boss)
+            std::cout << GridLogMessage << "cg_gcr stages: cg " << (tg1 - tg0) / 1.0e6 << " s, gcr "
+                      << subspace_rounds << " round(s) " << (usecond() - tg1) / 1.0e6 << " s"
+                      << std::endl;
         }
       } else {
         ProbeMG::create_subspace_gcr(rng, Op, Agg, kNbasis, subspace_tol, subspace_rounds,
@@ -1189,8 +1523,8 @@ int main(int argc, char **argv)
     // The fp32 coarsening below block-orthogonalises ITS copy of the subspace, which is all the
     // fp32 hierarchy reads. The fp64 subspace stays UN-orthogonalised and the fp64 coarse
     // operator unbuilt; under MG_PRECISION=single neither is applied (OuterPrecon selects the
-    // fp32 hierarchy; the fp64 `Precon` is constructed but never called). The guard on
-    // coarse_apply_check above removes the one path that would apply the fp64 coarse operator.
+    // fp32 hierarchy; the fp64 `Precon` is constructed but never called). The one path that
+    // would apply the fp64 coarse operator, the fp64 coarse_apply_check, is gated by !mg_single.
     if (boss) std::cout << GridLogMessage << "--- fp64 coarsening SKIPPED (--probe-skip-fp64-coarsen) ---" << std::endl;
   }
 
@@ -1273,11 +1607,12 @@ int main(int argc, char **argv)
   ProbeMG::OpCounts counts;
 
   NonHermitianLinearOperator<LittleDiracOperator, CoarseVector> LinOpCoarse(LittleDiracOp);
-  ShiftedNonHermitianLinearOperator<LittleDiracOperator, CoarseVector> ShiftedLinOpCoarse(LittleDiracOp, 0.001);
+  // +coarse_shift (--probe-coarse-shift, default 0.001 = the old literal).
+  ShiftedNonHermitianLinearOperator<LittleDiracOperator, CoarseVector> ShiftedLinOpCoarse(LittleDiracOp, coarse_shift);
 
   // ---- Workstream A: alternative coarse APPLIES, fp64 hierarchy (plan v2 §5) -------------
   //
-  // Same coarse matrix and the same 0.001 shift, different apply routine. Built only when
+  // Same coarse matrix and the same coarse_shift, different apply routine. Built only when
   // selected or when the agreement check is on, since each holds its own copy of the links.
   // Skipped entirely under --probe-mg-precision single: the fp64 coarse solver is never driven
   // there (OuterPrecon selects the fp32 hierarchy) and memory at C3 is already tight.
@@ -1287,9 +1622,9 @@ int main(int argc, char **argv)
   std::unique_ptr<MrhsCoarseD> MrhsCoarse;
   if (!mg_single) {
     if (coarse_apply == "stencil" || (coarse_apply_check > 0 && stencil_hops == 1))
-      StencilCoarse.reset(new StencilCoarseD(LittleDiracOp, Coarse4d, 0.001));
+      StencilCoarse.reset(new StencilCoarseD(LittleDiracOp, Coarse4d, coarse_shift));
     if (coarse_apply == "mrhs" || coarse_apply_check > 0)
-      MrhsCoarse.reset(new MrhsCoarseD(LittleDiracOp, Coarse4d, 0.001));
+      MrhsCoarse.reset(new MrhsCoarseD(LittleDiracOp, Coarse4d, coarse_shift));
     if (coarse_apply_check > 0) {
       if (boss) std::cout << GridLogMessage << "--- coarse apply check (fp64) ---" << std::endl;
       CoarseVector c_probe(Coarse4d);
@@ -1342,7 +1677,8 @@ int main(int argc, char **argv)
       fast_gcr ? static_cast<LinearFunction<CoarseVector> &>(CoarseSolverFast)
                : static_cast<LinearFunction<CoarseVector> &>(CoarseSolverStock);
 
-  ShiftedSchurOperator<LatticeFermionD> ShiftedSchurOp(SchurOp, 0.01);
+  // +smoother_shift (--probe-smoother-shift, default 0.01 = the old literal).
+  ShiftedSchurOperator<LatticeFermionD> ShiftedSchurOp(SchurOp, smoother_shift);
   ProbeMG::CountingLinearOperator<LatticeFermionD> CountedShiftedSchurOp(ShiftedSchurOp, counts.fine);
   PrecGeneralisedConjugateResidualNonHermitian<LatticeFermionD> SmootherStock(
       smoother_tol, smoother_maxiter, CountedShiftedSchurOp, fine_trivial, smoother_mmax, smoother_nstep);
@@ -1397,7 +1733,13 @@ int main(int argc, char **argv)
   // Workstream A on the fp32 hierarchy: stencil apply only (mrhs is fp64-only, see the header).
   typedef ProbeMG::StencilCoarseApply<vSpinColourVectorF, vTComplexF, 2 * kNbasis> StencilCoarseF_t;
   std::unique_ptr<StencilCoarseF_t> StencilCoarseF;
+  // COARSE_APPLY=stencil_h: fp16 copy of StencilCoarseF's links (it keeps a reference to
+  // StencilCoarseF->op, whose Stencil does the halo exchange, so it is declared after it and
+  // destroyed before it). CountedCoarseHalfF is its counted wrapper, the SOLVE-path operator.
+  typedef ProbeMG::HalfStencilCoarseApply<vSpinColourVectorF, vTComplexF, 2 * kNbasis> HalfCoarseF_t;
+  std::unique_ptr<HalfCoarseF_t> HalfCoarseF;
   std::unique_ptr<ProbeMG::CountingLinearOperator<CoarseVectorF>> CountedCoarseF;
+  std::unique_ptr<ProbeMG::CountingLinearOperator<CoarseVectorF>> CountedCoarseHalfF;
   std::unique_ptr<ProbeMG::CountingLinearOperator<LatticeFermionF>> CountedSchurOpF;
   std::unique_ptr<ProbeMG::CountingLinearOperator<LatticeFermionF>> CountedShiftedSchurOpF;
   std::unique_ptr<PrecGeneralisedConjugateResidualNonHermitian<CoarseVectorF>> CoarseSolverStockF;
@@ -1435,6 +1777,8 @@ int main(int argc, char **argv)
   std::unique_ptr<NonLocalStencilGeometry4D> geom2F;
   std::unique_ptr<L2OperatorF> L2OpF;
   std::unique_ptr<Stencil2F_t> Stencil2F;
+  typedef ProbeMG::HalfStencilCoarseApply<L1SiteF, CComplex2F, kNbasis2> Half2F_t; // COARSE2_APPLY=stencil_h
+  std::unique_ptr<Half2F_t> Half2F;
   std::unique_ptr<NonHermitianLinearOperator<L2OperatorF, CoarseVector2F>> LinOp2F;
   std::unique_ptr<ShiftedNonHermitianLinearOperator<L2OperatorF, CoarseVector2F>> Shifted2F;
   std::unique_ptr<ProbeMG::CountingLinearOperator<CoarseVector2F>> Counted2F;
@@ -1444,6 +1788,19 @@ int main(int argc, char **argv)
   std::unique_ptr<ProbeMG::ZeroThenApply<CoarseVectorF>> L1SmootherZeroedF; // smoother-only path
   std::unique_ptr<MGPreconditioner<L1SiteF, CComplex2F, kNbasis2>> Precon2F;
   double l2_subspace_seconds = 0.0, l2_coarsen_seconds = 0.0, l2_galerkin = -1.0;
+  // Wave 3 (--probe-l2-split 1): the level-2 problem replicated on every rank. Built only when
+  // selected; see ReplicaMap / SplitCoarseSolve above. Function scope for the same lifetime
+  // reasons as the rest of level 2.
+  typedef ReplicatedCoarseApply<L1SiteF, CComplex2F, kNbasis2> Rep2Apply_t;
+  GridCartesian *Coarse2Rep = nullptr;
+  std::unique_ptr<ReplicaMap> Rep2Map;
+  std::unique_ptr<Rep2Apply_t> Rep2Apply;
+  std::unique_ptr<ProbeMG::CountingLinearOperator<CoarseVector2F>> CountedRep2;
+  std::unique_ptr<TrivialPrecon<CoarseVector2F>> rep2_trivialF;
+  std::unique_ptr<ProbeMG::FlexibleGCR<CoarseVector2F>> Rep2SolverF;
+  std::unique_ptr<SplitCoarseSolve<CoarseVector2F>> SplitSolve2F;
+  double l2_split_check = -1.0, l2_split_seconds = 0.0;
+  bool l2_split_passed = true; // stays true when the split is off, so the gate is unaffected
 
   if (mg_single) {
     if (boss)
@@ -1480,10 +1837,27 @@ int main(int argc, char **argv)
     LinOpCoarseF.reset(
         new NonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>(*LittleDiracOpF));
     ShiftedLinOpCoarseF.reset(
-        new ShiftedNonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>(*LittleDiracOpF, 0.001));
-    // Workstream A, fp32: the stencil apply of the same fp32 coarse matrix (+0.001).
-    if (coarse_apply == "stencil" || (coarse_apply_check > 0 && stencil_hops == 1))
-      StencilCoarseF.reset(new StencilCoarseF_t(*LittleDiracOpF, Coarse4dF, 0.001));
+        new ShiftedNonHermitianLinearOperator<LittleDiracOperatorF, CoarseVectorF>(*LittleDiracOpF, coarse_shift));
+    // Workstream A, fp32: the stencil apply of the same fp32 coarse matrix (+coarse_shift).
+    // stencil_h builds it too: its CoarsenedMatrix holds the transposed links the fp16 store is
+    // converted from, its Stencil does the fp16 apply's halo exchange, and it drives level-2 setup.
+    if (coarse_apply == "stencil" || coarse_apply == "stencil_h" ||
+        (coarse_apply_check > 0 && stencil_hops == 1))
+      StencilCoarseF.reset(new StencilCoarseF_t(*LittleDiracOpF, Coarse4dF, coarse_shift));
+    // fp16 link storage, fp32 arithmetic: the same links rounded once to binary16, the same
+    // coarse_shift. Built when selected, or by the check wherever the fp32 stencil apply exists.
+    if (StencilCoarseF && (coarse_apply == "stencil_h" || coarse_apply_check > 0)) {
+      accelerator_barrier();
+      UGrid->Barrier();
+      const double th0 = usecond();
+      HalfCoarseF.reset(new HalfCoarseF_t(*StencilCoarseF->op, coarse_shift));
+      accelerator_barrier();
+      UGrid->Barrier();
+      if (boss)
+        std::cout << GridLogMessage << "stencil_h links   fp16 store " << HalfCoarseF->bytes() / 1.0e6
+                  << " MB/rank (the fp32 links stay resident), max |link| " << HalfCoarseF->max_abs
+                  << ", import " << (usecond() - th0) / 1.0e3 << " ms" << std::endl;
+    }
     if (coarse_apply_check > 0 && StencilCoarseF) {
       if (boss) std::cout << GridLogMessage << "--- coarse apply check (fp32) ---" << std::endl;
       // CRNG lives on the fp64 coarse grid; draw there and convert, as the subspace is.
@@ -1493,15 +1867,30 @@ int main(int argc, char **argv)
       precisionChange(c_probeF, c_probeD);
       ProbeMG::check_coarse_apply<CoarseVectorF>("stencil", *ShiftedLinOpCoarseF, *StencilCoarseF,
                                                  c_probeF, UGrid, coarse_apply_check, boss);
+      if (HalfCoarseF)
+        ProbeMG::check_coarse_apply<CoarseVectorF>("stencil_h", *ShiftedLinOpCoarseF, *HalfCoarseF,
+                                                   c_probeF, UGrid, coarse_apply_check, boss, 1.0e-3);
     }
+    // SETUP-path level-1 operator. Under stencil_h this is still the fp32 stencil apply: it
+    // drives the level-2 null vectors, the level-2 coarsening and the level-2 Galerkin check
+    // below, so the level-2 operator is identical to COARSE_APPLY=stencil's (bit for bit, up to
+    // the run-to-run determinism of the stencil row itself). Only the SOLVE path goes fp16.
     LinearOperatorBase<CoarseVectorF> &SelectedCoarseF =
-        (StencilCoarseF && coarse_apply == "stencil")
+        (StencilCoarseF && (coarse_apply == "stencil" || coarse_apply == "stencil_h"))
             ? static_cast<LinearOperatorBase<CoarseVectorF> &>(*StencilCoarseF)
             : static_cast<LinearOperatorBase<CoarseVectorF> &>(*ShiftedLinOpCoarseF);
     // The fp32 hierarchy shares the SAME counters as the fp64 one: only one of the two is ever
     // driven by the outer solver (OuterPrecon selects), so the totals stay unambiguous.
     CountedCoarseF.reset(
         new ProbeMG::CountingLinearOperator<CoarseVectorF>(SelectedCoarseF, counts.coarse));
+    // SOLVE-path level-1 operator: the level-1 GCR (CoarseSolver*F), the level-1 smoother
+    // (L1SmootherF) and the level-1 residuals of the level-2 V-cycle (Precon2F). The same object
+    // as CountedCoarseF except under stencil_h, where it wraps the fp16 apply. Both count into
+    // counts.coarse, which is reset before every timed solve, so the census is unchanged in kind.
+    if (coarse_apply == "stencil_h")
+      CountedCoarseHalfF.reset(new ProbeMG::CountingLinearOperator<CoarseVectorF>(*HalfCoarseF, counts.coarse));
+    ProbeMG::CountingLinearOperator<CoarseVectorF> &CountedCoarseSolveF =
+        CountedCoarseHalfF ? *CountedCoarseHalfF : *CountedCoarseF;
     CountedSchurOpF.reset(
         new ProbeMG::CountingLinearOperator<LatticeFermionF>(*schur_holderF, counts.fine));
 
@@ -1510,7 +1899,7 @@ int main(int argc, char **argv)
       // Smoother-only preconditioner for the level-1 GCR: the same L1SmootherF as the mg path,
       // with no level-2 aggregation. Isolates what the third level buys over smoothing alone.
       L1SmootherF.reset(new ProbeMG::FlexibleGCR<CoarseVectorF>(
-          l2_smoother_tol, 1, *CountedCoarseF, *coarse_trivialF, 1, l2_smoother_nstep));
+          l2_smoother_tol, 1, CountedCoarseSolveF, *coarse_trivialF, 1, l2_smoother_nstep));
       L1SmootherF->Level(4);
       L1SmootherF->verbose = 0;
       L1SmootherF->zero_guess = true;
@@ -1544,6 +1933,11 @@ int main(int argc, char **argv)
       // Level-2 null vectors: Grid's default generator (3 rounds of GCR inverse iteration, the
       // recipe workstream B confirmed) driven by the level-1 operator the coarse GCR solves
       // (shifted, stencil apply). Coarse applies here are counted but reset before the solve.
+      // Under COARSE_APPLY=stencil_h the level-2 setup (null vectors, coarsening, Galerkin check)
+      // still runs on CountedCoarseF = the fp32 stencil apply, NOT the fp16 solve operator.
+      // ⚠️ Always the GCR generator, whatever --probe-subspace-method says: method `cg` needs
+      // HermOp, and the level-1 operator wrappers (ShiftedNonHermitianLinearOperator,
+      // StencilCoarseApply) GRID_ASSERT in HermOp. `cg` is a level-1-only knob.
       CRNG1F.reset(new GridParallelRNG(Coarse4dF));
       CRNG1F->SeedFixedIntegers(std::vector<int>({9, 10, 11, 12}));
       Agg2F.reset(new Subspace2F(Coarse2F, Coarse4dF, Even));
@@ -1586,23 +1980,38 @@ int main(int argc, char **argv)
 
       // Level-2 solver stack, mirroring level 1's: shifted operator, counted, GCR to tolerance.
       LinOp2F.reset(new NonHermitianLinearOperator<L2OperatorF, CoarseVector2F>(*L2OpF));
-      Shifted2F.reset(new ShiftedNonHermitianLinearOperator<L2OperatorF, CoarseVector2F>(*L2OpF, 0.001));
+      // +l2_coarse_shift (--probe-l2-coarse-shift, default 0.001 = the old literal), on both applies.
+      Shifted2F.reset(new ShiftedNonHermitianLinearOperator<L2OperatorF, CoarseVector2F>(*L2OpF, l2_coarse_shift));
       // ⚠️ The stencil apply needs the general geometry's 9-point stencil. In a dimension of
       // global extent 2 the +1 and -1 shifts coincide and NonLocalStencilGeometry emits ONE
       // point for them (Geometry.h:166-169), so npoint < 9 and the old class's fixed 9-point
       // Geometry cannot be filled from it. That is the C2 level-2 lattice (2.2.2.4); at C3
       // (6.4.4.8) it does not arise. Fall back to the general apply rather than abort.
-      if (coarse2_apply == "stencil") {
+      if (coarse2_apply == "stencil" || coarse2_apply == "stencil_h") {
         if (geom2F->npoint == 9) {
-          Stencil2F.reset(new Stencil2F_t(*L2OpF, Coarse2F, 0.001));
+          Stencil2F.reset(new Stencil2F_t(*L2OpF, Coarse2F, l2_coarse_shift));
         } else if (boss) {
           std::cout << GridLogMessage << "level-2 stencil apply UNAVAILABLE (npoint " << geom2F->npoint
                     << " != 9: a level-2 dimension has extent 2); using the general apply" << std::endl;
         }
       }
+      // COARSE2_APPLY=stencil_h: fp16 copy of Stencil2F's links, same l2_coarse_shift. Level 2 is
+      // the bottom level, so it only replaces the level-2 GCR's operator.
+      if (Stencil2F && coarse2_apply == "stencil_h") {
+        Half2F.reset(new Half2F_t(*Stencil2F->op, l2_coarse_shift));
+        if (coarse_apply_check > 0) { // agreement on a random level-2 vector (own RNG: CRNG1F untouched)
+          GridParallelRNG rng2(Coarse2F);
+          rng2.SeedFixedIntegers(std::vector<int>({13, 14, 15, 16}));
+          CoarseVector2F v2(Coarse2F);
+          random(rng2, v2);
+          ProbeMG::check_coarse_apply<CoarseVector2F>("stencil_h(l2)", *Shifted2F, *Half2F, v2, UGrid,
+                                                      coarse_apply_check, boss, 1.0e-3);
+        }
+      }
       LinearOperatorBase<CoarseVector2F> &Selected2F =
-          Stencil2F ? static_cast<LinearOperatorBase<CoarseVector2F> &>(*Stencil2F)
-                    : static_cast<LinearOperatorBase<CoarseVector2F> &>(*Shifted2F);
+          Half2F      ? static_cast<LinearOperatorBase<CoarseVector2F> &>(*Half2F)
+          : Stencil2F ? static_cast<LinearOperatorBase<CoarseVector2F> &>(*Stencil2F)
+                      : static_cast<LinearOperatorBase<CoarseVector2F> &>(*Shifted2F);
       Counted2F.reset(new ProbeMG::CountingLinearOperator<CoarseVector2F>(Selected2F, counts.coarse2));
       coarse2_trivialF.reset(new TrivialPrecon<CoarseVector2F>());
       Coarse2SolverF.reset(new ProbeMG::FlexibleGCR<CoarseVector2F>(
@@ -1613,13 +2022,90 @@ int main(int argc, char **argv)
       Coarse2SolverF->verify_residual = false;
       // Level-1 smoother: a few GCR steps on the level-1 operator itself (QUDA: 8 CA-GCR).
       L1SmootherF.reset(new ProbeMG::FlexibleGCR<CoarseVectorF>(
-          l2_smoother_tol, 1, *CountedCoarseF, *coarse_trivialF, 1, l2_smoother_nstep));
+          l2_smoother_tol, 1, CountedCoarseSolveF, *coarse_trivialF, 1, l2_smoother_nstep));
       L1SmootherF->Level(4);
       L1SmootherF->verbose = 0;
       L1SmootherF->zero_guess = true;
       L1SmootherF->verify_residual = false;
+
+      // ---- Wave 3: the level-2 solve replicated on every rank (--probe-l2-split 1) ----------
+      if (l2_split) {
+        accelerator_barrier();
+        UGrid->Barrier();
+        const double ts0 = usecond();
+        const Coordinate simd2 = GridDefaultSimd(Nd, vComplexF::Nsimd());
+        for (int d = 0; d < 4; ++d) {
+          if (clatt2[d] % simd2[d] != 0) {
+            if (boss)
+              std::cerr << "probe: --probe-l2-split: level-2 dim " << d << " (" << clatt2[d]
+                        << ") not divisible by the fp32 SIMD layout " << simd2[d] << std::endl;
+            Grid_finalize();
+            return 2;
+          }
+        }
+        // mpi_split 1.1.1.1: every rank its own single-rank communicator, whole level-2 volume
+        // local (C3: 6.4.4.8 with simd 1.2.2.2 -> rdim 6.2.2.4).
+        Coarse2Rep = new GridCartesian(clatt2, simd2, Coordinate({1, 1, 1, 1}), *Coarse2F);
+        Rep2Map.reset(new ReplicaMap(Coarse2F, Coarse2Rep));
+        Rep2Apply.reset(new Rep2Apply_t(*L2OpF, Coarse2F, Coarse2Rep, *Rep2Map, l2_coarse_shift));
+        // counts.coarse2 counts the REPLICATED applies, so the "operator applications" census
+        // stays comparable with L2_SPLIT=0. ⚠️ With L2_SPLIT every rank applies the WHOLE level-2
+        // operator (16x the sites per rank at C3/16 GPUs): same count, different work per apply.
+        CountedRep2.reset(new ProbeMG::CountingLinearOperator<CoarseVector2F>(*Rep2Apply, counts.coarse2));
+        rep2_trivialF.reset(new TrivialPrecon<CoarseVector2F>());
+        // The same GCR as Coarse2SolverF (same tol / maxiter / mmax / nstep, zero guess), on the
+        // replicated grid.
+        Rep2SolverF.reset(new ProbeMG::FlexibleGCR<CoarseVector2F>(
+            l2_coarse_tol, l2_coarse_maxiter, *CountedRep2, *rep2_trivialF, l2_coarse_mmax, l2_coarse_nstep));
+        Rep2SolverF->Level(5);
+        Rep2SolverF->verbose = 0;
+        Rep2SolverF->zero_guess = true; // SplitCoarseSolve zeroes the replicated solution
+        Rep2SolverF->verify_residual = false;
+        SplitSolve2F.reset(new SplitCoarseSolve<CoarseVector2F>(*Rep2Map, *Rep2SolverF));
+        accelerator_barrier();
+        UGrid->Barrier();
+        l2_split_seconds = (usecond() - ts0) / 1.0e6;
+
+        // Gate: replicated-apply(replicate(v)) == replicate(distributed GENERAL apply(v)) on a
+        // random level-2 vector, to fp32 roundoff, plus extract(replicate(v)) == v exactly. The
+        // reference is the general apply (+l2 shift) whatever COARSE2_APPLY selects, so this
+        // also checks the link transposition and the extent-2 rule. Every rank checks its own
+        // replica; the worst is reported. (CRNG1F is not used after this point.)
+        {
+          CoarseVectorF f_rand(Coarse4dF);
+          random(*CRNG1F, f_rand);
+          CoarseVector2F v(Coarse2F), Av(Coarse2F), v_back(Coarse2F);
+          Agg2F->ProjectToSubspace(v, f_rand);
+          Shifted2F->Op(v, Av);
+          CoarseVector2F vR(Coarse2Rep), AvR(Coarse2Rep), AvR_ref(Coarse2Rep), dR(Coarse2Rep);
+          std::vector<CoarseVector2F::scalar_object> loc, glob;
+          replicate_lattice(*Rep2Map, v, vR, loc, glob);
+          Rep2Apply->Op(vR, AvR);
+          replicate_lattice(*Rep2Map, Av, AvR_ref, loc, glob);
+          dR = AvR - AvR_ref;
+          double rel_apply = std::sqrt(norm2(dR) / norm2(AvR_ref)); // replicated grid: rank-local
+          Coarse2F->GlobalMax(rel_apply);
+          extract_lattice(*Rep2Map, vR, v_back, loc, glob);
+          v_back = v_back - v;
+          const double rel_roundtrip = std::sqrt(norm2(v_back) / norm2(v));
+          l2_split_check = std::max(rel_apply, rel_roundtrip);
+          l2_split_passed = (l2_split_check < 1.0e-5);
+          if (boss)
+            std::cout << GridLogMessage << "level-2 split check " << l2_split_check
+                      << (l2_split_passed ? " PASSED" : " FAILED") << "   (apply " << rel_apply
+                      << ", round trip " << rel_roundtrip << "; replicated grid "
+                      << coordinate_string(Coarse2Rep->GlobalDimensions()) << " rdim "
+                      << coordinate_string(Coarse2Rep->_rdimensions) << " procs "
+                      << coordinate_string(Coarse2Rep->_processors) << ", " << Rep2Apply->zero_points
+                      << " zero link(s), setup " << l2_split_seconds << " s)" << std::endl;
+        }
+      }
+      // The level-2 coarse solve inside the level-2 V-cycle: distributed (control) or replicated.
+      LinearFunction<CoarseVector2F> &Coarse2SolveSel =
+          SplitSolve2F ? static_cast<LinearFunction<CoarseVector2F> &>(*SplitSolve2F)
+                       : static_cast<LinearFunction<CoarseVector2F> &>(*Coarse2SolverF);
       Precon2F.reset(new MGPreconditioner<L1SiteF, CComplex2F, kNbasis2>(
-          *Agg2F, *CountedCoarseF, *coarse_trivialF, *L1SmootherF, *LinOp2F, *Coarse2SolverF));
+          *Agg2F, CountedCoarseSolveF, *coarse_trivialF, *L1SmootherF, *LinOp2F, Coarse2SolveSel));
       Precon2F->Level(3);
       Precon2F->fast_project = (fast_project != 0);
       Precon2F->project_mode = fast_project;
@@ -1634,15 +2120,15 @@ int main(int argc, char **argv)
                             : static_cast<LinearFunction<CoarseVectorF> &>(*coarse_trivialF);
 
     CoarseSolverStockF.reset(new PrecGeneralisedConjugateResidualNonHermitian<CoarseVectorF>(
-        coarse_tol, coarse_maxiter, *CountedCoarseF, CoarsePreconF, coarse_mmax, coarse_nstep));
+        coarse_tol, coarse_maxiter, CountedCoarseSolveF, CoarsePreconF, coarse_mmax, coarse_nstep));
     CoarseSolverStockF->Level(3);
     CoarseSolverFastF.reset(new ProbeMG::FlexibleGCR<CoarseVectorF>(
-        coarse_tol, coarse_maxiter, *CountedCoarseF, CoarsePreconF, coarse_mmax, coarse_nstep));
+        coarse_tol, coarse_maxiter, CountedCoarseSolveF, CoarsePreconF, coarse_mmax, coarse_nstep));
     CoarseSolverFastF->Level(3);
     CoarseSolverFastF->verify_residual = (verify_residual != 0);
     CoarseSolverFastF->zero_guess = true;
 
-    ShiftedSchurOpF.reset(new ShiftedSchurOperator<LatticeFermionF>(*schur_holderF, 0.01));
+    ShiftedSchurOpF.reset(new ShiftedSchurOperator<LatticeFermionF>(*schur_holderF, smoother_shift));
     CountedShiftedSchurOpF.reset(
         new ProbeMG::CountingLinearOperator<LatticeFermionF>(*ShiftedSchurOpF, counts.fine));
     SmootherStockF.reset(new PrecGeneralisedConjugateResidualNonHermitian<LatticeFermionF>(
@@ -1915,7 +2401,11 @@ int main(int argc, char **argv)
       if (run_cg)
         std::cout << GridLogMessage << "CG solve (Mpc^dag Mpc)  " << median_of(cgF_times) << " s, "
                   << cgF_iters << " iters, fp64-graded residual " << cgF_residual << std::endl;
-      const bool ok = (mgF_residual <= 1.0e-4) && (!run_cg || cgF_residual <= 1.0e-4);
+      if (l2_split)
+        std::cout << GridLogMessage << "level-2 solve      replicated on every rank (L2_SPLIT=1)"
+                  << std::endl;
+      // l2_split_passed is true unless --probe-l2-split 1 built a replica that failed its check.
+      const bool ok = (mgF_residual <= 1.0e-4) && (!run_cg || cgF_residual <= 1.0e-4) && l2_split_passed;
       std::cout << GridLogMessage << "PROBE RESULT: " << (ok ? "PASS" : "FAIL") << std::endl;
     }
     Grid_finalize();
@@ -1949,6 +2439,8 @@ int main(int argc, char **argv)
     // Reset AFTER setup: CoarsenOperator applies Mpc npoint*2*nbasis times, and
     // CreateSubspaceGCR far more, neither of which belongs in the per-V-cycle count.
     counts.reset();
+    // Split timers likewise report the LAST timed repeat (null when --probe-l2-split 0).
+    if (SplitSolve2F) SplitSolve2F->reset_timers();
     accelerator_barrier();
     UGrid->Barrier();
     t0 = usecond();
@@ -2079,15 +2571,17 @@ int main(int argc, char **argv)
   // which is the independent residual. The must-fail control is still required at every hops,
   // since a check that cannot distinguish Mpc from Mpc^dag Mpc proves nothing.
   const bool galerkin_control_ok = (galerkin_herm > 1.0e-3);
+  // l2_split_passed is true unless --probe-l2-split 1 built a replica that failed its check.
   const bool probe_passed =
-      converged && galerkin_control_ok && ((stencil_hops < 2) || galerkin_passed);
+      converged && galerkin_control_ok && ((stencil_hops < 2) || galerkin_passed) && l2_split_passed;
   if (boss) {
     std::cout << GridLogMessage << "=== SUMMARY ===" << std::endl;
     std::cout << GridLogMessage << "action                  " << action_name << std::endl;
     std::cout << GridLogMessage << "checkerboard            " << cb_name << std::endl;
     std::cout << GridLogMessage << "stencil hops / npoint   " << stencil_hops << " / " << geom.npoint
               << std::endl;
-    std::cout << GridLogMessage << "coarse apply            " << coarse_apply << std::endl;
+    std::cout << GridLogMessage << "coarse apply            " << coarse_apply
+              << (coarse_apply == "stencil_h" ? " (fp16 link storage, fp32 arithmetic)" : "") << std::endl;
     std::cout << GridLogMessage << "MG precondition prec    " << precision_name
               << (mg_single ? " (hierarchy fp32; outer solver + gates fp64)" : " (fp64 throughout)")
               << std::endl;
@@ -2099,9 +2593,17 @@ int main(int argc, char **argv)
       std::cout << GridLogMessage << "level-2 setup           " << (l2_subspace_seconds + l2_coarsen_seconds)
                 << " s (subspace " << l2_subspace_seconds << ", coarsen " << l2_coarsen_seconds
                 << "), Galerkin " << l2_galerkin << std::endl;
+    if (SplitSolve2F) {
+      std::cout << GridLogMessage << "level-2 solve      replicated on every rank (L2_SPLIT=1)"
+                << std::endl;
+      std::cout << GridLogMessage << "level-2 split check " << l2_split_check
+                << (l2_split_passed ? " PASSED" : " FAILED") << ", replication setup "
+                << l2_split_seconds << " s" << std::endl;
+    }
+    // l2_split_seconds is 0 unless --probe-l2-split 1, so the default total is unchanged.
     std::cout << GridLogMessage << "setup total             "
               << (subspace_seconds + coarsen_seconds + coarsen_f_seconds + l2_subspace_seconds +
-                  l2_coarsen_seconds)
+                  l2_coarsen_seconds + l2_split_seconds)
               << " s" << std::endl;
     std::cout << GridLogMessage << "coarse precon           " << coarse_precon
               << (coarse_precon == "mg" && !l2_coarse_solve ? " (smoother only)" : "")
@@ -2138,6 +2640,12 @@ int main(int argc, char **argv)
                   << double(mg_coarse2_applies) / double(mg_steps) << " / V-cycle)";
       std::cout << std::endl;
     }
+    if (SplitSolve2F)
+      std::cout << GridLogMessage << "level-2 split timers    " << SplitSolve2F->calls
+                << " level-2 solves in the last timed solve: replicate "
+                << SplitSolve2F->t_replicate / 1.0e6 << " s, local GCR " << SplitSolve2F->t_solve / 1.0e6
+                << " s, extract " << SplitSolve2F->t_extract / 1.0e6
+                << " s (unbarriered usecond; diagnostic only)" << std::endl;
 
     if (run_cg && cg_double) {
       std::cout << GridLogMessage << "CG solve (Mpc^dag Mpc)  " << cg_seconds << " s, " << cg_iterations

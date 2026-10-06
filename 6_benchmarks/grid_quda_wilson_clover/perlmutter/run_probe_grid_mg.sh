@@ -90,9 +90,13 @@ COARSE_MAXITER=${COARSE_MAXITER:-50}
 #   general  the control (padded volume, PaddedCell exchange), ~3.2 ms/apply at C3 clover
 #   stencil  Grid's old CoarsenedMatrix apply (stencil halo, interior only); needs STENCIL_HOPS=1
 #   mrhs     Grid's MultiGeneralCoarsenedMatrix (batched cuBLAS); MG_PRECISION=double only
+#   stencil_h  the stencil apply with fp16 link storage, fp32 arithmetic, on the SOLVE path (level-1
+#            GCR, level-1 smoother, level-2 V-cycle residuals); level-2 setup keeps the fp32
+#            stencil apply. STENCIL_HOPS=1, MG_PRECISION=single. Needs the _w4 binary or later.
 COARSE_APPLY=${COARSE_APPLY:-general}
 # N>0: build every available alternative, check each against `general` on a random coarse
 # vector, and time N applies of each. Costs memory (extra link copies); 0 = off.
+# From _w4 it also checks stencil_h (fp16 tol 1e-3) and works with SKIP_FP64_COARSEN=1.
 COARSE_APPLY_CHECK=${COARSE_APPLY_CHECK:-0}
 SUBSPACE_TOL=${SUBSPACE_TOL:-0.001}
 SUBSPACE_ROUNDS=${SUBSPACE_ROUNDS:-3}
@@ -103,8 +107,15 @@ SUBSPACE_MAXITER=${SUBSPACE_MAXITER:-30}
 #   relax  Grid's own #else branch: relax Mpc x = 0 from the noise (QUDA's scheme); use ROUNDS=1
 #   cheb   Chebyshev filter on Mpc^dag Mpc; SUBSPACE_CHEB_LO / _ORDER, hi from a power method
 #   cheb_gcr  cheb, then SUBSPACE_ROUNDS gcr rounds started from the filtered vector (same knobs)
+#   cg     QUDA's relaxation: stock Grid CG on Mpc^dag Mpc, zero source, noise as the guess, one
+#          round, SUBSPACE_CG_TOL relative to the initial residual, SUBSPACE_CG_MAXITER cap.
+#          Level 1 only (level 2 keeps gcr). Needs a binary built after 2026-09-29 (_w2).
+#   cg_gcr cg, then SUBSPACE_ROUNDS gcr rounds started from the CG vector (as cheb_gcr; same
+#          cg and gcr knobs). Needs the _w2b binary or later.
 # SUBSPACE_PRECISION=single generates on the fp32 operator (needs MG_PRECISION=single).
 SUBSPACE_METHOD=${SUBSPACE_METHOD:-gcr}
+SUBSPACE_CG_TOL=${SUBSPACE_CG_TOL:-5e-6}         # QUDA setup_tol
+SUBSPACE_CG_MAXITER=${SUBSPACE_CG_MAXITER:-500}  # QUDA setup_maxiter
 SUBSPACE_PRECISION=${SUBSPACE_PRECISION:-double}
 SUBSPACE_CHEB_LO=${SUBSPACE_CHEB_LO:-0.01}
 SUBSPACE_CHEB_ORDER=${SUBSPACE_CHEB_ORDER:-100}
@@ -129,14 +140,28 @@ L2_COARSE_TOL=${L2_COARSE_TOL:-0.2}
 L2_COARSE_MAXITER=${L2_COARSE_MAXITER:-50}
 L2_COARSE_NSTEP=${L2_COARSE_NSTEP:-8}
 L2_COARSE_MMAX=${L2_COARSE_MMAX:-8}
+# general | stencil | stencil_h (fp16 link storage, _w4 or later) for the level-2 GCR's operator.
 COARSE2_APPLY=${COARSE2_APPLY:-general}
 # 0 = level-1 smoother ONLY as the coarse GCR's preconditioner (no level-2 aggregation).
 L2_COARSE_SOLVE=${L2_COARSE_SOLVE:-1}
 # 1 = skip the fp64 coarsening + its Galerkin check (production runs the fp32 hierarchy only).
-# Needs MG_PRECISION=single, RUN_CG=0 or CG_PRECISION=double, COARSE_APPLY_CHECK=0.
+# Needs MG_PRECISION=single, RUN_CG=0 or CG_PRECISION=double, and COARSE_APPLY_CHECK=0 before _w4.
 SKIP_FP64_COARSEN=${SKIP_FP64_COARSEN:-0}
 # 1 = build the fp64<->fp32 precision-change site maps once (stock rebuilds them per call).
 PERSISTENT_PRECCHANGE=${PERSISTENT_PRECCHANGE:-0}
+# Diagonal shifts, inherited from Grid's Test_general_coarse_wilson.cc (QUDA uses none).
+# Defaults = the old hardcoded values. SMOOTHER_SHIFT: fine smoother on Mpc + shift.
+# COARSE_SHIFT: every level-1 coarse apply (it also reaches level 2, which is coarsened from the
+# shifted level-1 operator). L2_COARSE_SHIFT: the level-2 apply. A binary built before 2026-09-29
+# ignores these flags (its literals are these defaults).
+SMOOTHER_SHIFT=${SMOOTHER_SHIFT:-0.01}
+COARSE_SHIFT=${COARSE_SHIFT:-0.001}
+L2_COARSE_SHIFT=${L2_COARSE_SHIFT:-0.001}
+# 1 = replicate the level-2 problem on every rank (1.1.1.1 split grid, own communicator) so the
+# level-2 GCR does no inter-rank communication; one GlobalSumVector per level-2 solve assembles
+# the source. Needs COARSE_PRECON=mg L2_COARSE_SOLVE=1. 0 = distributed (control). Needs the _w3
+# binary or later (older binaries ignore the flag and run distributed).
+L2_SPLIT=${L2_SPLIT:-0}
 TOL=${TOL:-1e-10}
 MAXITER=${MAXITER:-1000}
 CG_MAXITER=${CG_MAXITER:-50000}
@@ -267,12 +292,15 @@ chmod +x "${SELECT_GPU}"
     "${COARSE_TOL}" "${SUBSPACE_TOL}" "${SUBSPACE_ROUNDS}" "${SUBSPACE_MMAX}" "${SUBSPACE_MAXITER}"
   printf 'ENV SUBSPACE_METHOD=%s SUBSPACE_PRECISION=%s SUBSPACE_CHEB_LO=%s SUBSPACE_CHEB_ORDER=%s SUBSPACE_PM_ITERS=%s SUBSPACE_CHEB_HI_FACTOR=%s\n' \
     "${SUBSPACE_METHOD}" "${SUBSPACE_PRECISION}" "${SUBSPACE_CHEB_LO}" "${SUBSPACE_CHEB_ORDER}" "${SUBSPACE_PM_ITERS}" "${SUBSPACE_CHEB_HI_FACTOR}"
+  printf 'ENV SUBSPACE_CG_TOL=%s SUBSPACE_CG_MAXITER=%s SMOOTHER_SHIFT=%s COARSE_SHIFT=%s L2_COARSE_SHIFT=%s\n' \
+    "${SUBSPACE_CG_TOL}" "${SUBSPACE_CG_MAXITER}" "${SMOOTHER_SHIFT}" "${COARSE_SHIFT}" "${L2_COARSE_SHIFT}"
   printf 'ENV COARSE_PRECON=%s BLOCK2=%s L2_SUBSPACE_TOL=%s L2_SUBSPACE_ROUNDS=%s L2_SUBSPACE_MAXITER=%s\n' \
     "${COARSE_PRECON}" "${BLOCK2}" "${L2_SUBSPACE_TOL}" "${L2_SUBSPACE_ROUNDS}" "${L2_SUBSPACE_MAXITER}"
   printf 'ENV L2_SMOOTHER_NSTEP=%s L2_SMOOTHER_TOL=%s L2_COARSE_TOL=%s L2_COARSE_MAXITER=%s L2_COARSE_NSTEP=%s L2_COARSE_MMAX=%s COARSE2_APPLY=%s\n' \
     "${L2_SMOOTHER_NSTEP}" "${L2_SMOOTHER_TOL}" "${L2_COARSE_TOL}" "${L2_COARSE_MAXITER}" "${L2_COARSE_NSTEP}" "${L2_COARSE_MMAX}" "${COARSE2_APPLY}"
   printf 'ENV L2_COARSE_SOLVE=%s SKIP_FP64_COARSEN=%s PERSISTENT_PRECCHANGE=%s\n' \
     "${L2_COARSE_SOLVE}" "${SKIP_FP64_COARSEN}" "${PERSISTENT_PRECCHANGE}"
+  printf 'ENV L2_SPLIT=%s\n' "${L2_SPLIT}"
   printf 'ENV SOLVE_REPEATS=%s STOUT_NSMEAR=%s STOUT_RHO=%s\n' \
     "${SOLVE_REPEATS}" "${STOUT_NSMEAR}" "${STOUT_RHO}"
   printf 'ENV OUTER_PRECISION=%s CG_PRECISION=%s CG_INNER_TOL=%s CG_MIXED_OUTER=%s\n' \
@@ -324,6 +352,12 @@ args=(
   --probe-subspace-cheb-order "${SUBSPACE_CHEB_ORDER}"
   --probe-subspace-pm-iters "${SUBSPACE_PM_ITERS}"
   --probe-subspace-cheb-hi-factor "${SUBSPACE_CHEB_HI_FACTOR}"
+  --probe-subspace-cg-tol "${SUBSPACE_CG_TOL}"
+  --probe-subspace-cg-maxiter "${SUBSPACE_CG_MAXITER}"
+  --probe-smoother-shift "${SMOOTHER_SHIFT}"
+  --probe-coarse-shift "${COARSE_SHIFT}"
+  --probe-l2-coarse-shift "${L2_COARSE_SHIFT}"
+  --probe-l2-split "${L2_SPLIT}"
   --probe-coarse-precon "${COARSE_PRECON}"
   --probe-block2 "${BLOCK2}"
   --probe-l2-subspace-tol "${L2_SUBSPACE_TOL}"
