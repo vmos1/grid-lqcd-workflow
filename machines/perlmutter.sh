@@ -53,3 +53,12 @@ export LD_LIBRARY_PATH="${GRID_MPFR_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 # Cluster-specific dependency paths
 export CLIME_ROOT=/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/lime-install
 export CUDA_ARCH=sm_80
+
+# Python: the repo's own uv environment (pyproject.toml + uv.lock at the repo root), not the
+# system python3 (3.6). Run scripts as `uv run python <script>` from the repo root. All uv state
+# lives on $PSCRATCH: Python + environment are ~8k files and the m4599 CFS inode quota is full. After a
+# scratch purge, `uv sync` in the repo root rebuilds it from uv.lock. machines/perlmutter.md.
+export PATH="$HOME/.local/bin:$PATH"
+export UV_CACHE_DIR="$PSCRATCH/uv/cache"
+export UV_PYTHON_INSTALL_DIR="$PSCRATCH/uv/python"
+export UV_PROJECT_ENVIRONMENT="$PSCRATCH/uv/venvs/grid-lqcd-workflow"

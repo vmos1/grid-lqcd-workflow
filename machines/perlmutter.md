@@ -1,6 +1,6 @@
 # grid_qcd on Perlmutter: account, queues, paths, traps
 
-Updated on 2026-09-24 11:22 CDT · perlmutter
+Updated on 2026-10-06 12:39 CDT · perlmutter
 
 Read by agents on every session run on Perlmutter, per rule 7 of the workspace
 `AGENTS.md`. Shell environment is `perlmutter.sh` beside this file. General
@@ -72,6 +72,25 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
   "not found". A ~10 s death that names a shell variable and exits 1 is a
   missing `--export`, not the loader; read the last line first.
 - Login nodes are shared: `configure` there, `make -j` inside an allocation.
+
+## Python environment
+
+- The system `python3` is 3.6 (no `math.prod`, no 3.8+ syntax). Use the repo's
+  own uv environment: `pyproject.toml`, `.python-version` (3.12) and `uv.lock`
+  at the root of `grid-lqcd-workflow`. Run scripts from that root as
+  `uv run python <script>`; add a package with `uv add <name>` and commit the
+  changed `pyproject.toml` and `uv.lock`.
+- `uv` itself is in `~/.local/bin` (installed 2026-10-06 with
+  `python3.13 -m pip install --user uv` from the NERSC Python module's
+  interpreter). `perlmutter.sh` puts it on `PATH`.
+- All uv state is on `$PSCRATCH/uv/` (`cache`, `python`,
+  `venvs/grid-lqcd-workflow`), set by `perlmutter.sh`: Python plus packages
+  are ~8k files, which the CFS inode quota cannot take. The repo's `.venv` is
+  a local symlink to the same environment (gitignored), so `uv run` without
+  `perlmutter.sh` still uses scratch instead of creating ~8k files on CFS.
+  Never delete that symlink while the repo is on CFS.
+- After a scratch purge (~8 weeks idle), `uv sync` in the repo root rebuilds
+  everything from `uv.lock` in about a minute.
 
 ## Tools on the login node
 
