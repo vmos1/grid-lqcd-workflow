@@ -1,0 +1,90 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+  Free-drift test of Chroma's MD time unit, the twin of free_drift_grid.cc
+  (__docs/2026_10_05_grid_chroma_md_time_handoff.md §5). Placeholders @TAU@ @NSTEPS@ @BETA@ @SEED@
+  are filled by run_free_drift.sh.
+
+  8^4 cold start (UNIT), one Wilson gauge monomial at beta @BETA@ (0: zero force), one leapfrog
+  trajectory of length tau0 = @TAU@. The update is a warm-up update (StartUpdateNum 0,
+  NWarmUpUpdates 1), so Chroma skips the accept/reject step (abs_hmc.h) and the measured
+  plaquette is always the drifted configuration. KE_old in the log is sum localNorm2(P) - 4 per
+  link; with beta 0 the potential energy is zero.
+-->
+<Params>
+  <MCControl>
+    <Cfg>
+      <cfg_type>UNIT</cfg_type>
+      <cfg_file>none</cfg_file>
+    </Cfg>
+    <RNG>
+      <Seed>
+        <elem>@SEED@</elem>
+        <elem>11</elem>
+        <elem>11</elem>
+        <elem>11</elem>
+      </Seed>
+    </RNG>
+    <StartUpdateNum>0</StartUpdateNum>
+    <NWarmUpUpdates>1</NWarmUpUpdates>
+    <NProductionUpdates>1</NProductionUpdates>
+    <NUpdatesThisRun>1</NUpdatesThisRun>
+    <SaveInterval>1000000</SaveInterval>
+    <SavePrefix>./free_drift</SavePrefix>
+    <SaveVolfmt>SINGLEFILE</SaveVolfmt>
+    <ParallelIO>false</ParallelIO>
+    <ReproCheckP>false</ReproCheckP>
+    <ReverseCheckP>false</ReverseCheckP>
+    <MonitorForces>true</MonitorForces>
+    <InlineMeasurements>
+      <elem>
+        <Name>PLAQUETTE</Name>
+        <Frequency>1</Frequency>
+        <Param>
+          <version>2</version>
+          <GaugeState>
+            <Name>SIMPLE_GAUGE_STATE</Name>
+            <GaugeBC>
+              <Name>PERIODIC_GAUGEBC</Name>
+            </GaugeBC>
+          </GaugeState>
+        </Param>
+        <NamedObject>
+          <gauge_id>default_gauge_field</gauge_id>
+        </NamedObject>
+      </elem>
+    </InlineMeasurements>
+  </MCControl>
+  <HMCTrj>
+    <nrow>8 8 8 8</nrow>
+    <Monomials>
+      <elem>
+        <Name>GAUGE_MONOMIAL</Name>
+        <GaugeAction>
+          <Name>WILSON_GAUGEACT</Name>
+          <beta>@BETA@</beta>
+          <GaugeBC>
+            <Name>PERIODIC_GAUGEBC</Name>
+          </GaugeBC>
+        </GaugeAction>
+        <NamedObject>
+          <monomial_id>gauge</monomial_id>
+        </NamedObject>
+      </elem>
+    </Monomials>
+    <Hamiltonian>
+      <monomial_ids>
+        <elem>gauge</elem>
+      </monomial_ids>
+    </Hamiltonian>
+    <MDIntegrator>
+      <tau0>@TAU@</tau0>
+      <Integrator>
+        <Name>LCM_STS_LEAPFROG</Name>
+        <n_steps>@NSTEPS@</n_steps>
+        <monomial_ids>
+          <elem>gauge</elem>
+        </monomial_ids>
+      </Integrator>
+    </MDIntegrator>
+  </HMCTrj>
+</Params>

@@ -1,0 +1,89 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+  Pure-gauge HMC, the Chroma twin of pure_gauge_hmc_grid.cc
+  (__docs/2026_10_05_grid_chroma_md_time_handoff.md §6). Filled by run_pure_gauge.sh:
+  @CFG_TYPE@ @CFG_FILE@ (UNIT for a cold start, SZINQIO + file for a restart), @SEED@,
+  @START@ (StartUpdateNum), @NWARMUP@ (updates <= this skip Metropolis), @NUPDATES@
+  (NUpdatesThisRun), @GACT@ (WILSON_GAUGEACT | LW_TREE_GAUGEACT), @BETA@, @U0@ (read by LW only),
+  @TAU@, @NSTEPS@. Single-level leapfrog. The final configuration is always written as
+  ./pg_cfg_<last update>.lime; deltaH, AcceptP per update in the -l log, w_plaq in the -o output.
+-->
+<Params>
+  <MCControl>
+    <Cfg>
+      <cfg_type>@CFG_TYPE@</cfg_type>
+      <cfg_file>@CFG_FILE@</cfg_file>
+    </Cfg>
+    <RNG>
+      <Seed>
+        <elem>@SEED@</elem>
+        <elem>17</elem>
+        <elem>23</elem>
+        <elem>31</elem>
+      </Seed>
+    </RNG>
+    <StartUpdateNum>@START@</StartUpdateNum>
+    <NWarmUpUpdates>@NWARMUP@</NWarmUpUpdates>
+    <NProductionUpdates>100000</NProductionUpdates>
+    <NUpdatesThisRun>@NUPDATES@</NUpdatesThisRun>
+    <SaveInterval>1000000</SaveInterval>
+    <SavePrefix>./pg</SavePrefix>
+    <SaveVolfmt>SINGLEFILE</SaveVolfmt>
+    <ParallelIO>false</ParallelIO>
+    <ReproCheckP>false</ReproCheckP>
+    <ReverseCheckP>false</ReverseCheckP>
+    <MonitorForces>false</MonitorForces>
+    <InlineMeasurements>
+      <elem>
+        <Name>PLAQUETTE</Name>
+        <Frequency>1</Frequency>
+        <Param>
+          <version>2</version>
+          <GaugeState>
+            <Name>SIMPLE_GAUGE_STATE</Name>
+            <GaugeBC>
+              <Name>PERIODIC_GAUGEBC</Name>
+            </GaugeBC>
+          </GaugeState>
+        </Param>
+        <NamedObject>
+          <gauge_id>default_gauge_field</gauge_id>
+        </NamedObject>
+      </elem>
+    </InlineMeasurements>
+  </MCControl>
+  <HMCTrj>
+    <nrow>8 8 8 8</nrow>
+    <Monomials>
+      <elem>
+        <Name>GAUGE_MONOMIAL</Name>
+        <GaugeAction>
+          <Name>@GACT@</Name>
+          <beta>@BETA@</beta>
+          <u0>@U0@</u0>
+          <GaugeBC>
+            <Name>PERIODIC_GAUGEBC</Name>
+          </GaugeBC>
+        </GaugeAction>
+        <NamedObject>
+          <monomial_id>gauge</monomial_id>
+        </NamedObject>
+      </elem>
+    </Monomials>
+    <Hamiltonian>
+      <monomial_ids>
+        <elem>gauge</elem>
+      </monomial_ids>
+    </Hamiltonian>
+    <MDIntegrator>
+      <tau0>@TAU@</tau0>
+      <Integrator>
+        <Name>LCM_STS_LEAPFROG</Name>
+        <n_steps>@NSTEPS@</n_steps>
+        <monomial_ids>
+          <elem>gauge</elem>
+        </monomial_ids>
+      </Integrator>
+    </MDIntegrator>
+  </HMCTrj>
+</Params>
