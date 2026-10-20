@@ -111,6 +111,45 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
   arguments are bare filenames; put multi-line content in a file and pass it
   with `-F`/`--body-file`.
 
+## Gauge configurations on HPSS
+
+Updated on 2026-10-20 11:00 CDT · perlmutter
+
+- The NPLQCD clover ensembles (cl21 = 2+1 flavour, cl3 = 3 flavour, 16³ to
+  96³) are on NERSC HPSS tape under `/home/w/wdetmold/clover-iso/`, one
+  directory per stream. HPSS is not mounted: a job cannot read a config there.
+  Pull the few you need onto `$PSCRATCH`; never mirror an ensemble (cl21 48³
+  alone is 33 TB, 6.1 GB per config).
+- **Access needs NERSC project m747.** `clover-iso` is `drwxr-s--- wdetmold
+  m747`; on 2026-10-20 this account (groups `m4599`, `amsc011`) got
+  `HPSS_EACCES`, and m747 membership was being requested. Check with
+  `hsi -q ls -l <path>`, which lists without recalling from tape.
+- **Do not list configs in docs; query the catalog.** Every file has a record
+  (tape path, size, stream, trajectory, full action) in the AmSC MetaCat
+  catalog at FNAL. Reads are anonymous, no token, only the query text leaves
+  NERSC:
+  ```
+  bash grid-lqcd-workflow/common/find_cfgs.sh                                      # all ensembles, one line each
+  bash grid-lqcd-workflow/common/find_cfgs.sh cl21_48_96_b6p3_m0p2416_m0p2050       # its streams + HPSS dirs
+  bash grid-lqcd-workflow/common/find_cfgs.sh cl21_48_96_b6p3_m0p2416_m0p2050 djm-3 2000 2050   # files
+  ```
+  `KIND=hmc_input` lists the Chroma restart XMLs instead. Per-ensemble physics
+  and stream layout: `usqcd_catalog/ensembles/<ensemble>.toml` (upstream clone
+  at the workspace root, ~5 KB each). Its README covers MQL and the REST URLs.
+- Trajectory numbering restarts in every stream, so a config is named by
+  (ensemble, stream, trajectory). Our 48³×96 `data/...-djm-3_cfg_2000.lime` is
+  stream djm-3, trajectory 2000 of `cl21_48_96_b6p3_m0p2416_m0p2050`; its
+  size matches the catalog record byte for byte (6115385552).
+- Some cl3 ensembles (`cl3_16_48`, `cl3_32_48`) store configs inside htar
+  archives, so the catalog shows archive records and the per-config count can
+  read 0. Extract members with `usqcd_catalog/bin/htar_extract.sh`.
+- To pull (once m747 is granted):
+  `hsi -q "get $PSCRATCH/cfgs/<file> : <hpss path>"`. For more than a handful,
+  run on the `xfer` QOS and order the list by tape position
+  (`usqcd_catalog/scripts/hpss_select.py`, `docs/data_movement.md`); random
+  tape recalls are slow and NERSC asks for batching
+  (https://docs.nersc.gov/filesystems/HPSS-best-practices/).
+
 ## Where the rest is
 
 Campaign-grade operating history: `perlmutter-ops` row in `__docs/_TOC.md`,
