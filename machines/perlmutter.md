@@ -113,7 +113,7 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
 
 ## Gauge configurations on HPSS
 
-Updated on 2026-10-20 11:00 CDT · perlmutter
+Updated on 2026-10-22 10:10 CDT · perlmutter
 
 - The NPLQCD clover ensembles (cl21 = 2+1 flavour, cl3 = 3 flavour, 16³ to
   96³) are on NERSC HPSS tape under `/home/w/wdetmold/clover-iso/`, one
@@ -134,19 +134,32 @@ Updated on 2026-10-20 11:00 CDT · perlmutter
   bash grid-lqcd-workflow/common/find_cfgs.sh cl21_48_96_b6p3_m0p2416_m0p2050 djm-3 2000 2050   # files
   ```
   `KIND=hmc_input` lists the Chroma restart XMLs instead. Per-ensemble physics
-  and stream layout: `usqcd_catalog/ensembles/<ensemble>.toml` (upstream clone
-  at the workspace root, ~5 KB each). Its README covers MQL and the REST URLs.
+  and stream layout: `usqcd-catalog/ensembles/<ensemble>.toml` (~5 KB each),
+  in the workspace-root clone of https://github.com/FemtoMind/usqcd-catalog
+  (moved there from `mlwagman/usqcd_catalog`, whose last commit is
+  2026-10-19). Its README covers MQL and the REST URLs.
+- For observables (t0, w0, lattice spacing, a·m_π, a·M_N; registered for the
+  cl3 ensembles only, none for cl21 as of 2026-10-22) and cross-ensemble
+  search (`--beta`, `--kappa`), use the clone's own `retrieve_records.py`. It
+  needs Python ≥ 3.9 and `metacat-client`; run it in a throwaway uv env
+  instead of the README's `pip install --user`:
+  ```
+  env UV_CACHE_DIR=$PSCRATCH/uv/cache UV_PYTHON_INSTALL_DIR=$PSCRATCH/uv/python ~/.local/bin/uv run --no-project --python 3.12 --with 'metacat-client>=4.0' python usqcd-catalog/scripts/retrieve_records.py --observables
+  ```
+  `--summary` gives counts and sizes (binary TB). Each query writes a JSON
+  dump under `usqcd-catalog/work/` (gitignored).
 - Trajectory numbering restarts in every stream, so a config is named by
   (ensemble, stream, trajectory). Our 48³×96 `data/...-djm-3_cfg_2000.lime` is
   stream djm-3, trajectory 2000 of `cl21_48_96_b6p3_m0p2416_m0p2050`; its
   size matches the catalog record byte for byte (6115385552).
 - Some cl3 ensembles (`cl3_16_48`, `cl3_32_48`) store configs inside htar
-  archives, so the catalog shows archive records and the per-config count can
-  read 0. Extract members with `usqcd_catalog/bin/htar_extract.sh`.
+  archives: the catalog's file records are the archives, not single configs.
+  Extract members with `usqcd-catalog/bin/htar_extract.sh`. A config count of
+  0 (`cl3_48_64_*`) means no configs on HPSS at all.
 - To pull (once m747 is granted):
   `hsi -q "get $PSCRATCH/cfgs/<file> : <hpss path>"`. For more than a handful,
   run on the `xfer` QOS and order the list by tape position
-  (`usqcd_catalog/scripts/hpss_select.py`, `docs/data_movement.md`); random
+  (`usqcd-catalog/scripts/hpss_select.py`, `docs/data_movement.md`); random
   tape recalls are slow and NERSC asks for batching
   (https://docs.nersc.gov/filesystems/HPSS-best-practices/).
 
