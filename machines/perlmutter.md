@@ -113,17 +113,21 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
 
 ## Gauge configurations on HPSS
 
-Updated on 2026-10-22 10:10 CDT · perlmutter
+Updated on 2026-10-22 13:23 CDT · perlmutter
 
 - The NPLQCD clover ensembles (cl21 = 2+1 flavour, cl3 = 3 flavour, 16³ to
   96³) are on NERSC HPSS tape under `/home/w/wdetmold/clover-iso/`, one
   directory per stream. HPSS is not mounted: a job cannot read a config there.
   Pull the few you need onto `$PSCRATCH`; never mirror an ensemble (cl21 48³
   alone is 33 TB, 6.1 GB per config).
-- **Access needs NERSC project m747.** `clover-iso` is `drwxr-s--- wdetmold
-  m747`; on 2026-10-20 this account (groups `m4599`, `amsc011`) got
-  `HPSS_EACCES`, and m747 membership was being requested. Check with
-  `hsi -q ls -l <path>`, which lists without recalling from tape.
+- **Access needs NERSC project m747** (`clover-iso` is `drwxr-s--- wdetmold
+  m747`). Granted 2026-10-22; before that every path gave `HPSS_EACCES`.
+  Check with `hsi -q ls -l <path>`, which lists without recalling from tape.
+  `hsi` prints listings on stderr: add `2>&1` before piping to `grep`.
+- Restart XMLs (`KIND=hmc_input`, 88 KB, full Chroma input) come back from
+  `hsi get` in seconds; they are disk-cached. Use them, not the 6 GB config,
+  to read a stream's run settings. Findings and scripts: campaign
+  `data-catalog-48x96` (`_SUM.md`), `grid-lqcd-workflow/common/cfg_catalog/`.
 - **Do not list configs in docs; query the catalog.** Every file has a record
   (tape path, size, stream, trajectory, full action) in the AmSC MetaCat
   catalog at FNAL. Reads are anonymous, no token, only the query text leaves
