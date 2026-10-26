@@ -27,6 +27,12 @@
 #   N_TRAJ              default 1: trajectories in THIS run
 #   HMC_SEED_OFFSET     default 0; fresh start only (a resume restores the RNG state)
 #   RESUME_FROM         run dir of an earlier traj48_puregrid.sh run: restart (section 11)
+#   RESUME_CROSS_PHYS=1 (2026-10-22, diagnostic) let RESUME_FROM be a run with DIFFERENT physics:
+#                       its configuration and RNG state go into this run's action, replaying its
+#                       next trajectory under another ladder. A new chain, never a continuation.
+#   DIAG_START_CFG, DIAG_START_TRAJ  (2026-10-22) a fresh start from another configuration and
+#                       its trajectory number (default cfg_2000 / 2000), with HMC_SEED_OFFSET as
+#                       usual: steps past a solver failure that a resume would replay.
 #   RESUME_TRAJ         default: RESUME_FROM's LAST complete checkpoint. An earlier one
 #                       REPLAYS trajectories that run already made (the replay test)
 #   HASEN_GRID_MG_RUNGS                default "0,1,2"  } rung solver routes, section 8.
@@ -43,8 +49,38 @@
 #   DIAG_TOL_STRANGE, DIAG_MDSTEPS, DIAG_TRAJL  diagnostic overrides (2026-10-02, physics review
 #                       tests T1-T3): strange multishift tolerance, MD steps, trajectory length.
 #                       Unset = production. The ENV line records the values actually used.
+#                       The TRAJL default is 1.0 since 2026-10-15 (was sqrt(2)/4, L192): a chain
+#                       started on the old default no longer matches its PHYS fingerprint; resume
+#                       it with DIAG_TRAJL=0.35355339059327379.
 #   DIAG_RAT_LO, DIAG_RAT_HI, DIAG_RAT_DEGREE  diagnostic overrides of the strange rational
 #                       approximation (2026-10-03, test T4: is the dH floor the [0.4, 35] interval?).
+#   DIAG_GAUGE_INNER_MULT, DIAG_STRANGE_INNER_MULT  (2026-10-12, layout probes) override the
+#                       profile's level multipliers: nested levels run 2 x multiplier x the parent's
+#                       steps, so with MDSTEPS 6 and strange middle, DIAG_STRANGE_INNER_MULT=2 puts
+#                       the middle level at 24 and DIAG_GAUGE_INNER_MULT=1 the inner at 48.
+#   LADDER_PROFILE=custom  (2026-10-12) takes the whole layout from the caller instead of a named
+#                       profile, under CUSTOM_* names (plain HASEN_* are scrubbed in section 4):
+#                       CUSTOM_LADDER, CUSTOM_TAIL_LEVEL (outer|inner|middle) and CUSTOM_MDSTEPS are
+#                       required; CUSTOM_STRANGE_LEVEL=middle, CUSTOM_STRANGE_INNER_MULT and
+#                       CUSTOM_STRANGE_RUNGS (ratio rungs moved to the strange level) optional. The
+#                       solver routes must then be set by the caller for that ladder's rung count.
+#                       Every value is recorded in the ENV line like a named profile's.
+#   CUSTOM_LEVEL_LIGHT, CUSTOM_LEVEL_STRANGE, CUSTOM_LEVEL_TAIL, CUSTOM_LEVEL_GAUGE  (2026-10-13,
+#                       binary _stock_m9 or later, LADDER_PROFILE=custom only) the general level
+#                       assignment: each monomial group on an integrator level 0..3 (0 = outermost,
+#                       runs CUSTOM_MDSTEPS; used levels contiguous from 0), all four required
+#                       once any is given. CUSTOM_LEVEL_MULT_1/2/3 (>= 1, default 1): the nested
+#                       levels' multipliers, level l runs 2 x mult_l x the parent's steps. This
+#                       family REPLACES CUSTOM_TAIL_LEVEL / CUSTOM_STRANGE_LEVEL /
+#                       CUSTOM_STRANGE_INNER_MULT and the DIAG_*_INNER_MULT overrides (giving
+#                       both is refused), and the legacy driver knobs (HASEN_TAIL_LEVEL,
+#                       GAUGE_INNER_MULT, HASEN_STRANGE_*) are then NOT exported: the driver
+#                       refuses a run carrying both families. CUSTOM_STRANGE_RUNGS still routes
+#                       rungs to the strange's level. Recorded as LEVEL_* in the ENV line and as
+#                       an LVL= segment of the PHYS resume fingerprint. The campaign layout
+#                       light+strange 12 / tail 24 / gauge 48 is CUSTOM_LEVEL_LIGHT=0
+#                       CUSTOM_LEVEL_STRANGE=0 CUSTOM_LEVEL_TAIL=1 CUSTOM_LEVEL_GAUGE=2
+#                       CUSTOM_LEVEL_MULT_1=1 CUSTOM_LEVEL_MULT_2=1 with CUSTOM_MDSTEPS=12.
 #
 # Output: runs/<YYYY_M_D>_<RUN>/hmc.log (unpadded date). Line 1 is the ENV provenance
 # line; per the conventions entry of __docs/_SUM.md that line, not this script, is the
@@ -225,6 +261,14 @@ N_QUDA_ENV=$(compgen -e | grep -c '^QUDA_' || true)
 export LATT=48.48.48.96
 START_CFG=$BASE/data/cl21_48_96_b6p3_m0p2416_m0p2050-djm-3_cfg_2000.lime   # ILDG, 6.1 GB
 START_TRAJ=2000                                           # its trajectory number (section 11)
+# DIAG_START_CFG / DIAG_START_TRAJ (2026-10-22): a FRESH start from another configuration, e.g. a
+# chain's ckpoint_lat.<n> with a new HMC_SEED_OFFSET, to continue past a solver failure that a
+# resume (RNG restored) would replay. Both or neither; ignored on a resume.
+if [ -n "${DIAG_START_CFG:-}${DIAG_START_TRAJ:-}" ]; then
+  { [ -n "${DIAG_START_CFG:-}" ] && [[ "${DIAG_START_TRAJ:-}" =~ ^[0-9]+$ ]]; } || die "DIAG_START_CFG and DIAG_START_TRAJ (integer) go together, got '${DIAG_START_CFG:-}' / '${DIAG_START_TRAJ:-}'"
+  START_CFG=$(readlink -f "$DIAG_START_CFG") || die "DIAG_START_CFG does not resolve: $DIAG_START_CFG"
+  START_TRAJ=$DIAG_START_TRAJ
+fi
 export BETA=6.3
 # U0: the driver's LOCAL default is 1.0 and shadows params.h; the wrong U0 was the
 # 48^3 blow-up root cause (__docs/_TOC.md u0-48cube). SOP value:
@@ -257,6 +301,10 @@ fi
 # ladder -0.2416,-0.2400,-0.2320,-0.2180,-0.1870, tail on the inner (gauge) level, MDSTEPS=12,
 # strange level at the driver default; chroma_match_sop_48.sh lines 23-30).
 LADDER_PROFILE=${LADDER_PROFILE:-baseG}
+# 2026-10-13: the CUSTOM_LEVEL_* family (header). Detected here, applied in the custom case.
+LEVEL_FAMILY=no
+[ -z "${CUSTOM_LEVEL_LIGHT:-}${CUSTOM_LEVEL_STRANGE:-}${CUSTOM_LEVEL_TAIL:-}${CUSTOM_LEVEL_GAUGE:-}${CUSTOM_LEVEL_MULT_1:-}${CUSTOM_LEVEL_MULT_2:-}${CUSTOM_LEVEL_MULT_3:-}" ] || LEVEL_FAMILY=yes
+[ "$LEVEL_FAMILY" = no ] || [ "$LADDER_PROFILE" = custom ] || die "CUSTOM_LEVEL_* needs LADDER_PROFILE=custom (a named profile carries its own level layout)"
 case "$LADDER_PROFILE" in
   c3)
     export HASEN_LADDER=-0.2416,-0.2380,-0.2340,-0.2180,-0.1870
@@ -290,13 +338,78 @@ case "$LADDER_PROFILE" in
     export HASEN_TAIL_LEVEL=inner
     export MDSTEPS=5
     ;;
-  *) die "LADDER_PROFILE must be c1, c2, c3 or baseG, got $LADDER_PROFILE" ;;
+  custom)   # 2026-10-12: the whole layout from the caller (header). Validated by the driver.
+    # The caller passes CUSTOM_* names: every HASEN_* except HASEN_GRID_* is scrubbed from the
+    # environment above (section 4 hygiene), so the driver knobs are set only here.
+    # 2026-10-13: two layout families, exactly one per run. LEVEL_FAMILY=yes is the general
+    # level assignment (CUSTOM_LEVEL_* -> driver HASEN_LEVEL_*, binary m9 or later); the legacy
+    # knobs are then never exported, because the driver refuses a run that carries both
+    # families, even at their default values (section 6 skips GAUGE_INNER_MULT for the same
+    # reason). A binary without the knob names would silently run its default layout, so the
+    # family is refused unless the names are in $BIN (the section-8 rule for HASEN_GRID_*).
+    [ -n "${CUSTOM_LADDER:-}" ] || die "LADDER_PROFILE=custom needs CUSTOM_LADDER (masses light->heavy, the last is the tail)"
+    [[ "${CUSTOM_MDSTEPS:-}" =~ ^[1-9][0-9]*$ ]] || die "LADDER_PROFILE=custom needs CUSTOM_MDSTEPS (positive integer), got '${CUSTOM_MDSTEPS:-}'"
+    export HASEN_LADDER=$CUSTOM_LADDER MDSTEPS=$CUSTOM_MDSTEPS
+    if [ "$LEVEL_FAMILY" = yes ]; then
+      [ -z "${CUSTOM_TAIL_LEVEL:-}${CUSTOM_STRANGE_LEVEL:-}${CUSTOM_STRANGE_INNER_MULT:-}" ] || die "CUSTOM_LEVEL_* and CUSTOM_TAIL_LEVEL / CUSTOM_STRANGE_LEVEL / CUSTOM_STRANGE_INNER_MULT are two layout families; give exactly one"
+      [ -z "${DIAG_GAUGE_INNER_MULT:-}${DIAG_STRANGE_INNER_MULT:-}" ] || die "CUSTOM_LEVEL_* carries its own multipliers (CUSTOM_LEVEL_MULT_1/2/3); DIAG_GAUGE_INNER_MULT / DIAG_STRANGE_INNER_MULT are refused with it"
+      [ "$(grep -c -a -F HASEN_LEVEL_LIGHT "$BIN" || true)" -gt 0 ] || die "$BIN does not contain HASEN_LEVEL_LIGHT: a binary older than _stock_m9 would silently ignore CUSTOM_LEVEL_*"
+      for g in LIGHT STRANGE TAIL GAUGE; do
+        v=CUSTOM_LEVEL_$g
+        [[ "${!v:-}" =~ ^[0-3]$ ]] || die "$v must be 0..3 (0 = outermost; all four of CUSTOM_LEVEL_LIGHT/STRANGE/TAIL/GAUGE are required), got '${!v:-}'"
+        export "HASEN_LEVEL_$g=${!v}"
+      done
+      for l in 1 2 3; do
+        v=CUSTOM_LEVEL_MULT_$l
+        [ -z "${!v:-}" ] || [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v must be a positive integer, got '${!v}'"
+        [ -z "${!v:-}" ] || export "HASEN_LEVEL_MULT_$l=${!v}"
+      done
+      unset HASEN_TAIL_LEVEL HASEN_STRANGE_LEVEL HASEN_STRANGE_INNER_MULT
+      [ -z "${CUSTOM_STRANGE_RUNGS:-}" ] || export HASEN_STRANGE_RUNGS=$CUSTOM_STRANGE_RUNGS
+    else
+      [[ "${CUSTOM_TAIL_LEVEL:-}" =~ ^(outer|inner|middle)$ ]] || die "LADDER_PROFILE=custom needs CUSTOM_TAIL_LEVEL=outer|inner|middle (or the CUSTOM_LEVEL_* family, header), got '${CUSTOM_TAIL_LEVEL:-}'"
+      export HASEN_TAIL_LEVEL=$CUSTOM_TAIL_LEVEL
+      if [ -n "${CUSTOM_STRANGE_LEVEL:-}" ]; then
+        [ "$CUSTOM_STRANGE_LEVEL" = middle ] || die "CUSTOM_STRANGE_LEVEL must be 'middle' or unset, got '$CUSTOM_STRANGE_LEVEL'"
+        export HASEN_STRANGE_LEVEL=middle
+        export HASEN_STRANGE_INNER_MULT=${CUSTOM_STRANGE_INNER_MULT:-1}
+        [ -z "${CUSTOM_STRANGE_RUNGS:-}" ] || export HASEN_STRANGE_RUNGS=$CUSTOM_STRANGE_RUNGS
+      else
+        unset HASEN_STRANGE_LEVEL HASEN_STRANGE_INNER_MULT
+        [ -z "${CUSTOM_STRANGE_RUNGS:-}" ] || die "CUSTOM_STRANGE_RUNGS needs CUSTOM_STRANGE_LEVEL=middle"
+      fi
+    fi
+    ;;
+  *) die "LADDER_PROFILE must be c1, c2, c3, baseG or custom, got $LADDER_PROFILE" ;;
 esac
+# HASEN_STRANGE_RUNGS (ratio rungs moved to the strange level, driver 3-level only) is set by
+# the custom profile only (from CUSTOM_STRANGE_RUNGS); a named profile never carries it.
+[ "$LADDER_PROFILE" = custom ] || unset HASEN_STRANGE_RUNGS
 export MDSTEPS=${DIAG_MDSTEPS:-$MDSTEPS}                        # DIAG_MDSTEPS: diagnostic override of the profile (header)
+# Level multipliers (header, 2026-10-12): the strange one only exists in the 3-level layout.
+# With the CUSTOM_LEVEL_* family (2026-10-13) the multipliers are CUSTOM_LEVEL_MULT_* (custom case
+# above) and GAUGE_INNER_MULT is NOT exported: the driver refuses a run with both families. The
+# PHYS fingerprint gets an LVL= segment only in that family, so chains started before 2026-10-13
+# keep their fingerprint and stay resumable.
+if [ -n "${DIAG_STRANGE_INNER_MULT:-}" ]; then
+  [ "${HASEN_STRANGE_LEVEL:-}" = middle ] || die "DIAG_STRANGE_INNER_MULT needs the 3-level layout (HASEN_STRANGE_LEVEL=middle)"
+  [[ "$DIAG_STRANGE_INNER_MULT" =~ ^[1-4]$ ]] || die "DIAG_STRANGE_INNER_MULT must be 1..4, got '$DIAG_STRANGE_INNER_MULT'"
+  export HASEN_STRANGE_INNER_MULT=$DIAG_STRANGE_INNER_MULT
+fi
 export INTEGRATOR=ForceGradient                           # SOP section B
-export GAUGE_INNER_MULT=2                                 # SOP section B
+if [ "$LEVEL_FAMILY" = yes ]; then
+  unset GAUGE_INNER_MULT
+  LEVEL_MULT_TAG=${HASEN_LEVEL_MULT_1:-1},${HASEN_LEVEL_MULT_2:-1},${HASEN_LEVEL_MULT_3:-1}
+  LEVEL_PHYS=:LVL=$HASEN_LEVEL_LIGHT/$HASEN_LEVEL_STRANGE/$HASEN_LEVEL_TAIL/$HASEN_LEVEL_GAUGE/$LEVEL_MULT_TAG
+else
+  GAUGE_INNER_MULT=${DIAG_GAUGE_INNER_MULT:-2}              # SOP section B is 2; DIAG_GAUGE_INNER_MULT: override (header)
+  [[ "$GAUGE_INNER_MULT" =~ ^[1-4]$ ]] || die "DIAG_GAUGE_INNER_MULT must be 1..4, got '$GAUGE_INNER_MULT'"
+  export GAUGE_INNER_MULT
+  LEVEL_MULT_TAG=none
+  LEVEL_PHYS=
+fi
 # TRAJL is MANDATORY: the driver exits "FATAL: TRAJL is not set" before the config load.
-export TRAJL=${DIAG_TRAJL:-0.35355339059327379}       # sqrt(2)/4, SOP section B. DIAG_TRAJL: diagnostic override (header)
+export TRAJL=${DIAG_TRAJL:-1.0}                       # 2026-10-15: Chroma-matched length (L192), was sqrt(2)/4 (SOP section B). DIAG_TRAJL: override (header)
 
 # ---- 7. Trajectories, seed, tolerances --------------------------------------------
 export N_TRAJ
@@ -329,10 +442,14 @@ export TUNE_CG_TOL_STRANGE=${DIAG_TOL_STRANGE:-1e-9}   # DIAG_TOL_STRANGE: diagn
 # EMPTY to run without that route. Every other HASEN_GRID_* the caller set passes through
 # under the same check (a typo'd name is refused), and is recorded in the ENV line.
 ROUTE_KNOBS=(HASEN_GRID_MG_RUNGS HASEN_GRID_MG_HEATBATH_RUNGS HASEN_GRID_MIXED_CG_RUNGS HASEN_GRID_MIXED_CG_HEATBATH_RUNGS)
+# Ratio rungs of the ladder: N masses -> rungs 0..N-2 (the last mass is the tail); a route may
+# only name those (2026-10-12: was hard-wired to 0..3, the four-rung ladders).
+NRUNG=$(( $(printf '%s\n' "$HASEN_LADDER" | tr ',' '\n' | wc -l) - 1 ))
+RUNG_RE="^[0-$((NRUNG - 1))](,[0-$((NRUNG - 1))])*$"
 for v in "${ROUTE_KNOBS[@]}"; do
   val=${!v:-}
   if [ -n "$val" ]; then
-    [[ "$val" =~ ^[0-3](,[0-3])*$ ]] || die "$v must list ratio rungs 0..3 of the C3 ladder (PF0..PF3), got '$val'"
+    [[ "$val" =~ $RUNG_RE ]] || die "$v must list ratio rungs 0..$((NRUNG - 1)) of this ladder (PF0..PF$((NRUNG - 1))), got '$val'"
     N_STR=$(grep -c -a -F "$v" "$BIN" || true)
     [ "$N_STR" -gt 0 ] || die "$BIN has no $v support: it would silently run Grid CG on rung(s) $val. Use a binary built with it, or set $v= (empty)."
     export "$v"
@@ -394,8 +511,14 @@ export OMP_NUM_THREADS=8                                  # run_probe_grid_mg.sh
 MPI_GEOM=1.2.2.4
 NODES=4
 NTASKS=16
-# --device-mem 8000: what the 48^3 MG needed; 12000 OOMs (L119, L167). The 48^3
-# FORCES_ONLY probe peaked at 25.5-26.3 GB per 40 GB GPU with it (build plan s.6).
+# --device-mem caps Grid's device lattice cache; fields beyond it are evicted to host, so a
+# too-small cap costs time and a too-large one OOMs. 8000 is the SAFE default for any ladder,
+# not a measured need (the old "12000 OOMs", L167, was a gq-mg probe with NBASIS 32). Measured
+# 2026-10-07, base+G 48^3 TRAJL 1.0 on 40 GB: the cache fills, peak ~ peak(8000) + (cap - 8000);
+# 8000 -> 30.6 GB peak and ~5.8 TB host<->device per GPU per trajectory; 16000 -> 37.8 GB, MD
+# wall -8%, dH bit-exact; 20000 OOMs. Tune DEVICE_MEM_MB only for a chosen setup's final runs,
+# from its own peak at 8000 (gpu_mem_peak.txt), keeping >= 5 GB free (__docs/_SUM.md
+# hasen-tune-trajl1).
 GRID_ARGS=(--grid "$LATT" --mpi "$MPI_GEOM" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB")
 
 # ---- 10. Device-memory reporting ------------------------------------------------------
@@ -454,7 +577,7 @@ RNG_MIN=$(( 104 * (V + 1) ))      # RNG_SITMO (stock Config.h): 13 x uint64 per 
                                   # (Lattice_rng.h RngStateCount) + the serial RNG. The
                                   # hybrid chain's ckpoint_rng files are >= exactly this.
 # Physics fingerprint: a resume must continue the same action and integrator.
-PHYS="$LATT:$HASEN_LADDER:$MASS_LIGHT:$MASS_STRANGE:$CSW:$BETA:$U0:$STOUT_RHO/$STOUT_NSMEAR:$RAT_LO/$RAT_HI/$RAT_DEGREE:$INTEGRATOR:$MDSTEPS:$GAUGE_INNER_MULT:$TRAJL:${HASEN_STRANGE_LEVEL:-default}/${HASEN_STRANGE_INNER_MULT:-default}/$HASEN_TAIL_LEVEL:$TUNE_CG_TOL_DERIV/$TUNE_CG_TOL_ACTION/$TUNE_CG_TOL_STRANGE${RAT_DEGREE_MD:+:RATMD=$RAT_DEGREE_MD}${TUNE_CG_TOL_STRANGE_MD:+:TOLMD=$TUNE_CG_TOL_STRANGE_MD}"
+PHYS="$LATT:$HASEN_LADDER:$MASS_LIGHT:$MASS_STRANGE:$CSW:$BETA:$U0:$STOUT_RHO/$STOUT_NSMEAR:$RAT_LO/$RAT_HI/$RAT_DEGREE:$INTEGRATOR:$MDSTEPS:${GAUGE_INNER_MULT:-none}:$TRAJL:${HASEN_STRANGE_LEVEL:-default}/${HASEN_STRANGE_INNER_MULT:-default}/${HASEN_TAIL_LEVEL:-none}:$TUNE_CG_TOL_DERIV/$TUNE_CG_TOL_ACTION/$TUNE_CG_TOL_STRANGE${RAT_DEGREE_MD:+:RATMD=$RAT_DEGREE_MD}${TUNE_CG_TOL_STRANGE_MD:+:TOLMD=$TUNE_CG_TOL_STRANGE_MD}$LEVEL_PHYS"
 
 PREV= PREV_LOG= PREV_ENV= PREV_LAT= PREV_RNG= PREV_RNG_CSUM= PREV_PLAQ= RESUME_N=
 prev_field() { printf '%s\n' "$PREV_ENV" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
@@ -468,6 +591,7 @@ if [ -z "$RESUME_FROM" ]; then
   SEED_TAG=$HMC_SEED_OFFSET
   START_TAG=$(basename "$START_CFG")
   IMPORT_TAG=$START_TAG
+  [ -z "${DIAG_START_CFG:-}" ] || IMPORT_TAG=$START_CFG   # full path: a ckpoint_lat.<n> name alone does not say which chain
   CHAIN=${DATE_TAG}_${RUN}
   SEGMENT=1
 else
@@ -483,7 +607,14 @@ else
     *) die "$PREV is not a traj48_puregrid.sh run (line 1 of its hmc.log is not 'ENV TRAJ48_PUREGRID ...')" ;;
   esac
   PREV_PHYS=$(prev_field PHYS)
-  [ "$PREV_PHYS" = "$PHYS" ] || die "physics of $PREV differs from this launcher's; a resume must continue the same action and integrator. Theirs: '$PREV_PHYS'. Ours: '$PHYS'. Start a new chain instead."
+  # RESUME_CROSS_PHYS=1 (2026-10-22, diagnostic): take another chain's configuration AND RNG state
+  # into a different action, to replay that chain's next trajectory under it (e.g. the baseline
+  # ladder on B2's 2008 state). Starts a new chain; the ENV line keeps both PHYS and RESUME_FROM.
+  if [ "${RESUME_CROSS_PHYS:-0}" = 1 ]; then
+    [ "$PREV_PHYS" = "$PHYS" ] || warn "RESUME_CROSS_PHYS=1: physics differs from $PREV (theirs '$PREV_PHYS'); a diagnostic replay, not a continuation of that chain"
+  else
+    [ "$PREV_PHYS" = "$PHYS" ] || die "physics of $PREV differs from this launcher's; a resume must continue the same action and integrator. Theirs: '$PREV_PHYS'. Ours: '$PHYS'. Start a new chain instead (or RESUME_CROSS_PHYS=1 for a diagnostic replay, header)."
+  fi
   grep -q -a -E '^exit=' "$PREV_LOG" || warn "$PREV_LOG has no exit= line: that run may still be running (its launcher appends exit= when srun returns)"
   PREV_CKPT=$(readlink -f "$PREV/ckpt" || true)
   { [ -n "$PREV_CKPT" ] && [ -d "$PREV_CKPT" ]; } || die "checkpoint directory of $PREV is missing ($PREV/ckpt -> '${PREV_CKPT:-?}'); purged from \$PSCRATCH? see $PREV/CKPT_LOCATION.txt"
@@ -521,11 +652,16 @@ else
   SEED_TAG=restored
   START_TAG=ckpt:$RESUME_N
   IMPORT_TAG=none
-  CHAIN=$(prev_field CHAIN)
-  CHAIN=${CHAIN:-$(basename "$PREV")}
-  PREV_SEG=$(prev_field SEGMENT)
-  [[ "$PREV_SEG" =~ ^[0-9]+$ ]] || PREV_SEG=1
-  SEGMENT=$(( PREV_SEG + 1 ))
+  if [ "${RESUME_CROSS_PHYS:-0}" = 1 ]; then
+    CHAIN=${DATE_TAG}_${RUN}
+    SEGMENT=1
+  else
+    CHAIN=$(prev_field CHAIN)
+    CHAIN=${CHAIN:-$(basename "$PREV")}
+    PREV_SEG=$(prev_field SEGMENT)
+    [[ "$PREV_SEG" =~ ^[0-9]+$ ]] || PREV_SEG=1
+    SEGMENT=$(( PREV_SEG + 1 ))
+  fi
 fi
 
 # ---- 12. Run directory + checkpoint directory (refuse to overwrite) ----------------------
@@ -657,7 +793,10 @@ ENV_KV=(
   "CKPT_DIR=$CKPT_DIR" "CKPT_FS=$CKPT_FS" "CKPT_INTERVAL=$CKPT_INTERVAL" "SMEARED_CKPT=no"
   "LATT=$LATT" "MPI=$MPI_GEOM" "NODES=$NODES" "NTASKS=$NTASKS"
   "LADDER=$HASEN_LADDER" "STRANGE_LEVEL=${HASEN_STRANGE_LEVEL:-default}" "STRANGE_INNER_MULT=${HASEN_STRANGE_INNER_MULT:-default}"
-  "TAIL_LEVEL=$HASEN_TAIL_LEVEL" "INTEGRATOR=$INTEGRATOR" "MDSTEPS=$MDSTEPS" "GAUGE_INNER_MULT=$GAUGE_INNER_MULT"
+  "TAIL_LEVEL=${HASEN_TAIL_LEVEL:-none}" "STRANGE_RUNGS=${HASEN_STRANGE_RUNGS:-none}" "LADDER_PROFILE=$LADDER_PROFILE"
+  "INTEGRATOR=$INTEGRATOR" "MDSTEPS=$MDSTEPS" "GAUGE_INNER_MULT=${GAUGE_INNER_MULT:-none}"
+  "LEVEL_LIGHT=${HASEN_LEVEL_LIGHT:-none}" "LEVEL_STRANGE=${HASEN_LEVEL_STRANGE:-none}" "LEVEL_TAIL=${HASEN_LEVEL_TAIL:-none}"
+  "LEVEL_GAUGE=${HASEN_LEVEL_GAUGE:-none}" "LEVEL_MULT=$LEVEL_MULT_TAG"
   "TRAJL=$TRAJL" "MASS_LIGHT=$MASS_LIGHT" "MASS_STRANGE=$MASS_STRANGE" "CSW=$CSW" "BETA=$BETA" "U0=$U0"
   "STOUT_RHO=$STOUT_RHO" "STOUT_NSMEAR=$STOUT_NSMEAR" "RAT=$RAT_LO/$RAT_HI/$RAT_DEGREE"
   "RAT_DEGREE_MD=${RAT_DEGREE_MD:-$RAT_DEGREE}" "TOL_STRANGE_MD=${TUNE_CG_TOL_STRANGE_MD:-$TUNE_CG_TOL_STRANGE}" "RAT_BOUNDS_CHECK=$RAT_BC_TAG"
@@ -692,7 +831,7 @@ printf 'exit=%s\n' "$rc" >> "$LOG"
 echo "==== $RUN: exit=$rc  log: $LOG"
 [ "$rc" -eq 124 ] && echo "exit 124 = TIMEOUT_MIN ($TIMEOUT_MIN min) reached: the trajectory in flight is lost, completed ones are checkpointed"
 grep -a -E '^ENV ' "$LOG"
-grep -a -E 'Current Grid git commit hash|CG tol:|Hasenbusch chain|\[Ladder\]|N_TRAJ=|INTEGRATOR=|NoMetropolisUntil=|\[HMC parameters\] (Trajectories|Start trajectory|Metropolis test)|HMC_SEED_OFFSET=|IMPORT_CFG=|\[Ckpt\]|Initial plaquette' "$LOG" | grep -a -v -E '^(ENV|CMD) '
+grep -a -E 'Current Grid git commit hash|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|N_TRAJ=|INTEGRATOR=|NoMetropolisUntil=|\[HMC parameters\] (Trajectories|Start trajectory|Metropolis test)|HMC_SEED_OFFSET=|IMPORT_CFG=|\[Ckpt\]|Initial plaquette' "$LOG" | grep -a -v -E '^(ENV|CMD) '
 if [ "$MODE" = resume ]; then
   echo "---- checkpoint read-back (reader asserts SciDAC checksum + plaquette/link trace) ----"
   grep -a -E 'RNG read I/O on file|RNG file (nersc_checksum|scidac_checksum)|FieldNormMetaData|SciDAC checksums|Plaquette and link trace match|Read ILDG Configuration from' "$LOG"

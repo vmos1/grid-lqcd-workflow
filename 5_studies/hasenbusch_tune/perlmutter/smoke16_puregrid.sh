@@ -44,6 +44,20 @@
 # GPU sum reduction changed between the fork's April base and 3d3eff86; build
 # plan section 5), so agreement is to roundoff, not bitwise.
 #
+# Layout overrides (2026-10-13, for the integrator-level gates of binary m9; unset =
+# the frozen recipe below, byte-identical to before). Read in section 1, BEFORE the
+# section-3 scrub, applied in section 5; same names and rules as the custom profile
+# of traj48_puregrid.sh (its header):
+#   legacy family: CUSTOM_STRANGE_LEVEL=middle, CUSTOM_STRANGE_INNER_MULT,
+#                  CUSTOM_TAIL_LEVEL (outer|inner|middle), CUSTOM_STRANGE_RUNGS,
+#                  DIAG_GAUGE_INNER_MULT (1..4)
+#   level family:  CUSTOM_LEVEL_LIGHT/STRANGE/TAIL/GAUGE (0..3, all four required),
+#                  CUSTOM_LEVEL_MULT_1/2/3 (>= 1, default 1), CUSTOM_STRANGE_RUNGS;
+#                  the legacy driver knobs are then NOT exported (the driver refuses
+#                  both families) and $BIN must contain the HASEN_LEVEL_* names.
+# Exactly one family per run. The ENV line records the resolved knobs (STRANGE_LEVEL,
+# STRANGE_INNER_MULT, STRANGE_RUNGS, LEVEL_* fields appended at its end).
+#
 # Estimated wall time: the identical physics on the QUDA hybrid took 130 s for
 # trajectory 1 on 4 GPUs (runs/2026_7_11_three_level_recheck_tol11_16/case_qf2.log);
 # pure Grid CG is expected to be several times slower. Timeout is 60 min.
@@ -64,6 +78,16 @@ USAGE="usage: SLURM_JOB_ID=<id> BIN=<binary> RUN=<name> bash $0"
 [[ "$RUN" =~ ^[A-Za-z0-9._-]+$ ]] || die "RUN may contain only letters, digits, '.', '_' and '-', got '$RUN'"
 { [ -f "$BIN" ] && [ -x "$BIN" ]; } || die "BIN is not an executable file: $BIN"
 BIN=$(readlink -f "$BIN")
+# Layout overrides (header): read here, before the section-3 scrub, applied in section 5.
+L_STRANGE_LEVEL=${CUSTOM_STRANGE_LEVEL:-} L_STRANGE_MULT=${CUSTOM_STRANGE_INNER_MULT:-} L_TAIL_LEVEL=${CUSTOM_TAIL_LEVEL:-}
+L_STRANGE_RUNGS=${CUSTOM_STRANGE_RUNGS:-} L_GAUGE_MULT=${DIAG_GAUGE_INNER_MULT:-}
+L_LIGHT=${CUSTOM_LEVEL_LIGHT:-} L_STRANGE=${CUSTOM_LEVEL_STRANGE:-} L_TAIL=${CUSTOM_LEVEL_TAIL:-} L_GAUGE=${CUSTOM_LEVEL_GAUGE:-}
+L_MULT1=${CUSTOM_LEVEL_MULT_1:-} L_MULT2=${CUSTOM_LEVEL_MULT_2:-} L_MULT3=${CUSTOM_LEVEL_MULT_3:-}
+LEVEL_FAMILY=no
+[ -z "$L_LIGHT$L_STRANGE$L_TAIL$L_GAUGE$L_MULT1$L_MULT2$L_MULT3" ] || LEVEL_FAMILY=yes
+LEGACY_FAMILY=no
+[ -z "$L_STRANGE_LEVEL$L_STRANGE_MULT$L_TAIL_LEVEL$L_GAUGE_MULT" ] || LEGACY_FAMILY=yes
+[ "$LEVEL_FAMILY" = no ] || [ "$LEGACY_FAMILY" = no ] || die "CUSTOM_LEVEL_* and CUSTOM_STRANGE_LEVEL / CUSTOM_STRANGE_INNER_MULT / CUSTOM_TAIL_LEVEL / DIAG_GAUGE_INNER_MULT are two layout families; give exactly one"
 
 # The allocation must already exist; this script only attaches srun steps to it.
 # (squeue is read-only.)
@@ -163,10 +187,43 @@ export RAT_LO=1e-4 RAT_HI=100 RAT_DEGREE=20
 # (PF0, PF1) + tail at -0.10, so the carried TwoFlavourSchurCloverRatioAction
 # header is exercised too.
 export HASEN_LADDER=-0.245,-0.20,-0.10
-export HASEN_TAIL_LEVEL=outer                             # driver default; 16^3 recipe leaves it unset
-# 2-level integrator (fermions / gauge). HASEN_STRANGE_LEVEL stays unset (cleared above).
 export INTEGRATOR=ForceGradient                           # chroma_match_sop_48.sh + 16^3 A/B recipe
-export GAUGE_INNER_MULT=2                                 # driver default = chroma_match_sop_48.sh
+# Level layout. With no override (the recipe): HASEN_TAIL_LEVEL=outer (driver default; the
+# 16^3 recipe leaves it unset), 2-level integrator (fermions / gauge) with HASEN_STRANGE_LEVEL
+# unset (cleared above), GAUGE_INNER_MULT=2 (driver default = chroma_match_sop_48.sh). The
+# header's overrides change only what they name; with the level family nothing legacy is
+# exported, because the driver refuses a run that carries both families.
+LEVEL_MULT_TAG=none
+if [ "$LEVEL_FAMILY" = yes ]; then
+  unset GAUGE_INNER_MULT                                  # not scrubbed in section 3; a caller's value would trip the driver's both-families check
+  [ "$(grep -c -a -F HASEN_LEVEL_LIGHT "$BIN" || true)" -gt 0 ] || die "$BIN does not contain HASEN_LEVEL_LIGHT: a binary older than _stock_m9 would silently ignore CUSTOM_LEVEL_*"
+  for g in LIGHT STRANGE TAIL GAUGE; do
+    v=L_$g
+    [[ "${!v}" =~ ^[0-3]$ ]] || die "CUSTOM_LEVEL_$g must be 0..3 (all four of CUSTOM_LEVEL_LIGHT/STRANGE/TAIL/GAUGE are required), got '${!v}'"
+    export "HASEN_LEVEL_$g=${!v}"
+  done
+  for l in 1 2 3; do
+    v=L_MULT$l
+    [ -z "${!v}" ] || [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "CUSTOM_LEVEL_MULT_$l must be a positive integer, got '${!v}'"
+    [ -z "${!v}" ] || export "HASEN_LEVEL_MULT_$l=${!v}"
+  done
+  LEVEL_MULT_TAG=${L_MULT1:-1},${L_MULT2:-1},${L_MULT3:-1}
+else
+  export HASEN_TAIL_LEVEL=${L_TAIL_LEVEL:-outer}
+  [[ "$HASEN_TAIL_LEVEL" =~ ^(outer|inner|middle)$ ]] || die "CUSTOM_TAIL_LEVEL must be outer|inner|middle, got '$HASEN_TAIL_LEVEL'"
+  if [ -n "$L_STRANGE_LEVEL" ]; then
+    [ "$L_STRANGE_LEVEL" = middle ] || die "CUSTOM_STRANGE_LEVEL must be 'middle' or unset, got '$L_STRANGE_LEVEL'"
+    export HASEN_STRANGE_LEVEL=middle
+    export HASEN_STRANGE_INNER_MULT=${L_STRANGE_MULT:-1}
+    [[ "$HASEN_STRANGE_INNER_MULT" =~ ^[1-9][0-9]*$ ]] || die "CUSTOM_STRANGE_INNER_MULT must be a positive integer, got '$HASEN_STRANGE_INNER_MULT'"
+  else
+    [ -z "$L_STRANGE_MULT" ] || die "CUSTOM_STRANGE_INNER_MULT needs CUSTOM_STRANGE_LEVEL=middle"
+    [ -z "$L_STRANGE_RUNGS" ] || die "CUSTOM_STRANGE_RUNGS needs CUSTOM_STRANGE_LEVEL=middle or the CUSTOM_LEVEL_* family"
+  fi
+  export GAUGE_INNER_MULT=${L_GAUGE_MULT:-2}
+  [[ "$GAUGE_INNER_MULT" =~ ^[1-4]$ ]] || die "DIAG_GAUGE_INNER_MULT must be 1..4, got '$GAUGE_INNER_MULT'"
+fi
+[ -z "$L_STRANGE_RUNGS" ] || export HASEN_STRANGE_RUNGS=$L_STRANGE_RUNGS
 # TRAJL is MANDATORY: the driver exits "FATAL: TRAJL is not set" before the
 # config load. sqrt(2)/4, the benchmark value (driver FATAL message; SOP):
 export TRAJL=0.35355339059327379
@@ -266,17 +323,18 @@ GRID_SHA=${GRID_HASH_LINE:0:40}
 GRID_SHA=${GRID_SHA:-unknown}
 case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
 
-printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" GRID_FLAGS="%s"\n' \
+printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" GRID_FLAGS="%s" STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s STRANGE_RUNGS=%s LEVEL_LIGHT=%s LEVEL_STRANGE=%s LEVEL_TAIL=%s LEVEL_GAUGE=%s LEVEL_MULT=%s\n' \
   "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
   "$LATT" "$MPI_GEOM" "$NTASKS" "$(basename "$IMPORT_CFG")" "$HMC_SEED_OFFSET" "$N_TRAJ" \
-  "$MDSTEPS" "$TRAJL" "$INTEGRATOR" "$GAUGE_INNER_MULT" "$HASEN_LADDER" "$HASEN_TAIL_LEVEL" \
+  "$MDSTEPS" "$TRAJL" "$INTEGRATOR" "${GAUGE_INNER_MULT:-none}" "$HASEN_LADDER" "${HASEN_TAIL_LEVEL:-none}" \
   "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \
   "$RAT_LO" "$RAT_HI" "$RAT_DEGREE" "$TUNE_CG_TOL_DERIV" "$TUNE_CG_TOL_ACTION" \
   "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" "$MPICH_GPU_IPC_ENABLED" "$MPICH_RDMA_ENABLED_CUDA" \
   "${HASEN_GRID_MG_RUNGS:-none}" "${HASEN_GRID_MG_HEATBATH_RUNGS:-none}" \
   "${HASEN_GRID_MIXED_CG_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" \
   "$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_|STRANGE_EVEN$)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
-  "${GRID_ARGS[*]}" > "$LOG"
+  "${GRID_ARGS[*]}" "${HASEN_STRANGE_LEVEL:-default}" "${HASEN_STRANGE_INNER_MULT:-default}" "${HASEN_STRANGE_RUNGS:-none}" \
+  "${HASEN_LEVEL_LIGHT:-none}" "${HASEN_LEVEL_STRANGE:-none}" "${HASEN_LEVEL_TAIL:-none}" "${HASEN_LEVEL_GAUGE:-none}" "$LEVEL_MULT_TAG" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"
   printf 'BIN_PATH %s\n' "$BIN"
@@ -301,7 +359,7 @@ printf 'exit=%s\n' "$rc" >> "$LOG"
 # FORCES traj=1 is the per-monomial average over the whole trajectory.
 echo "==== $RUN: exit=$rc  log: $LOG"
 grep -a -E '^ENV ' "$LOG"
-grep -a -E 'Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain' "$LOG"
+grep -a -E 'Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|Integrator: ' "$LOG"
 grep -a -E '\[0\]\[[0-9]+\] Force average' "$LOG" | head -6
 grep -a -E 'Total H before trajectory|Total H after trajectory|exp\(-dH\)|Metropolis_test|Total time for trajectory|Plaquette: \[|FORCES traj=' "$LOG"
 echo "log: $LOG"

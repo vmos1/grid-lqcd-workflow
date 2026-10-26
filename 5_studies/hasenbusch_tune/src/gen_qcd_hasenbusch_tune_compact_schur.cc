@@ -1452,95 +1452,192 @@ int main(int argc, char **argv) {
             << " MASS_STRANGE=" << mass_strange
             << std::setprecision(6) << std::endl;
 
-  // ── Integrator: 2-level fermions / gauge, matching Chroma ────────────────
-  // ALL fermion monomials (strange RHMC + both logdets + light ladder + tail)
-  // share the top level -- Chroma's production grouping (rat_strange + has0-3
-  // + logdets at n_steps; only cancel+gauge finer).  In Grid's nested scheme
-  // a child level always runs 2 x multiplier x its parent's steps (each
-  // parent step recurses into the child once per drift slot -- same
-  // convention as Chroma's lcm_sts_*_recursive), so
-  //   gauge steps/traj = MDSTEPS x 2 x GAUGE_INNER_MULT.
-  //   GAUGE_INNER_MULT=2 (default) at MDSTEPS=12 reproduces Chroma's
-  //   12x2x2=48-step inner level exactly.
-  // The earlier 3-level strange/light/gauge layout was dropped 2026-07-06:
-  // it silently ran the light ladder 2x finer than strange (the recursion
-  // factor -- no multiplier setting avoids it), i.e. 2x the light-sector
-  // force solves for nothing Chroma needs.  Re-add later, if profiling ever
-  // justifies it, by giving the light actions their own ActionLevel again.
-  // See __docs/2026_7_6_integrator_step_accounting_summary.md.
+  // ── Integrator levels: general assignment of the four monomial groups ────
+  // Four groups -- light (ratio rungs + both log-dets), strange (RHMC), tail
+  // (bare det D(m_tail)), gauge -- each on one of up to four nested levels.
+  // In Grid's nested scheme a child level always runs 2 x multiplier x its
+  // parent's steps (each parent step recurses into the child once per drift
+  // slot -- same convention as Chroma's lcm_sts_*_recursive), so with level 0
+  // at MDSTEPS, level l runs n_l = 2 x mult_l x n_{l-1} steps per trajectory.
+  // Level 0's multiplier is pinned to 1: Grid divides the step size by EVERY
+  // level's multiplier, level 0 included, and this driver has always built the
+  // root with 1 so that MDSTEPS in the log means what it says.
   //
-  // Correctness: each action term is in exactly one level; the Metropolis
-  // test keeps the sampled distribution exact for any multipliers -- only
-  // acceptance/efficiency changes.
-  int gauge_mult = 2;
-  if (const char *gm = std::getenv("GAUGE_INNER_MULT"); gm && *gm) gauge_mult = std::atoi(gm);
-
-  // HASEN_STRANGE_LEVEL=middle switches the 2-level (all-fermions / gauge)
-  // layout to a 3-level light / strange / gauge+tail integrator, giving the
-  // strange RHMC its own middle timescale so the over-resolved light ladder can
-  // take a coarser outer step.  Default unset = the verbatim 2-level path; the
-  // 3-level ActionLevels are never instantiated unless requested.  CRITICAL --
-  // level ORDER: Grid runs every child level at 2*mult*parent_steps, so the
-  // coarsest (root) level takes the fewest steps.  The light ladder is the
-  // expensive sector, so it MUST be the root; strange (its child) then inherits
-  // the intrinsic 2x refinement its larger force wants.  The 2026-07-06 3-level
-  // was dropped for the OPPOSITE order (strange/light/gauge), which ran the
-  // light 2x too fine.  See __docs/2026_7_11_three_level_integrator_plan.md.
-  const char *strange_level_env = std::getenv("HASEN_STRANGE_LEVEL");
-  const bool three_level = (strange_level_env && std::string(strange_level_env) == "middle");
-  int strange_mult = 1;
-  if (const char *sm = std::getenv("HASEN_STRANGE_INNER_MULT"); sm && *sm) strange_mult = std::atoi(sm);
-
-  typedef Representations<EmptyRep<LatticeGaugeField>> Reps;
-  ActionSet<LatticeGaugeField, Reps> Aset;
-  // Grid's ActionLevel holds `actions` as a REFERENCE into its own actions_hirep;
-  // the copy that Aset.push_back() stores keeps that reference bound to THIS
-  // object.  So every ActionLevel pushed into Aset must outlive the Integrator
-  // ctor (built ~line 1105) -- declare them here at function scope, NOT inside
-  // the branch below (in-branch scoping dangles the reference and segfaults at
-  // the ctor's action-summary print).  Only the levels the chosen layout pushes
-  // into Aset are populated; the others stay empty and unused.
-  ActionLevel<LatticeGaugeField, Reps> Lferm(1);               // 2-level: all fermions
-  ActionLevel<LatticeGaugeField, Reps> Llight(1);              // 3-level: light rungs + logdets
-  ActionLevel<LatticeGaugeField, Reps> Lstrange(strange_mult); // 3-level: strange RHMC
-  ActionLevel<LatticeGaugeField, Reps> Lgauge(gauge_mult);     // finest: gauge (+ tail if inner)
-
-  // HASEN_TAIL_LEVEL=inner puts the bare-det tail on the fine gauge level —
-  // Chroma's actual has_cancel_2flav placement (the cfg_2000 XML integrates it
-  // in the inner n_steps=2 sub-integrator WITH lw_tree_gauge); default/outer =
-  // the historical placement with the ladder rungs.  HASEN_TAIL_LEVEL=middle
-  // (3-level only) puts it on strange's level instead -- a 4x cut in tail
-  // evaluations vs inner (STRANGE_INNER_MULT-scaled cadence instead of
-  // gauge's), the lever the x5a-family mass-split campaign was built to
-  // unlock.  Level membership only changes the integrator (discretization)
-  // error, not the sampled distribution: Metropolis stays exact either way
-  // (see Correctness above).
-  const char *tail_level_env = std::getenv("HASEN_TAIL_LEVEL");
-  std::string tail_level = (tail_level_env && *tail_level_env) ? tail_level_env : "outer";
-  if (tail_level != "outer" && tail_level != "inner" && tail_level != "middle") {
-    std::cerr << "HASEN_TAIL_LEVEL must be 'outer', 'inner', or 'middle', got '"
-              << tail_level << "'\n";
+  // Two knob families, exactly one per run.  Both present = exit(1), even when
+  // the legacy one only carries its default value: a knob silently ignored at
+  // its default is how a log stops being the ground truth of what ran.
+  //   new (2026-10-13): HASEN_LEVEL_LIGHT / _STRANGE / _TAIL / _GAUGE in 0..3
+  //           (0 = root, fewest steps; all four required once any is set),
+  //           HASEN_LEVEL_MULT_1/2/3 >= 1 (default 1; one given for an unused
+  //           level is an error, never ignored); used levels contiguous from 0.
+  //   legacy: GAUGE_INNER_MULT (default 2), HASEN_STRANGE_LEVEL (middle = the
+  //           3-level light / strange / gauge layout; unset = 2-level),
+  //           HASEN_STRANGE_INNER_MULT (default 1), HASEN_TAIL_LEVEL
+  //           (outer|inner|middle, default outer).  They map onto the new
+  //           family exactly as the two hand-written layouts they replace:
+  //             2-level: light 0, strange 0, tail 0 (outer) / 1 (inner),
+  //                      gauge 1, mult_1 = GAUGE_INNER_MULT
+  //             3-level: light 0, strange 1, tail 0 / 1 / 2 (outer / middle /
+  //                      inner), gauge 2, mult_1 = HASEN_STRANGE_INNER_MULT,
+  //                      mult_2 = GAUGE_INNER_MULT
+  //           so a run with no knobs at all is bit-identical to the old binary.
+  //   HASEN_STRANGE_RUNGS=<csv> (0-based k of "PF<k>") routes the listed ratio
+  //           rungs to the strange's level, whatever it is -- for a rung whose
+  //           force needs the strange's finer dt but whose solve is cheap enough
+  //           that the extra evaluations are worth paying.  Orthogonal to SOLVER
+  //           routing (HASEN_GRID_MG_RUNGS etc.): it only picks which INTEGRATOR
+  //           level a rung's already-built solver gets evaluated at.  Error when
+  //           strange shares the light's level: the routing would be a no-op
+  //           silently accepted (the routed term would not be dropped -- it is
+  //           pushed either way -- but the knob would not do what it says).
+  //
+  // TRAP -- push order within a level is physics-visible: Integrator::refresh
+  // draws the pseudofermion noise from ONE shared pRNG stream in level/action
+  // order, and update_P sums the forces in that order.  The two legacy layouts
+  // used DIFFERENT orders (2-level: strange first; 3-level: strange last), and
+  // both must be reproduced for the no-knob run to stay bit-exact, so the rule
+  // below is: a level holding BOTH light and strange uses the 2-level order
+  // (strange, strange log-det, light log-det, all rungs, tail); any other level
+  // is light block (light log-det, strange log-det, un-routed rungs), routed
+  // rungs, tail, strange; the gauge action always last.  Gated bit-exact at
+  // 16^3 against both legacy layouts (perlmutter/gate16_levels_m9.sh).
+  // Changing this order changes the noise draws, not just the roundoff.
+  //
+  // Correctness: each action term is in exactly one level; the Metropolis test
+  // keeps the sampled distribution exact for any layout and multipliers -- only
+  // the integrator (discretization) error, hence acceptance/efficiency, changes.
+  // Cost: the batched smearing pullback (HASEN_GRID_BATCH_SMEAR) runs once per
+  // force call on every level that holds a smeared monomial, and the gauge-
+  // import skip / field-strength sharing fire only between operators imported
+  // at the same field, i.e. within one level's force call -- a monomial on a
+  // level of its own pays its own pullback and imports.  The [Levels] banner
+  // prints the force-call and smeared-monomial counts per level for that.
+  // History: the 2026-07-06 strange/light/gauge 3-level ran the light ladder 2x
+  // finer than strange (the recursion factor); the light sector is the
+  // expensive one and belongs on the root.  Nothing here forbids another order,
+  // the banner shows what was asked for.  See
+  // __docs/2026_7_6_integrator_step_accounting_summary.md,
+  // __docs/2026_7_11_three_level_integrator_plan.md,
+  // __docs/2026_08_10_integrator_factor_of_2_explained.md.
+  constexpr int kMaxLevels = 4;
+  auto env_present = [](const char *n) { const char *v = std::getenv(n); return v && *v; };
+  const char *level_knobs[]  = {"HASEN_LEVEL_LIGHT", "HASEN_LEVEL_STRANGE", "HASEN_LEVEL_TAIL",
+                                "HASEN_LEVEL_GAUGE", "HASEN_LEVEL_MULT_1", "HASEN_LEVEL_MULT_2",
+                                "HASEN_LEVEL_MULT_3"};
+  const char *legacy_knobs[] = {"GAUGE_INNER_MULT", "HASEN_STRANGE_LEVEL",
+                                "HASEN_STRANGE_INNER_MULT", "HASEN_TAIL_LEVEL"};
+  std::string level_knobs_seen, legacy_knobs_seen;
+  for (const char *n : level_knobs)  if (env_present(n)) level_knobs_seen  += std::string(" ") + n;
+  for (const char *n : legacy_knobs) if (env_present(n)) legacy_knobs_seen += std::string(" ") + n;
+  const bool general_knobs = !level_knobs_seen.empty();
+  if (general_knobs && !legacy_knobs_seen.empty()) {
+    std::cerr << "Integrator level knobs: both families are set -- HASEN_LEVEL_*:"
+              << level_knobs_seen << "  and legacy:" << legacy_knobs_seen
+              << ".  Use exactly one family (unset the legacy knobs, even at their defaults).\n";
     exit(1);
   }
-  // HASEN_STRANGE_RUNGS=<csv> (3-level only) routes the listed ratio rungs
-  // (0-based, matching the k in "PF<k>") to strange's level instead of
-  // light's -- same mechanism as tail_level=middle, for a rung whose force
-  // needs strange's finer dt but whose solve is cheap enough that the extra
-  // evaluations (strange's cadence vs light's) are worth paying.  Empty/unset
-  // = every rung stays on light, today's behavior.  Orthogonal to SOLVER
-  // routing (HASEN_MG_RUNG / HASEN_QUDA_CG_RUNGS / etc.) -- this only picks
-  // which INTEGRATOR level a rung's already-built solver gets evaluated at.
   std::set<int> strange_rungs = parse_rung_list("HASEN_STRANGE_RUNGS");
-  // Lstrange is declared at function scope but only wired into Aset in the
-  // 3-level branch below -- accepting either knob outside that branch would
-  // silently drop the routed action term from the integrator entirely (never
-  // evaluated, not even a crash).  Fail loudly instead.
-  if ((tail_level == "middle" || !strange_rungs.empty()) && !three_level) {
-    std::cerr << "HASEN_TAIL_LEVEL=middle / HASEN_STRANGE_RUNGS require the "
-                 "3-level integrator (HASEN_STRANGE_LEVEL=middle) -- strange "
-                 "is not a distinct level in 2-level mode.\n";
+
+  int lvl_light = 0, lvl_strange = 0, lvl_tail = 0, lvl_gauge = 1;
+  int lvl_mult[kMaxLevels] = {1, 1, 1, 1};
+  // Legacy-only state, kept for the legacy log lines below (byte-identical to
+  // the old binary's, downstream greps depend on them).
+  bool three_level = false;
+  int gauge_mult = 2, strange_mult = 1;
+  std::string tail_level = "outer";
+  if (general_knobs) {
+    auto env_level = [&](const char *n) {
+      if (!env_present(n)) {
+        std::cerr << "HASEN_LEVEL_* family in use but " << n << " is not set (all four of "
+                     "HASEN_LEVEL_LIGHT / _STRANGE / _TAIL / _GAUGE are required)\n";
+        exit(1);
+      }
+      const int v = std::atoi(std::getenv(n));
+      if (v < 0 || v >= kMaxLevels) {
+        std::cerr << n << " must be in 0.." << (kMaxLevels - 1) << " (0 = outermost), got '"
+                  << std::getenv(n) << "'\n";
+        exit(1);
+      }
+      return v;
+    };
+    lvl_light   = env_level("HASEN_LEVEL_LIGHT");
+    lvl_strange = env_level("HASEN_LEVEL_STRANGE");
+    lvl_tail    = env_level("HASEN_LEVEL_TAIL");
+    lvl_gauge   = env_level("HASEN_LEVEL_GAUGE");
+    for (int l = 1; l < kMaxLevels; ++l) {
+      const std::string n = "HASEN_LEVEL_MULT_" + std::to_string(l);
+      if (!env_present(n.c_str())) continue;
+      lvl_mult[l] = std::atoi(std::getenv(n.c_str()));
+    }
+  } else {
+    // Legacy family, parsed exactly as before (2026-07-06 .. 2026-10-12 binaries).
+    if (const char *gm = std::getenv("GAUGE_INNER_MULT"); gm && *gm) gauge_mult = std::atoi(gm);
+    const char *strange_level_env = std::getenv("HASEN_STRANGE_LEVEL");
+    three_level = (strange_level_env && std::string(strange_level_env) == "middle");
+    if (const char *sm = std::getenv("HASEN_STRANGE_INNER_MULT"); sm && *sm) strange_mult = std::atoi(sm);
+    const char *tail_level_env = std::getenv("HASEN_TAIL_LEVEL");
+    tail_level = (tail_level_env && *tail_level_env) ? tail_level_env : "outer";
+    if (tail_level != "outer" && tail_level != "inner" && tail_level != "middle") {
+      std::cerr << "HASEN_TAIL_LEVEL must be 'outer', 'inner', or 'middle', got '"
+                << tail_level << "'\n";
+      exit(1);
+    }
+    // In 2-level mode strange is not a distinct level: 'middle' and the rung
+    // routing would both be silent no-ops.  Fail loudly instead (as before).
+    if ((tail_level == "middle" || !strange_rungs.empty()) && !three_level) {
+      std::cerr << "HASEN_TAIL_LEVEL=middle / HASEN_STRANGE_RUNGS require the "
+                   "3-level integrator (HASEN_STRANGE_LEVEL=middle) -- strange "
+                   "is not a distinct level in 2-level mode.\n";
+      exit(1);
+    }
+    if (!three_level) {
+      lvl_light = 0; lvl_strange = 0; lvl_gauge = 1;
+      lvl_tail  = (tail_level == "inner") ? 1 : 0;
+      lvl_mult[1] = gauge_mult;
+    } else {
+      lvl_light = 0; lvl_strange = 1; lvl_gauge = 2;
+      lvl_tail  = (tail_level == "outer") ? 0 : (tail_level == "middle") ? 1 : 2;
+      lvl_mult[1] = strange_mult;
+      lvl_mult[2] = gauge_mult;
+    }
+  }
+  // Layout validation, both families.
+  const int lvl_of_group[4] = {lvl_light, lvl_strange, lvl_tail, lvl_gauge};
+  int n_levels = 0;
+  bool level_used[kMaxLevels] = {false, false, false, false};
+  for (int g = 0; g < 4; ++g) {
+    level_used[lvl_of_group[g]] = true;
+    n_levels = std::max(n_levels, lvl_of_group[g] + 1);
+  }
+  for (int l = 0; l < n_levels; ++l) {
+    if (!level_used[l]) {
+      std::cerr << "Integrator levels: level " << l << " holds no group but a deeper level "
+                   "is used -- level numbers must be contiguous from 0 (light=" << lvl_light
+                << " strange=" << lvl_strange << " tail=" << lvl_tail << " gauge=" << lvl_gauge
+                << ")\n";
+      exit(1);
+    }
+    if (lvl_mult[l] < 1) {
+      std::cerr << "Integrator levels: multiplier of level " << l << " must be >= 1, got "
+                << lvl_mult[l] << "\n";
+      exit(1);
+    }
+  }
+  for (int l = n_levels; l < kMaxLevels; ++l) {
+    const std::string n = "HASEN_LEVEL_MULT_" + std::to_string(l);
+    if (env_present(n.c_str())) {
+      std::cerr << n << " is set but only " << n_levels << " level(s) are used (0.."
+                << n_levels - 1 << "); a multiplier for an unused level is not ignored\n";
+      exit(1);
+    }
+  }
+  if (!strange_rungs.empty() && lvl_strange == lvl_light) {
+    std::cerr << "HASEN_STRANGE_RUNGS routes rungs to the strange's level, but strange and "
+                 "light share level " << lvl_strange << " -- the routing would be a no-op. "
+                 "Give the strange its own level (HASEN_LEVEL_STRANGE) or unset the list.\n";
     exit(1);
   }
+  auto level_of_rung = [&](int k) { return strange_rungs.count(k) ? lvl_strange : lvl_light; };
   // Grid-MG sharers rely on the donor's gauge import (HASEN_GRID_MG_RUNGS above).  If
   // HASEN_STRANGE_RUNGS puts a sharer and its donor on different integrator levels, the sharer
   // can solve at a gauge field the donor has not imported yet.  Still exact to tol (the outer
@@ -1548,60 +1645,120 @@ int main(int argc, char **argv) {
   // operator lags, which can cost outer iterations.  Report it.  (The M3 Grid-MG HEATBATH
   // solvers, HASEN_GRID_MG_HEATBATH_RUNGS, import the gauge themselves when the hierarchy does
   // not carry it, so their refresh never lags and never meets an un-gauged hierarchy.)
-  if (GridMGH && three_level) {
-    const bool donor_on_strange = strange_rungs.count(grid_mg_donor) != 0;
+  if (GridMGH) {
     for (int k : grid_mg_rungs)
-      if ((strange_rungs.count(k) != 0) != donor_on_strange)
+      if (level_of_rung(k) != level_of_rung(grid_mg_donor))
         std::cout << GridLogMessage << "[Ladder] NOTE: Grid-MG rung " << k
                   << " and its donor rung " << grid_mg_donor
                   << " are on different integrator levels (HASEN_STRANGE_RUNGS): its MG "
                      "preconditioner may see the previous gauge field (the solve itself "
                      "stays on the current fp64 operator)" << std::endl;
   }
-  std::cout << GridLogMessage << "[Ladder] tail level = " << tail_level
-            << (tail_level == "inner"    ? " (with gauge — Chroma has_cancel placement)"
-                : tail_level == "middle" ? " (with strange)"
-                                         : " (with the ladder rungs)")
-            << std::endl;
-
-  if (!three_level) {
-    std::cout << GridLogMessage
-              << "Integrator: 2-level (strange+light)/gauge  GAUGE_INNER_MULT="
-              << gauge_mult << std::endl;
-    Lferm.push_back(&StrangeSchurPF);
-    Lferm.push_back(StrangeLogDetPtr);
-    Lferm.push_back(LightLogDetPtr);
-    for (auto &pf : RatioPF) Lferm.push_back(pf.get());
-    if (tail_level == "inner") Lgauge.push_back(LightTailSchur);
-    else                       Lferm.push_back(LightTailSchur);
-    Lgauge.push_back(&GaugeAction);
-    Aset.push_back(Lferm);      // coarsest pushed first
-    Aset.push_back(Lgauge);
+  if (!general_knobs) {
+    std::cout << GridLogMessage << "[Ladder] tail level = " << tail_level
+              << (tail_level == "inner"    ? " (with gauge — Chroma has_cancel placement)"
+                  : tail_level == "middle" ? " (with strange)"
+                                           : " (with the ladder rungs)")
+              << std::endl;
   } else {
-    // 3-level: light (root, coarsest) / strange (middle) / gauge+tail (deepest).
-    const int n_light   = mdsteps;
-    const int n_strange = 2 * strange_mult * n_light;
-    const int n_gauge   = 2 * gauge_mult   * n_strange;
-    std::cout << GridLogMessage
-              << "Integrator: 3-level light/strange/gauge+tail  MDSTEPS(light)="
-              << mdsteps << "  STRANGE_INNER_MULT=" << strange_mult
-              << "  GAUGE_INNER_MULT=" << gauge_mult << std::endl;
-    std::cout << GridLogMessage << "[3-level] steps/traj: light=" << n_light
-              << "  strange=" << n_strange << "  gauge=" << n_gauge << std::endl;
-    Llight.push_back(LightLogDetPtr);
-    Llight.push_back(StrangeLogDetPtr);   // negligible force -> cheapest (coarsest) slot
-    for (int k = 0; k < n_pf; ++k) {
-      if (strange_rungs.count(k)) Lstrange.push_back(RatioPF[k].get());
-      else                        Llight.push_back(RatioPF[k].get());
+    std::cout << GridLogMessage << "[Ladder] tail level = L" << lvl_tail
+              << (lvl_tail == lvl_light   ? " (with the ladder rungs)"
+                  : lvl_tail == lvl_strange ? " (with strange)"
+                  : lvl_tail == lvl_gauge   ? " (with gauge)"
+                                            : " (alone)")
+              << std::endl;
+  }
+
+  typedef Representations<EmptyRep<LatticeGaugeField>> Reps;
+  ActionSet<LatticeGaugeField, Reps> Aset;
+  // Grid's ActionLevel holds `actions` as a REFERENCE into its own actions_hirep;
+  // the copy that Aset.push_back() stores keeps that reference bound to THIS
+  // object.  So every ActionLevel pushed into Aset must outlive the Integrator
+  // ctor (built further down, "── HMC ──") -- declare them here at function
+  // scope, NOT inside a branch (in-branch scoping dangles the reference and
+  // segfaults at the ctor's action-summary print).  Only the first n_levels are
+  // populated and pushed into Aset; the rest stay empty and unused.  The
+  // multipliers were validated above (the ctor asserts mul >= 1).
+  ActionLevel<LatticeGaugeField, Reps> L0(1);            // root: always multiplier 1
+  ActionLevel<LatticeGaugeField, Reps> L1(lvl_mult[1]);
+  ActionLevel<LatticeGaugeField, Reps> L2(lvl_mult[2]);
+  ActionLevel<LatticeGaugeField, Reps> L3(lvl_mult[3]);
+  ActionLevel<LatticeGaugeField, Reps> *Lv[kMaxLevels] = {&L0, &L1, &L2, &L3};
+
+  if (!general_knobs) {
+    if (!three_level) {
+      std::cout << GridLogMessage
+                << "Integrator: 2-level (strange+light)/gauge  GAUGE_INNER_MULT="
+                << gauge_mult << std::endl;
+    } else {
+      const int n_light   = mdsteps;
+      const int n_strange = 2 * strange_mult * n_light;
+      const int n_gauge   = 2 * gauge_mult   * n_strange;
+      std::cout << GridLogMessage
+                << "Integrator: 3-level light/strange/gauge+tail  MDSTEPS(light)="
+                << mdsteps << "  STRANGE_INNER_MULT=" << strange_mult
+                << "  GAUGE_INNER_MULT=" << gauge_mult << std::endl;
+      std::cout << GridLogMessage << "[3-level] steps/traj: light=" << n_light
+                << "  strange=" << n_strange << "  gauge=" << n_gauge << std::endl;
     }
-    if      (tail_level == "inner")  Lgauge.push_back(LightTailSchur);
-    else if (tail_level == "middle") Lstrange.push_back(LightTailSchur);
-    else                              Llight.push_back(LightTailSchur);
-    Lstrange.push_back(&StrangeSchurPF);
-    Lgauge.push_back(&GaugeAction);
-    Aset.push_back(Llight);     // coarsest pushed first
-    Aset.push_back(Lstrange);
-    Aset.push_back(Lgauge);
+  } else {
+    std::cout << GridLogMessage << "Integrator: general level assignment (HASEN_LEVEL_*), "
+              << n_levels << " level(s)  MDSTEPS(level 0)=" << mdsteps << std::endl;
+  }
+
+  // Assembly: the push order per level is the TRAP rule in the header comment.
+  for (int l = 0; l < n_levels; ++l) {
+    ActionLevel<LatticeGaugeField, Reps> &L = *Lv[l];
+    const bool has_light = (lvl_light == l), has_strange = (lvl_strange == l);
+    const bool has_tail  = (lvl_tail  == l), has_gauge   = (lvl_gauge   == l);
+    if (has_light && has_strange) {
+      // The 2-level order (strange_rungs is empty here, checked above).
+      L.push_back(&StrangeSchurPF);
+      L.push_back(StrangeLogDetPtr);
+      L.push_back(LightLogDetPtr);
+      for (auto &pf : RatioPF) L.push_back(pf.get());
+      if (has_tail) L.push_back(LightTailSchur);
+    } else {
+      if (has_light) {
+        L.push_back(LightLogDetPtr);
+        L.push_back(StrangeLogDetPtr);   // negligible force -> cheapest (coarsest) slot
+        for (int k = 0; k < n_pf; ++k)
+          if (!strange_rungs.count(k)) L.push_back(RatioPF[k].get());
+      }
+      if (has_strange)
+        for (int k = 0; k < n_pf; ++k)
+          if (strange_rungs.count(k)) L.push_back(RatioPF[k].get());
+      if (has_tail)    L.push_back(LightTailSchur);
+      if (has_strange) L.push_back(&StrangeSchurPF);
+    }
+    if (has_gauge) L.push_back(&GaugeAction);
+    Aset.push_back(L);   // coarsest pushed first
+  }
+
+  // [Levels] banner: the resolved layout, steps per level per trajectory, the
+  // force-gradient force-call count 3n+1 per level, and how many members are
+  // smeared (= batched smearing pullbacks per force call on that level).
+  {
+    std::ostringstream mults;
+    for (int l = 1; l < n_levels; ++l) mults << (l > 1 ? "," : "") << lvl_mult[l];
+    std::cout << GridLogMessage << "[Levels] light=L" << lvl_light << " strange=L" << lvl_strange
+              << " tail=L" << lvl_tail << " gauge=L" << lvl_gauge << " mults="
+              << (n_levels > 1 ? mults.str() : std::string("none")) << " levels=" << n_levels
+              << (general_knobs ? " (HASEN_LEVEL_*)" : " (legacy knobs)") << std::endl;
+    int n_steps = mdsteps;
+    for (int l = 0; l < n_levels; ++l) {
+      if (l > 0) n_steps *= 2 * lvl_mult[l];
+      int n_smeared = 0;
+      std::ostringstream members;
+      for (auto *a : Lv[l]->actions) {
+        if (a->is_smeared) ++n_smeared;
+        members << " " << a->action_name();
+      }
+      std::cout << GridLogMessage << "[Levels] L" << l << ": mult " << lvl_mult[l]
+                << ", steps/traj " << n_steps << ", FG force calls " << 3 * n_steps + 1
+                << ", smeared monomials " << n_smeared << "/" << Lv[l]->actions.size()
+                << ", members:" << members.str() << std::endl;
+    }
   }
 
   // ── Stout smearing ────────────────────────────────────────────────────────
@@ -1635,6 +1792,9 @@ int main(int argc, char **argv) {
   //   FORCES_SKIP_RUNGS=0,1   (skip near-critical end, keep tail in the output)
   // LightLogDet is NOT covered (use FORCES_SKIP_LIGHT); each PF rung index
   // matches the k in "PF<k>" printed in the log.
+  // FORCES_STIFFNESS=1 (2026-10-14): the stiffness screen (finite differences of
+  // every force at displaced links, contracted with the forces and a momentum
+  // draw) instead of this loop; its own comment block below, same FORCES_SAMPLES.
   // CAVEAT 1 (pRNG coupling): refresh() draws from ONE shared pRNG stream, in ref
   // order, ACROSS samples.  A skipped rung does not consume its draw, so every
   // level after it -- including the next SAMPLE's early levels -- sees different
@@ -1649,6 +1809,311 @@ int main(int argc, char **argv) {
   if (std::getenv("FORCES_ONLY") != nullptr) {
     int nsamp = 1;
     if (const char *ns = std::getenv("FORCES_SAMPLES"); ns && *ns) nsamp = std::atoi(ns);
+
+    // ── Stiffness screen: FORCES_ONLY=1 FORCES_STIFFNESS=1 (2026-10-14) ──────────
+    // What: at the imported configuration, the stiffness of every monomial (the
+    // derivative of its force along a direction) from finite differences of the
+    // force at displaced thin links, U' = exp(eps vhat) U, with the pseudofermions
+    // held fixed, contracted with every stored force and with a momentum draw.
+    // Why: at TRAJL 1.0 the near-critical ratio rungs' integration error is set by
+    // their stiffness, not by their force, so the force norms above cannot rank
+    // ladders; the h^4 terms of dH are built from exactly these contractions
+    // (__docs/2026_10_14_notes_dh_force_stiffness.md, handoff
+    // 2026_10_14_handoff_stiffness_screen.md).  The trajectory's force-gradient
+    // kick already evaluates each force at links displaced along the level force
+    // (Integrator_algorithm.h FG_update_P); this does the same along chosen
+    // directions, once, without a trajectory.
+    // Sequence per sample (deliberately NOT the plain FORCES_ONLY loop below):
+    //   1. momenta, then the heatbaths in the INTEGRATOR's order (generate_momenta,
+    //      then refresh level by level over Aset, as Integrator::refresh does), so the
+    //      same seed gives the trajectory's draws and the undisplaced forces equal the
+    //      trajectory's first update_P forces, raw and pulled back.
+    //   2. F_a at U for every monomial: deriv on the smeared links, the stout pullback,
+    //      Ta (the stock ActionBase::deriv(ConfigurationBase&) sequence, done here in
+    //      two steps so the raw pre-pullback norm can be logged next to the batched
+    //      trajectory lines); the gauge action directly on the thin links, as below.
+    //   3. per direction v (FORCES_STIFF_DIRS) and eps (FORCES_STIFF_EPS):
+    //      vhat = v / sqrt(maxLocalNorm2(v)), so eps is the largest link rotation;
+    //      F_a at U+ = exp(+eps vhat) U and, central (default), U- = exp(-eps vhat) U;
+    //      M_a vhat = (F_a(U+) - F_a(U-)) / (2 eps)   [one-sided: (F_a(U+) - F_a(U)) / eps]
+    //      D2_a     = (F_a(U+) - 2 F_a(U) + F_a(U-)) / eps^2   (nonlinearity along vhat)
+    //      logged: |M_a vhat|^2, <vhat, M_a vhat>, <P, M_a vhat>, <F_b, M_a vhat> for
+    //      every b, |D2_a|^2, <vhat, D2_a>, <P, D2_a>, and the Gram matrix
+    //      <M_a vhat, M_b vhat> (FORCES_STIFF_GRAM: P = the momentum direction only, the
+    //      default, the one direction whose h^4 term is quadratic in M; all; 0 = none; the
+    //      stored M_a vhat exist only while a Gram direction runs).
+    //      <a, b> = Re sum_x tr(a^dag b) (Grid innerProduct), so <F, F> = |F|^2.
+    //      The gauge action is evaluated at U, U+, U-: its first and second differences
+    //      along vhat check the gauge force and stiffness (dS/deps = 2 Re<vhat, F>, the
+    //      update_field / update_P conventions; the "gaugecheck" line prints both sides).
+    // Directions: gauge = F_Gauge, tail = F_LightSchurPF, strange = F_Strange +
+    // F_StrangeLogDet, light = F_LightLogDet + sum_k F_PFk, P = the momentum draw of
+    // step 1 (production normalisation), a level name (LightLogDet, PF<k>, LightSchurPF,
+    // Strange, StrangeLogDet, Gauge) = that monomial's force alone, each = one direction
+    // per monomial (every level name, in order).  Contractions are logged for vhat;
+    // |v|_max and |v|^2 are logged per direction, so the unnormalised contraction is vmax
+    // times the logged one.  M_a is linear, so a level's force direction is the sum over
+    // its monomials (or groups) of the logged, rescaled contractions, for any level
+    // layout when the directions are per monomial; the Gram entries are not additive.
+    // Trap: every object that caches the gauge field decides by CONTENT (the import
+    // guard compares fields exactly, the MG hierarchy and the mixed-CG wrapper by trace
+    // fingerprint), so a displaced field is always re-imported; the MG null space is
+    // kept (a preconditioner only, the solve converges to its tolerance).  Linearity
+    // and solver-floor: D2 and a second eps value show it; the FG kick's own
+    // displacement is (h^2/24)|F_level|_max ~ 2e-4 (inner, 48 steps) to 3e-3 (12 steps).
+    // Knobs (all optional): FORCES_STIFF_DIRS csv of gauge,tail,strange,light,P, level
+    //   names, each (default gauge,tail,strange,P; "none" = step 1-2 only); FORCES_STIFF_EPS csv
+    //   (default 1e-3); FORCES_STIFF_ONESIDED=1; FORCES_STIFF_ACTIONS csv of the level
+    //   names above whose displaced forces are computed (default all; the others are
+    //   still evaluated at U and used as F_b); FORCES_STIFF_GRAM=P|all|0 (default P).
+    //   FORCES_SAMPLES applies (new momenta and noise per sample); FORCES_SKIP_* are refused.
+    // Output: "FORCES_STIFF <kind> key=value ..." lines, kinds meta, refresh, force, P,
+    //   gram0, dir, stiff, gram, gaugecheck; 10 significant digits.  Table script:
+    //   5_studies/hasenbusch_tune/data_extraction_scripts/stiffness_screen_table.py.
+    // Memory: nref stored forces + nref stored M_a vhat (while a Gram direction runs) + 7
+    // work fields (P, v, vhat, U+, U-, F+, F-, D2 share 8); 0.4 GB each at 48^3 on 16 ranks.
+    if (std::getenv("FORCES_STIFFNESS") != nullptr) {
+      typedef LatticeGaugeField GF;
+      for (const char *k : {"FORCES_SKIP_STRANGE", "FORCES_SKIP_GAUGE", "FORCES_SKIP_LIGHT",
+                            "FORCES_SKIP_TAIL", "FORCES_SKIP_RUNGS"})
+        if (std::getenv(k) != nullptr) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: " << k
+                    << " is not supported with FORCES_STIFFNESS=1 (heatbaths run in the "
+                       "integrator's order, nothing is skipped)" << std::endl;
+          assert(0 && "FORCES_SKIP_* with FORCES_STIFFNESS");
+        }
+      auto csv = [](const char *name, const std::string &dflt) {
+        std::vector<std::string> out;
+        std::string s = dflt;
+        if (const char *e = std::getenv(name); e && *e) s = e;
+        std::stringstream ss(s); std::string tok;
+        while (std::getline(ss, tok, ',')) if (!tok.empty()) out.push_back(tok);
+        return out;
+      };
+      auto join = [](const std::vector<std::string> &v) {
+        std::string s;
+        for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + v[i];
+        return s.empty() ? std::string("none") : s;
+      };
+      const std::vector<std::string> dirs_in = csv("FORCES_STIFF_DIRS", "gauge,tail,strange,P");
+      const std::vector<std::string> eps_str = csv("FORCES_STIFF_EPS", "1e-3");
+      std::vector<double> eps_list;
+      for (auto &t : eps_str) eps_list.push_back(std::atof(t.c_str()));
+      const bool central = std::getenv("FORCES_STIFF_ONESIDED") == nullptr;
+      const char *gram_env = std::getenv("FORCES_STIFF_GRAM");
+      const std::string gram_mode = (gram_env && *gram_env) ? std::string(gram_env) : std::string("P");
+      if (gram_mode != "P" && gram_mode != "all" && gram_mode != "0") {
+        std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_GRAM must be P, all or 0, got '"
+                  << gram_mode << "'" << std::endl;
+        assert(0 && "bad FORCES_STIFF_GRAM");
+      }
+      const std::vector<std::string> diff_list = csv("FORCES_STIFF_ACTIONS", "");
+      const std::set<std::string> diff_acts(diff_list.begin(), diff_list.end());
+      const int nref = (int)ForceObs.refs.size();
+      auto ref_index = [&](const std::string &nm) {
+        for (int i = 0; i < nref; ++i) if (ForceObs.refs[i].name == nm) return i;
+        return -1;
+      };
+      auto name_of = [&](Action<GF> *a) -> std::string {
+        for (auto &r : ForceObs.refs) if (r.act == a) return r.name;
+        return a->action_name();
+      };
+      auto group_of = [](const std::string &nm) -> std::string {
+        if (nm == "Gauge") return "gauge";
+        if (nm == "LightSchurPF") return "tail";
+        if (nm == "Strange" || nm == "StrangeLogDet") return "strange";
+        return "light";   // LightLogDet, PF<k>
+      };
+      // "each" expands to one direction per monomial (the level names, in ForceObs order).
+      std::vector<std::string> dirs;
+      for (auto &d : dirs_in) {
+        if (d == "each") { for (auto &r : ForceObs.refs) dirs.push_back(r.name); continue; }
+        if (d != "gauge" && d != "tail" && d != "strange" && d != "light" && d != "P" && d != "none"
+            && ref_index(d) < 0) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_DIRS entry '" << d
+                    << "' is not one of gauge,tail,strange,light,P,none,each or a level name" << std::endl;
+          assert(0 && "bad FORCES_STIFF_DIRS");
+        }
+        dirs.push_back(d);
+      }
+      for (double e : eps_list)
+        if (!(e > 0.0)) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_EPS entries must be > 0" << std::endl;
+          assert(0 && "bad FORCES_STIFF_EPS");
+        }
+      for (auto &nm : diff_acts)
+        if (ref_index(nm) < 0) {
+          std::cout << GridLogError << "[FORCES_STIFF] FATAL: FORCES_STIFF_ACTIONS entry '" << nm
+                    << "' is not a FORCES_ONLY level name" << std::endl;
+          assert(0 && "bad FORCES_STIFF_ACTIONS");
+        }
+      const int ig = ref_index("Gauge");
+      const double gsites = (double)Grid_.gSites();
+      const std::streamsize oldprec = std::cout.precision();
+      std::cout.precision(10);
+      auto out = [&]() -> std::ostream & { return std::cout << GridLogMessage << "FORCES_STIFF "; };
+      auto secs = [](const std::chrono::steady_clock::time_point &t0) {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      };
+      out() << "meta samples=" << nsamp << " nref=" << nref << " gsites=" << gsites
+            << " central=" << (central ? 1 : 0) << " gram=" << gram_mode
+            << " dirs=" << join(dirs) << " eps=" << join(eps_str)
+            << " diff_actions=" << (diff_acts.empty() ? std::string("all") : join(diff_list))
+            << std::endl;
+      // Pulled-back, Ta-projected force of one monomial at the thin links Smear holds
+      // (Uthin must be the field given to the last Smear.set_Field).  Optional raw
+      // (pre-pullback, Ta-projected) norms for the comparison with the batched
+      // trajectory lines.
+      auto eval_force = [&](Action<GF> *act, GF &Uthin, GF &force, double *raw_avg, double *raw_max) {
+        if (act->is_smeared) {
+          act->deriv(Smear.get_U(true), force);   // dS/dU_smeared, unprojected
+          if (raw_avg) {
+            GF raw = PeriodicGimplR::projectForce(force);
+            *raw_avg = std::sqrt(norm2(raw) / gsites);
+            *raw_max = std::sqrt(maxLocalNorm2(raw));
+          }
+          Smear.smeared_force(force);              // stout chain rule to the thin links, then Ta
+        } else {
+          act->deriv(Uthin, force);                // gauge action: thin links, no wrapper (see below)
+        }
+        force = PeriodicGimplR::projectForce(force);
+        if (raw_avg && !act->is_smeared) {
+          *raw_avg = std::sqrt(norm2(force) / gsites);
+          *raw_max = std::sqrt(maxLocalNorm2(force));
+        }
+      };
+      for (int s = 0; s < nsamp; ++s) {
+        // 1. momenta, then every heatbath in the integrator's level/action order.
+        GF P(&Grid_);
+        PeriodicGimplR::generate_momenta(P, sRNG, pRNG);
+        Smear.set_Field(Umu);
+        for (int l = 0; l < (int)Aset.size(); ++l)
+          for (int a = 0; a < (int)Aset[l].actions.size(); ++a) {
+            Action<GF> *act = Aset[l].actions.at(a);
+            auto t0 = std::chrono::steady_clock::now();
+            act->refresh(Smear, sRNG, pRNG);
+            out() << "refresh sample=" << s << " level=" << l << " idx=" << a
+                  << " act=" << name_of(act) << " time=" << secs(t0) << std::endl;
+          }
+        // 2. forces at U, plus the Gram matrix of the forces and P.
+        std::vector<std::unique_ptr<GF>> F(nref);
+        for (int i = 0; i < nref; ++i) {
+          F[i].reset(new GF(&Grid_));
+          double ravg = 0.0, rmax = 0.0;
+          auto t0 = std::chrono::steady_clock::now();
+          eval_force(ForceObs.refs[i].act, Umu, *F[i], &ravg, &rmax);
+          const double t = secs(t0);
+          const double n2 = norm2(*F[i]);
+          out() << "force sample=" << s << " act=" << ForceObs.refs[i].name
+                << " avg=" << std::sqrt(n2 / gsites) << " max=" << std::sqrt(maxLocalNorm2(*F[i]))
+                << " raw_avg=" << ravg << " raw_max=" << rmax << " norm2=" << n2
+                << " time=" << t << std::endl;
+        }
+        const double P2 = norm2(P);
+        out() << "P sample=" << s << " norm2=" << P2 << " avg=" << std::sqrt(P2 / gsites)
+              << " max=" << std::sqrt(maxLocalNorm2(P)) << std::endl;
+        for (int i = 0; i < nref; ++i) {
+          for (int j = i; j < nref; ++j)
+            out() << "gram0 sample=" << s << " a=" << ForceObs.refs[i].name << " b=" << ForceObs.refs[j].name
+                  << " dot=" << real(innerProduct(*F[i], *F[j])) << std::endl;
+          out() << "gram0 sample=" << s << " a=" << ForceObs.refs[i].name << " b=P"
+                << " dot=" << real(innerProduct(*F[i], P)) << std::endl;
+        }
+        const double S0 = GaugeAction.S(Umu);
+        // 3. displaced evaluations per direction and eps.
+        for (auto &dname : dirs) {
+          if (dname == "none") continue;
+          GF v(&Grid_); v = Zero();
+          if (dname == "P") v = P;
+          else if (ref_index(dname) >= 0) v = *F[ref_index(dname)];
+          else for (int i = 0; i < nref; ++i)
+            if (group_of(ForceObs.refs[i].name) == dname) v = v + *F[i];
+          const double vmax = std::sqrt(maxLocalNorm2(v)), v2 = norm2(v);
+          if (!(vmax > 0.0)) {
+            out() << "dir sample=" << s << " dir=" << dname << " vmax=0 skipped" << std::endl;
+            continue;
+          }
+          GF vhat(&Grid_); vhat = v * (1.0 / vmax);
+          out() << "dir sample=" << s << " dir=" << dname << " vmax=" << vmax << " norm2=" << v2
+                << " dot_P=" << real(innerProduct(vhat, P)) << std::endl;
+          const bool want_gram = (gram_mode == "all") || (gram_mode == "P" && dname == "P");
+          for (double eps : eps_list) {
+            GF Up(&Grid_); Up = Umu; PeriodicGimplR::update_field(vhat, Up, eps);
+            GF Um(&Grid_); Um = Umu;
+            if (central) PeriodicGimplR::update_field(vhat, Um, -eps);
+            const double Sp = GaugeAction.S(Up);
+            const double Sm = central ? GaugeAction.S(Um) : S0;
+            std::vector<std::unique_ptr<GF>> Mv(nref);
+            GF Fp(&Grid_), Fm(&Grid_), D2(&Grid_);
+            double gauge_dot_v = 0.0;
+            bool gauge_done = false;
+            for (int i = 0; i < nref; ++i) {
+              const std::string &nm = ForceObs.refs[i].name;
+              if (!diff_acts.empty() && !diff_acts.count(nm)) continue;
+              Action<GF> *act = ForceObs.refs[i].act;
+              auto t0 = std::chrono::steady_clock::now();
+              Smear.set_Field(Up);
+              eval_force(act, Up, Fp, nullptr, nullptr);
+              const double tp = secs(t0);
+              double tm = 0.0;
+              if (central) {
+                t0 = std::chrono::steady_clock::now();
+                Smear.set_Field(Um);
+                eval_force(act, Um, Fm, nullptr, nullptr);
+                tm = secs(t0);
+              }
+              Mv[i].reset(new GF(&Grid_));
+              if (central) {
+                *Mv[i] = Fp - Fm;
+                *Mv[i] = (*Mv[i]) * (0.5 / eps);
+                D2 = Fp + Fm;
+                D2 = D2 - (*F[i]) * 2.0;
+                D2 = D2 * (1.0 / (eps * eps));
+              } else {
+                *Mv[i] = Fp - (*F[i]);
+                *Mv[i] = (*Mv[i]) * (1.0 / eps);
+              }
+              const double dot_v = real(innerProduct(vhat, *Mv[i]));
+              if (i == ig) { gauge_dot_v = dot_v; gauge_done = true; }
+              std::ostream &o = out() << "stiff sample=" << s << " dir=" << dname << " eps=" << eps
+                                      << " act=" << nm << " norm2_Mv=" << norm2(*Mv[i])
+                                      << " dot_v=" << dot_v << " dot_P=" << real(innerProduct(P, *Mv[i]));
+              for (int b = 0; b < nref; ++b)
+                o << " dot_" << ForceObs.refs[b].name << "=" << real(innerProduct(*F[b], *Mv[i]));
+              if (central)
+                o << " norm2_D2=" << norm2(D2) << " dot_v_D2=" << real(innerProduct(vhat, D2))
+                  << " dot_P_D2=" << real(innerProduct(P, D2));
+              o << " plus_avg=" << std::sqrt(norm2(Fp) / gsites);
+              if (central) o << " minus_avg=" << std::sqrt(norm2(Fm) / gsites);
+              o << " time_plus=" << tp << " time_minus=" << tm << std::endl;
+              if (!want_gram) Mv[i].reset();
+            }
+            if (want_gram)
+              for (int i = 0; i < nref; ++i)
+                for (int j = i; j < nref; ++j)
+                  if (Mv[i] && Mv[j])
+                    out() << "gram sample=" << s << " dir=" << dname << " eps=" << eps
+                          << " a=" << ForceObs.refs[i].name << " b=" << ForceObs.refs[j].name
+                          << " dot=" << real(innerProduct(*Mv[i], *Mv[j])) << std::endl;
+            if (ig >= 0) {
+              const double dS1 = central ? (Sp - Sm) / (2.0 * eps) : (Sp - S0) / eps;
+              std::ostream &o = out() << "gaugecheck sample=" << s << " dir=" << dname << " eps=" << eps
+                                      << " S0=" << S0 << " Sp=" << Sp << " Sm=" << Sm
+                                      << " dS1=" << dS1 << " fd1=" << 2.0 * real(innerProduct(vhat, *F[ig]));
+              if (central) o << " dS2=" << (Sp - 2.0 * S0 + Sm) / (eps * eps);
+              if (gauge_done) o << " fd2=" << 2.0 * gauge_dot_v;
+              o << std::endl;
+            }
+            Smear.set_Field(Umu);   // the smearer holds U again before the next eps/direction/sample
+          }
+        }
+      }
+      std::cout.precision(oldprec);
+      std::cout << GridLogMessage << "FORCES_STIFF done samples=" << nsamp << std::endl;
+      Grid_finalize();
+      return 0;
+    }
+
     const bool skip_strange = std::getenv("FORCES_SKIP_STRANGE") != nullptr;
     const bool skip_gauge   = std::getenv("FORCES_SKIP_GAUGE")   != nullptr;
     const bool skip_light   = std::getenv("FORCES_SKIP_LIGHT")   != nullptr;  // LogDet + PF ladder + Schur PF
