@@ -11,13 +11,14 @@ Layout = steps per trajectory of light / strange / tail / gauge. A nested level 
 Cost model (2026_10_07_baseg_force_breakdown_trajl1.md, TRAJL 1.0, four 40 GB nodes):
   force calls per level = 3N + 1 (force-gradient); per-call times from the force-only run
   (PF0 10.18 s ... gauge 0.15 s); at 12/12/48/48 the pieces give 2,424 s.
-  wall = force time + NONFORCE (MG rebuilds, cache copies, updates; T24: 3,166 - 2,048 = 1,118 s,
-  baseline ~1,150-1,230 s). Wall savings are therefore ~2/3 of force-time savings.
+  wall = WALL_FACTOR x force time. The non-force part (MG rebuilds, cache copies, updates) scales
+  with the force time rather than being constant: wall/force was 1.41-1.55 on the five tune 2
+  runs of 10-27 and 1.44 on the baseline, mean 1.47 (before 10-27 the model used force + 1,150 s).
 
 dH model (pieces add; spreads add in quadrature; shifts add to the mean):
   gauge: momentum-independent SHIFT, exactly h^4, +0.0604 at 48 (2026_10_12_pure_gauge_fg_step_scan.md).
   tail (-0.1870): SPREAD sigma 0.47 at 24 (T24: RMS 0.51 over 3, baseline 0.195 removed in
-        quadrature; 2026_10_19_force_only_candidates_like_with_like.md), scaled as h^4 (marginal
+        quadrature; 2026_10_19_tune1_force_only_candidates_like_with_like.md), scaled as h^4 (marginal
         for the tail: 2026_10_14_stiffness_screen_results.md).
   light rungs (baseline ladder): SPREAD sigma 0.43 at 6 without the control's +2.06 spike, 0.77
         with it (control at 6, RMS 0.47 / 0.79 over 10), scaled as h^4 (NOT established for the
@@ -62,7 +63,7 @@ PIECES = [
 ]
 BASE = {'light': 12, 'strange': 12, 'tail': 48, 'gauge': 48}
 PC = {g: sum(p[2] * (3 * BASE[g] + 1) for p in PIECES if p[1] == g) for g in BASE}   # s per trajectory at base
-NONFORCE = 1150.0
+WALL_FACTOR = 1.47            # wall = WALL_FACTOR x force; fitted 10-27 (five tune 2 runs + baseline, 1.41-1.55)
 GAUGE_SHIFT_48 = 0.0604
 TAIL_SIGMA_24 = 0.47
 LIGHT_SIGMA_6 = 0.43
@@ -102,7 +103,7 @@ def acceptance(sigma, shift):
 def evaluate(lay):
     ft = force_time(lay)
     force = sum(ft.values())
-    wall = force + NONFORCE
+    wall = WALL_FACTOR * force
     st, sg = tail_sigma(lay['tail']), gauge_shift(lay['gauge'])
     out = dict(lay=lay, ft=ft, force=force, wall=wall, st=st, sg=sg,
                levels=len(set(lay.values())), strange_untested=lay['strange'] < 12)
@@ -186,7 +187,7 @@ def print_detail(lays):
     for name, g, tcall, fs_avg, fs_pk, lin in PIECES:
         print('| %s | %s |' % (name, ' | '.join('%.0f (%d calls)' % (tcall * calls(l[g]), calls(l[g])) for l in cols)))
     print('| **total force** | %s |' % ' | '.join('**%.0f** (%+.0f%%)' % (evaluate(l)['force'], pct(evaluate(l)['force'], base['force'])) for l in cols))
-    print('| wall (force + %.0f) | %s |' % (NONFORCE, ' | '.join('%.0f' % evaluate(l)['wall'] for l in cols)))
+    print('| wall (%.2f x force) | %s |' % (WALL_FACTOR, ' | '.join('%.0f' % evaluate(l)['wall'] for l in cols)))
     print()
     print('### dH pieces by the model, acceptance, cost per accepted trajectory, and the launcher knobs')
     print()
@@ -247,10 +248,10 @@ def main():
 
     print('baseline %s: force %.0f s, wall %.0f s, sigma %.3f, acceptance %.3f, per accepted %.0f s; %d layouts enumerated'
           % (fmt(BASE), base['force'], base['wall'], base['sigma'], base['acc'], base['per_acc'], len(rows)))
-    print('model: wall = force + %.0f s; sigma_light %.2f (%.2f with spike) x (6/N)^4, sigma_tail %.2f x (24/N)^4,'
+    print('model: wall = %.2f x force; sigma_light %.2f (%.2f with spike) x (6/N)^4, sigma_tail %.2f x (24/N)^4,'
           ' residual %.3f; gauge shift %.4f x (48/N)^4; strange < 12 untested (residual kept, optimistic);'
           ' ranked by the mean of the two per-accepted costs'
-          % (NONFORCE, LIGHT_SIGMA_6, LIGHT_SIGMA_6_SPIKE, TAIL_SIGMA_24, RESIDUAL, GAUGE_SHIFT_48))
+          % (WALL_FACTOR, LIGHT_SIGMA_6, LIGHT_SIGMA_6_SPIKE, TAIL_SIGMA_24, RESIDUAL, GAUGE_SHIFT_48))
     print()
     print('| rank | layout L/S/T/G | levels | force s | vs base | wall s | gauge shift | σ tail | σ light (spike) | accept. (spike) | per accepted vs base (spike) | strange |')
     print('|---|---|---|---|---|---|---|---|---|---|---|---|')
