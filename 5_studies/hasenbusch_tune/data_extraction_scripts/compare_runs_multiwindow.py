@@ -359,7 +359,7 @@ def write_csv(runs, out, start=2000):
     import csv
     cols_hdr = ["run", "traj", "traj_abs", "accepted", "cold", "resume", "dH", "exp_dH",
                 "plaquette", "plaquette_smeared", "poly_re", "poly_im",
-                "wall_s", "sigma_force_s", "limiter_kick"]
+                "wall_s", "sigma_force_s", "limiter_kick", "cycle_s"]  # cycle_s: full trajectory, added 2026-10-27
     n = 0
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh)
@@ -375,7 +375,8 @@ def write_csv(runs, out, start=2000):
                     f"{t['dH']:.6f}", f"{t.get('exp', float('nan')):.6f}",
                     f"{pl[0]:.8f}", f"{pl[-1]:.8f}",
                     f"{t['poly'][0]:.6f}", f"{t['poly'][1]:.6f}",
-                    f"{r.wall(i):.1f}", f"{r.sigma_force(i):.1f}", f"{r.limiter(i):.4f}"])
+                    f"{r.wall(i):.1f}", f"{r.sigma_force(i):.1f}", f"{r.limiter(i):.4f}",
+                    f"{r.cycle(i):.1f}" if r.cycle(i) is not None else ""])
                 n += 1
     sys.stderr.write(f"wrote {out}  ({n} rows)\n")
 
