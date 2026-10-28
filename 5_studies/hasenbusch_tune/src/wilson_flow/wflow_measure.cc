@@ -18,8 +18,11 @@
 //   WF_EPS      flow step (default 0.01)
 //   WF_TMAX     flow time to reach (default 8.0)
 //   WF_MEAS     measure every WF_MEAS steps (default 1)
+//   WF_STOUT_RHO  stout rho for the smeared plaquette, one step, all directions (default 0.125,
+//               the HMC driver's fermion smearing; added 2026-10-28)
 // Output (boss rank, after Grid's log prefix):
 //   WFLOW <cfg> plaq0 <thin plaquette>
+//   WFLOW <cfg> plaq0_smeared <stout-smeared plaquette, = Grid's second "Plaquette:" log line>
 //   WFLOW <cfg> flow <step> <t> <t^2 E clover> <t^2 E plaquette>
 //   WFLOW <cfg> topq <Q clover> t <tmax>
 //   WFLOW <cfg> seconds <read + flow wall time>
@@ -91,6 +94,7 @@ int main(int argc, char **argv)
   const double eps = env_double("WF_EPS", 0.01);
   const double tmax = env_double("WF_TMAX", 8.0);
   const int meas = env_int("WF_MEAS", 1);
+  const double stout_rho = env_double("WF_STOUT_RHO", 0.125);
   const int nstep = int(std::lround(tmax / eps));
   GRID_ASSERT(eps > 0.0 && nstep > 0 && meas > 0);
 
@@ -107,6 +111,13 @@ int main(int argc, char **argv)
     read_config(cfg, U);
     std::cout << GridLogMessage << "WFLOW " << cfg << " plaq0 "
               << WilsonLoops<PeriodicGimplR>::avgPlaquette(U) << std::endl;
+    // Stout-smeared plaquette, one step at WF_STOUT_RHO in all directions: the HMC driver's
+    // fermion smearing (params.h STOUT_RHO 0.125, STOUT_NSMEAR 1) and Grid's second
+    // "Plaquette:" line. V is free until the flow overwrites it.
+    Smear_Stout<PeriodicGimplR> stout(stout_rho);
+    stout.smear(V, U);
+    std::cout << GridLogMessage << "WFLOW " << cfg << " plaq0_smeared "
+              << WilsonLoops<PeriodicGimplR>::avgPlaquette(V) << std::endl;
 
     WilsonFlow<PeriodicGimplR> WF(eps, nstep, meas);
     WF.resetActions();

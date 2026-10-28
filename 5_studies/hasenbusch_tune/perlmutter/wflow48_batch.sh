@@ -15,6 +15,8 @@
 # Usage (one line; --nodes = number of lists, --time mandatory):
 #   env RUN=<name> WF_LISTDIR=<dir with list_0.txt ... list_<N-1>.txt> sbatch --nodes=<N>
 #     --time=<hh:mm:ss> -J <name> --export=ALL wflow48_batch.sh
+# or in an existing interactive allocation of N nodes, from the login node:
+#   env SLURM_JOB_ID=<id> RUN=<name> WF_LISTDIR=<dir> bash wflow48_batch.sh
 # Env: WF_EPS (0.02), WF_TMAX (4.2), WF_MEAS (2): the settings validated on cfg_2000 on 10-26
 #   (identical t0, w0 to step 0.01); BIN (default bin/wflow_measure).
 # Output: runs/<YYYY_M_D>_<RUN>/flow_<i>.log per node (+ list_<i>.txt copied), never overwrites;
@@ -40,7 +42,11 @@ source "$WORKFLOW/machines/perlmutter.sh"
 unset SLURM_GPUS_PER_NODE
 export MPICH_GPU_IPC_ENABLED=0 MPICH_RDMA_ENABLED_CUDA=0 MPICH_OFI_NIC_POLICY=GPU
 
-mapfile -t NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+# Inside sbatch Slurm sets the node list; driving an interactive allocation from the login node
+# (SLURM_JOB_ID=<id> bash wflow48_batch.sh) it does not, so ask squeue for it.
+NODELIST=${SLURM_JOB_NODELIST:-$(squeue -h -j "$SLURM_JOB_ID" -o %N)}
+[ -n "$NODELIST" ] || die "cannot find the node list of job $SLURM_JOB_ID"
+mapfile -t NODES < <(scontrol show hostnames "$NODELIST")
 NLIST=$(ls "$WF_LISTDIR"/list_*.txt 2>/dev/null | wc -l)
 [ "$NLIST" -ge 1 ] || die "no list_*.txt in $WF_LISTDIR"
 [ "$NLIST" -le "${#NODES[@]}" ] || die "$NLIST lists but only ${#NODES[@]} nodes"
