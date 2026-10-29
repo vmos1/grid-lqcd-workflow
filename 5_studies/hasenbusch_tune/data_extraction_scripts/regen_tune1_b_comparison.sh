@@ -16,6 +16,7 @@
 #   grid_summary.md, chroma_summary.md   candidate_tables.py, the doc's summary tables
 #   __docs/figs/2026_10_27_tune1_b_{grid,chroma}_2x2.png   the figures (repo uv env: matplotlib)
 #   __docs/figs/2026_10_29_tune1_wflow_scales.png, wflow_scales.md   Wilson-flow scales per stream
+#   __docs/figs/2026_10_29_tune1_force_by_monomial.png, force_by_monomial.md   force per monomial
 #
 # Usage:  regen_tune1_b_comparison.sh [outdir]
 
@@ -93,6 +94,16 @@ uv run --project "$BASE/grid-lqcd-workflow" python "$S/plot_candidates_2x2.py" "
   --display "baseline chain 1=baseline, chain 1 (seed 300);baseline chain 2=baseline, chain 2 (seed 301);B1_t48=B1_t48 (tail −0.0300);B2_t48=B2_t48 (tail +0.1000);B2_t24=B2_t24 (tail +0.1000, at 24 steps)" \
   --band "$PBAND" \
   --title "Chroma, 48³×96: baseline vs B candidates, from cfg_2000 (τ0 1.414)"
+
+# ---- force per monomial, average and peak over the trajectories (§4, added 2026-10-29) ----
+# B2_t48's 2026_10_21_B2_md12_s300_r3 segment holds only the aborted 2009 (§6); the script drops it.
+B2_FORCE=$R/2026_10_19_B2_md12_s300/hmc.log,$R/2026_10_20_B2_md12_s300_r1/hmc.log,$R/2026_10_20_B2_md12_s300_r2/hmc.log,$R/2026_10_21_B2_md12_s300_r3/hmc.log,$R/2026_10_24_B2_md12_s302_from2008/hmc.log
+[ -n "$B2_EXT" ] && [ -f "$B2_EXT/hmc.log" ] && B2_FORCE=$B2_FORCE,$B2_EXT/hmc.log
+uv run --project "$BASE/grid-lqcd-workflow" python "$S/plot_force_by_monomial.py" \
+  "$FIGS/2026_10_29_tune1_force_by_monomial.png" \
+  --run "baseline=$BASELINE" --run "B1_t48=$B1" --run "B2_t48=$B2_FORCE" --run "B2_t24=$B2T24" \
+  --title "Grid: force per monomial, baseline vs B candidates (20 trajectories each)" \
+  > "$OUT/force_by_monomial.md"
 
 # ---- Wilson-flow scales per stream against the production ensemble (§5, added 2026-10-29) ----
 W=$R/2026_10_28_wflow
