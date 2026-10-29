@@ -69,14 +69,14 @@ python3 "$S/candidate_tables.py" "$OUT/chroma.csv" --ref "baseline both chains" 
   --order "baseline chain 1,baseline chain 2,baseline both chains,B1_t48,B2_t48,B2_t24" > "$OUT/chroma_summary.md"
 
 # ---- figures (matplotlib from the repo's uv environment) ----
-# Band in B and D: the production ensemble's plaquette, mean ± one configuration's sd over the 9
+# Band in panel B: the production ensemble's plaquette, mean ± one configuration's sd over the 9
 # independent configurations of runs/2026_10_28_wflow_production_set (plaq0 lines, 2026-10-29).
-# D's running mean starts at 2005, past the relaxation from cfg_2000 (plaquette 0.543508).
+# Three panels (time, plaquette, dH); the running-mean panel D was dropped 2026-10-29.
 PBAND="0.5434195,0.0000297,production: mean ± 1 sd (9 configurations)"
 DISP="baseline=baseline (tail −0.1870, 12/48);B1_t48=B1_t48 (tail −0.0300, 12/48);B2_t48=B2_t48 (tail +0.1000, 12/48);B2_t24=B2_t24 (tail +0.1000, 12/24/48)"
 uv run --project "$BASE/grid-lqcd-workflow" python "$S/plot_candidates_2x2.py" "$OUT/grid.csv" \
   "$FIGS/2026_10_27_tune1_b_grid_2x2.png" --order "baseline,B1_t48,B2_t48,B2_t24" --display "$DISP" \
-  --band "$PBAND" --mean-from 2005 \
+  --band "$PBAND" \
   --title "Grid, 48³×96: baseline vs B candidates, from cfg_2000 (TRAJL 1.0)"
 # Chroma: chain 1 takes the baseline's slot (blue); chain 2 the fifth (pink); the B runs keep theirs.
 python3 - "$OUT/chroma.csv" "$OUT/chroma_plot.csv" <<'EOF'
@@ -91,7 +91,7 @@ uv run --project "$BASE/grid-lqcd-workflow" python "$S/plot_candidates_2x2.py" "
   "$FIGS/2026_10_27_tune1_b_chroma_2x2.png" \
   --order "baseline chain 1,B1_t48,B2_t48,B2_t24,baseline chain 2" \
   --display "baseline chain 1=baseline, chain 1 (seed 300);baseline chain 2=baseline, chain 2 (seed 301);B1_t48=B1_t48 (tail −0.0300);B2_t48=B2_t48 (tail +0.1000);B2_t24=B2_t24 (tail +0.1000, at 24 steps)" \
-  --band "$PBAND" --mean-from 2005 \
+  --band "$PBAND" \
   --title "Chroma, 48³×96: baseline vs B candidates, from cfg_2000 (τ0 1.414)"
 
 # ---- Wilson-flow scales per stream against the production ensemble (§5, added 2026-10-29) ----

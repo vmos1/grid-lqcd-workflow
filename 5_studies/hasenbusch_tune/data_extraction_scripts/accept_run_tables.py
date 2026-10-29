@@ -55,8 +55,10 @@ import re, sys, os
 from collections import OrderedDict
 
 TS_UPDP = re.compile(r"Integrator : ([0-9.]+) s :\s*update_P : Level \[(\d)\]\[(\d)\] (.*?)(?: \[QUDA| dt |$)")
-FDTMAX  = re.compile(r"\[(\d)\]\[(\d)\] Fdt max\s*:\s*([0-9.eE+-]+)")
-FDTAVG  = re.compile(r"\[(\d)\]\[(\d)\] Fdt average\s*:\s*([0-9.eE+-]+)")
+# Pure-Grid logs from 2026-10 tag smeared fermion monomials "Fdt max (raw, pre-pullback): ...";
+# before the optional (...) was allowed (2026-10-29) every such kick parsed as 0 (L195).
+FDTMAX  = re.compile(r"\[(\d)\]\[(\d)\] Fdt max\s*(?:\([^)]*\))?\s*:\s*([0-9.eE+-]+)")
+FDTAVG  = re.compile(r"\[(\d)\]\[(\d)\] Fdt average\s*(?:\([^)]*\))?\s*:\s*([0-9.eE+-]+)")
 HBEF    = re.compile(r"Total H before trajectory")
 HAFT    = re.compile(r"Total H after trajectory\s*=\s*[0-9.eE+-]+\s+dH = ([0-9.eE+-]+)")
 TTOT    = re.compile(r"Total time for trajectory \(s\):\s*([0-9.eE+-]+)")

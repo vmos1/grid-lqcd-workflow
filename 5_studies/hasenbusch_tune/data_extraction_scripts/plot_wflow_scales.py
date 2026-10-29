@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Wilson-flow scales per stream against the production ensemble (tune1-perturbations, 2026-10-29):
 one figure, two panels (t0/a², w0/a), one row per stream. Small markers are single configurations,
-the large marker with its bar is the stream mean ± standard error (sd/√n); the grey band is the
-production mean ± one configuration's spread (sd over the production configurations).
+the large marker with its bar is the stream mean ± standard error (sd/√n); the light grey band is the
+production mean ± one configuration's spread (sd over the production configurations), the darker
+inner band ± sd/√4, the spread expected for a mean of 4 independent configurations (a stream's size;
+a stream's configurations come from one short chain and are not fully independent, so its mean
+belongs somewhere between the two bands).
 
 Reads wflow_measure's output (`WFLOW <cfg> flow <step> <t> <t2E_clover> <t2E_plaq>` lines). t0 and w0
 as in runs/2026_10_26_wflow_driver/wflow_streams.py: clover t²E = 0.3 and t d/dt t²E = 0.3, linear
@@ -28,6 +31,8 @@ from matplotlib.patches import Patch  # noqa: E402
 
 GREY = "#8c8c8c"
 BAND = "#e6e6e6"
+BAND_IN = "#cfcfcf"
+N_STREAM = 4  # configurations per tune 1 stream: the inner band is sd/sqrt(N_STREAM)
 SLOT = {"baseline": ("#0072B2", "o"), "B1_t48": ("#E69F00", "s"), "B2_t48": ("#009E73", "^"),
         "B2_t24": ("#D55E00", "D"), "chain 2": ("#CC79A7", "v")}
 ENS = "cl21_48_96_b6p3_m0p2416_m0p2050"
@@ -98,8 +103,8 @@ def main(out_png, logs):
         prev = g
 
     prod = [tw for r in ROW if r[0] == "production" for tw in rows[r[1]]]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 6.4), sharey=True)
-    fig.subplots_adjust(top=0.80, bottom=0.10, left=0.20, right=0.98, wspace=0.08)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 6.8), sharey=True)
+    fig.subplots_adjust(top=0.76, bottom=0.09, left=0.20, right=0.98, wspace=0.08)
     print("| row | n | t0/a² | w0/a |")
     print("|---|---|---|---|")
     for k, (ax, name) in enumerate(zip(axes, ("t0/a²", "w0/a"))):
@@ -107,6 +112,9 @@ def main(out_png, logs):
             pv = [tw[k] for tw in prod]
             m, sd = st.mean(pv), st.stdev(pv)
             ax.axvspan(m - sd, m + sd, color=BAND, zorder=0, lw=0)
+            # inner band: the spread of a mean of N_STREAM independent configurations
+            ax.axvspan(m - sd / math.sqrt(N_STREAM), m + sd / math.sqrt(N_STREAM), color=BAND_IN,
+                       zorder=0, lw=0)
             ax.axvline(m, color=P.MUTED, ls="--", lw=0.9, zorder=1)
         for g, lab, _, c, mk, filled in ROW:
             v = [tw[k] for tw in rows[lab]]
@@ -152,14 +160,16 @@ def main(out_png, logs):
         Line2D([0], [0], marker="o", ms=4.5, color=GREY, ls="none", alpha=0.75,
                label="single configuration"),
         Patch(facecolor=BAND, edgecolor="none",
-              label="production: mean (dashed) ± one configuration's spread, %d configurations"
-              % len(prod)),
+              label="production: mean (dashed) ± sd of single configurations (%d)" % len(prod)),
+        Patch(facecolor=BAND_IN, edgecolor="none",
+              label="± sd/√%d: expected spread of a mean of %d independent configurations"
+              % (N_STREAM, N_STREAM)),
         Line2D([0], [0], marker="o", ms=8, color=GREY, mfc="white", mew=1.6, ls="none",
                label="open marker = Chroma, filled = Grid"),
     ]
     fig.text(0.01, 0.98, "Wilson-flow scales: tune 1 streams against the production ensemble "
              "(48³×96, clover E)", fontsize=13, color=P.INK, ha="left", va="top")
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.55, 0.935), frameon=False,
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.55, 0.94), frameon=False,
                fontsize=9, ncol=2)
     fig.savefig(out_png, dpi=200, facecolor="white")
     print("wrote %s" % out_png)

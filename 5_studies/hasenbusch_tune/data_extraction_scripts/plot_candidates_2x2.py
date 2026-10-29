@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""2x2 per-trajectory figure for a candidate-vs-baseline comparison (tune1-perturbations, 2026-10-27),
-from the CSV of `compare_runs_multiwindow.py --csv` (Grid) or `chroma_runs_csv.py` (Chroma):
+"""Per-trajectory figure for a candidate-vs-baseline comparison (tune1-perturbations, 2026-10-27),
+from the CSV of `compare_runs_multiwindow.py --csv` (Grid) or `chroma_runs_csv.py` (Chroma). Three
+panels in a row (the name is historical: a 2x2 until 2026-10-29):
 
   (A) time per trajectory (full trajectory, cycle_s)   (B) plaquette (unsmeared)
-  (C) dH (open marker = rejected)                       (D) running mean of the plaquette
+  (C) dH (open marker = rejected)
 
 Uses `plot_accept_runs.py`'s helpers (style map, panel drawing, accept/reject fill, axis styling)
 unchanged, so colours, marker shapes and conventions match every other figure in __docs/figs/.
-Panel D replaces that module's max-kick panel: the fermion kicks are not in today's logs, and the
-running mean shows directly whether the chains settle to a common plaquette.
+That module's fourth panel, the max kick, is left out: in these runs the per-trajectory maximum is
+the gauge or the strange force (~0.30) in every candidate, so it does not separate them. A running
+mean of the plaquette (the 10-27 panel D) was dropped 10-29: it only restates B.
 
---band MEAN,SD,LABEL shades a reference value (mean ± sd) in B and D, e.g. the production ensemble's
-plaquette. --mean-from N starts D's running mean at trajectory N, past the relaxation from the start
-configuration (a running mean from the first trajectory carries the start's offset for the whole
-chain, falling as 1/n, which reads as a drift).
+--band MEAN,SD,LABEL shades a reference value (mean ± sd) in B, e.g. the production ensemble's
+plaquette.
 
 Colour follows the run, given in fixed order by --order (Okabe-Ito slots, validated CVD-safe; each
 run also has its own marker shape, so identity never rests on colour alone). Pass the same labels in
@@ -21,7 +21,7 @@ the same slots for the Grid and the Chroma figure so an entity keeps its colour 
 
 Usage:
   plot_candidates_2x2.py <in.csv> <out.png> --order 'L1,L2,...' [--title '...'] [--display 'L1=text;L2=text']
-                         [--band 'MEAN,SD,LABEL'] [--mean-from N]
+                         [--band 'MEAN,SD,LABEL']
 """
 import os
 import sys
@@ -45,7 +45,7 @@ def _band(ax, band):
 
 def main(argv):
     csv_path, out_png = argv[0], argv[1]
-    order, title, display, band, mean_from = None, "", {}, None, None
+    order, title, display, band = None, "", {}, None
     i = 2
     while i < len(argv):
         if argv[i] == "--order":
@@ -57,8 +57,6 @@ def main(argv):
         elif argv[i] == "--band":
             m, sd, lab = argv[i + 1].split(",", 2)
             band = (float(m), float(sd), lab)
-        elif argv[i] == "--mean-from":
-            mean_from = int(argv[i + 1])
         i += 2
     df = pd.read_csv(csv_path)
     runs = order or list(dict.fromkeys(df["run"]))
@@ -69,10 +67,9 @@ def main(argv):
 
     ncol = len(runs) if len(runs) <= 3 else 3
     legend_rows = -(-(len(runs) + (1 if band else 0)) // ncol)
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8.6))
-    fig.subplots_adjust(top=0.85 - 0.035 * (legend_rows - 1), bottom=0.08,
-                        left=0.08, right=0.97, hspace=0.5, wspace=0.28)
-    (axA, axB), (axC, axD) = axes
+    fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(15, 5.4))
+    fig.subplots_adjust(top=0.80 - 0.045 * (legend_rows - 1), bottom=0.15,
+                        left=0.06, right=0.985, wspace=0.3)
 
     # (A) full-trajectory time; cold start and checkpoint resumes ringed (excluded from the means)
     P._panel(axA, df, sty, "cycle_s", lambda g: g["cycle_s"],
@@ -98,28 +95,18 @@ def main(argv):
     axC.set_ylim(lo - 0.15 * (hi - lo), hi + 0.15 * (hi - lo))
     P._finish(axC, "(C) ΔH  (open marker = rejected)", "ΔH")
 
-    # (D) running mean of the plaquette along each chain, from --mean-from on
-    dD = df if mean_from is None else df[df["traj_abs"] >= mean_from]
-    d0 = int(dD["traj_abs"].min())
-    P._panel(axD, dD, sty, "plaquette", lambda g: g["plaquette"].expanding().mean(),
-             "(D) Running mean of the plaquette" + ("" if mean_from is None else " from %d" % d0),
-             "mean plaquette, trajectories %d…n" % d0)
-    axD.ticklabel_format(useOffset=False, axis="y")
-    _band(axD, band)
-
     xs = sorted(df["traj_abs"].unique())
-    for ax in (axA, axB, axC, axD):
+    for ax in (axA, axB, axC):
         ax.set_xticks(xs[::2])
         ax.tick_params(axis="x", rotation=45)
         ax.set_xlabel("trajectory (from cfg_2000)", fontsize=9, color=P.MUTED)
-    axD.set_xlim(axB.get_xlim())  # same x range in every panel, D just starts later
 
     handles = [Line2D([0], [0], color=sty[r][0], marker=sty[r][1], lw=1.8, ms=7,
                       markeredgecolor="white", label=display.get(r, r)) for r in runs]
     if band:
         handles.append(Patch(facecolor=BAND, edgecolor="none", label=band[2]))
     fig.text(0.01, 0.98, title, fontsize=13, color=P.INK, ha="left", va="top")
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.945), frameon=False,
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.925), frameon=False,
                fontsize=10, ncol=ncol)
     fig.savefig(out_png, dpi=200, facecolor="white")
     print("wrote %s" % out_png)
