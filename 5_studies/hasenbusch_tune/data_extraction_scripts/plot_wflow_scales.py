@@ -14,6 +14,10 @@ interpolation, central differences. A configuration flowed in more than one log 
 Colour follows the run as in plot_candidates_2x2.py (Okabe-Ito slots); Grid filled, Chroma open;
 production and cfg_2000 in grey. Rows are named on the axis, so identity never rests on colour.
 
+On stdout, two markdown tables: the per-stream means (t0, w0) and, from 2026-10-30, the production
+configurations one by one with their plaquettes, mean and spread, in the doc's §5 format (for
+check_doc_tables.py).
+
 Usage:
   plot_wflow_scales.py <out.png> <flow log> [<flow log> ...]
 """
@@ -51,6 +55,57 @@ ROWS = [
     ("Chroma", "Chroma B2_t24", "chroma_baseg_mds12_b2t24_20_s300_cfg", *SLOT["B2_t24"], False),
 ]
 pat_flow = re.compile(r"WFLOW (\S+) flow (\d+) (\S+) (\S+) (\S+)")
+pat_plaq = re.compile(r"WFLOW (\S+) (plaq0|plaq0_smeared) (\S+)")
+pat_prod = re.compile(r"-(djm-\d)_cfg_(\d+)\.lime")
+
+
+def plaquettes(logs):
+    """{cfg path: {"plaq0": x, "plaq0_smeared": y}} from the flow program's own lines."""
+    out = {}
+    for log in logs:
+        for line in open(log, errors="replace"):
+            m = pat_plaq.search(line)
+            if m:
+                out.setdefault(m.group(1), {}).setdefault(m.group(2), float(m.group(3)))
+    return out
+
+
+def sci1(x):
+    """3.0e-5 -> '3 ×10⁻⁵' (one significant digit), as the doc prints a plaquette spread."""
+    e = int(math.floor(math.log10(abs(x))))
+    d = int(round(x / 10 ** e))
+    if d == 10:
+        d, e = 1, e + 1
+    sup = str(e).translate(str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"))
+    return "%d ×10%s" % (d, sup)
+
+
+def production_table(vals, plaq):
+    """The doc's §5 production table: one row per configuration, the mean of all with its
+    standard error (one digit, as candidate_tables.one_digit), and one configuration's sd."""
+    from candidate_tables import one_digit
+    prod = []
+    for cfg, (t0, w0) in vals.items():
+        m = pat_prod.search(cfg)
+        if m and "cfgs48/" in cfg and cfg in plaq:
+            prod.append(((m.group(1), int(m.group(2))), plaq[cfg]["plaq0"],
+                         plaq[cfg]["plaq0_smeared"], t0, w0))
+    if not prod:
+        return
+    prod.sort()
+    print()
+    print("| production configuration | thin plaquette | smeared plaquette | t0/a² | w0/a |")
+    print("|---|---|---|---|---|")
+    for (s, n), p, ps, t0, w0 in prod:
+        print("| %s %d | %.6f | %.6f | %.4f | %.4f |" % (s, n, p, ps, t0, w0))
+    cols = [[r[k] for r in prod] for k in range(1, 5)]
+    n = len(prod)
+    print("| **mean of %d** | %s |" % (n, " | ".join(
+        "**%s**" % one_digit(st.mean(c), st.stdev(c) / math.sqrt(n)) for c in cols)))
+    sd = [st.stdev(c) for c in cols]
+    print("| spread, one configuration (sd) | %s | %s | %.3f (%.1f%%) | %.3f (%.1f%%) |" % (
+        sci1(sd[0]), sci1(sd[1]), sd[2], 100 * sd[2] / st.mean(cols[2]),
+        sd[3], 100 * sd[3] / st.mean(cols[3])))
 
 
 def crossing(ts, ys, target):
@@ -105,8 +160,8 @@ def main(out_png, logs):
     prod = [tw for r in ROW if r[0] == "production" for tw in rows[r[1]]]
     fig, axes = plt.subplots(1, 2, figsize=(11, 6.8), sharey=True)
     fig.subplots_adjust(top=0.76, bottom=0.09, left=0.20, right=0.98, wspace=0.08)
-    print("| row | n | t0/a² | w0/a |")
-    print("|---|---|---|---|")
+    print("| code | stream | configurations | t0/a² | w0/a |")
+    print("|---|---|---|---|---|")
     for k, (ax, name) in enumerate(zip(axes, ("t0/a²", "w0/a"))):
         if prod:
             pv = [tw[k] for tw in prod]
@@ -136,7 +191,8 @@ def main(out_png, logs):
                 w0s = [tw[1] for tw in rows[lab]]
                 cell = (lambda x: "%.4f ± %.4f" % (st.mean(x), st.stdev(x) / math.sqrt(len(x)))
                         if len(x) > 1 else "%.4f" % x[0])
-                print("| %s | %d | %s | %s |" % (lab, len(v), cell(t0s), cell(w0s)))
+                stream = lab[len(g):].strip(" :") if lab.startswith(g) else lab
+                print("| %s | %s | %d | %s | %s |" % (g, stream, len(v), cell(t0s), cell(w0s)))
         for s in seps:
             ax.axhline(s, color=P.GRID, lw=0.8, zorder=1)
         ax.set_title("(%s) %s" % ("AB"[k], "t0/a²  (t²E = 0.3)" if k == 0 else
@@ -172,7 +228,8 @@ def main(out_png, logs):
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.55, 0.94), frameon=False,
                fontsize=9, ncol=2)
     fig.savefig(out_png, dpi=200, facecolor="white")
-    print("wrote %s" % out_png)
+    production_table(vals, plaquettes(logs))
+    print("wrote %s" % out_png, file=sys.stderr)
 
 
 if __name__ == "__main__":

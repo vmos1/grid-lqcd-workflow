@@ -131,23 +131,25 @@ def parse(path):
                 fix.feed(mraw.group(1))
             if hb or cur is None:
                 continue
-            ms = SMEAR.search(line)
+            in_md = "t1" not in cur  # timed pieces count only inside the MD window (review 10-30:
+            # the "Smearing in" line after "Total H after" had been counted, ~0.45 s per trajectory)
+            ms = SMEAR.search(line) if in_md else None
             if ms:
                 cur["smear_pending"] += float(ms.group(1)) / 1000.0
                 cur["smear_tot"] += float(ms.group(1)) / 1000.0
                 continue
-            me_ = ELAPSED.search(line)
+            me_ = ELAPSED.search(line) if in_md else None
             if me_:
                 k = (me_.group(1), me_.group(2))
                 cur["elp"][k] = cur["elp"].get(k, 0.0) + float(me_.group(3)) / 1000.0
                 cur["nelp"] += 1
                 continue
-            mb = BATCHED.search(line)
+            mb = BATCHED.search(line) if in_md else None
             if mb:
                 lv = mb.group(1)
                 cur["pb"][lv] = cur["pb"].get(lv, 0.0) + float(mb.group(2)) / 1000.0
                 continue
-            mu = TS_UPDP.search(line)
+            mu = TS_UPDP.search(line) if in_md else None
             if mu:
                 k = (mu.group(2), mu.group(3))
                 cur["evs"].append((float(mu.group(1)), k, cur["smear_pending"]))
@@ -156,6 +158,8 @@ def parse(path):
                 names.setdefault(k, mu.group(4).strip())
                 if "smeared" in line:
                     smeared.add(k)
+                if "pullback batched" in line:
+                    cur.setdefault("pb_needed", set()).add(k[0])
             mf = FDTMAX.search(line)
             if mf:
                 k = (mf.group(1), mf.group(2)); v = float(mf.group(3))
@@ -229,6 +233,13 @@ def buckets(tr):
     it credits each gap between update_P prints to the monomial that printed next, so time spent
     after a monomial lands on its successor and the split depends on the level layout (L199)."""
     t = {}
+    tag = "trajectory with H before at %.1f s" % tr["t0"]
+    missing_pb = sorted(tr.get("pb_needed", set()) - set(tr["pb"]))
+    if missing_pb and id(tr) not in _WARNED:
+        # a batched-pullback level printed no pullback line: its time would land in `other`
+        print("accept_run_tables: WARNING %s: no batched pullback line for level(s) %s" % (
+            tag, ",".join(missing_pb)), file=sys.stderr)
+        _WARNED.append(id(tr))
     if tr["nupd"] and tr["nelp"] == tr["nupd"]:
         for k, s in tr["elp"].items():
             t[k] = s
@@ -237,11 +248,13 @@ def buckets(tr):
             t[k] = t.get(k, 0.0) + s
         t[SMEARKEY] = tr["smear_tot"]
     else:
-        if not _WARNED:
-            print("accept_run_tables: no per-call timers in this log (%d update_P, %d elapsed "
-                  "lines); falling back to the gap split, which depends on the level layout "
-                  "(L199)" % (tr["nupd"], tr["nelp"]), file=sys.stderr)
-            _WARNED.append(1)
+        # warned for every such trajectory: a log that has the timers elsewhere is damaged here,
+        # and a warm mean would blend the two methods (review 10-30)
+        if id(tr) not in _WARNED:
+            print("accept_run_tables: WARNING %s: %d update_P but %d per-call timer lines; "
+                  "this trajectory falls back to the gap split, which depends on the level layout "
+                  "(L199)" % (tag, tr["nupd"], tr["nelp"]), file=sys.stderr)
+            _WARNED.append(id(tr))
         prev = tr["t0"]
         for (ts, k, smear_s) in tr["evs"]:
             t[k] = t.get(k, 0.0) + (ts - prev - smear_s)

@@ -17,6 +17,9 @@
 #   __docs/figs/2026_10_27_tune1_b_{grid,chroma}_2x2.png   the figures (repo uv env: matplotlib)
 #   __docs/figs/2026_10_29_tune1_wflow_scales.png, wflow_scales.md   Wilson-flow scales per stream
 #   __docs/figs/2026_10_29_tune1_force_by_monomial.png, force_by_monomial.md   force per monomial
+#   piece_time.md, t24_table.md     §4 time by piece and the T24 control (piece_time_table.py)
+#   doc_check.txt                   check_doc_tables.py: the doc's tables against all of the above;
+#                                   the script exits non-zero if any doc cell differs
 #
 # Usage:  regen_tune1_b_comparison.sh [outdir]
 
@@ -113,5 +116,20 @@ uv run --project "$BASE/grid-lqcd-workflow" python "$S/plot_wflow_scales.py" \
   "$FIGS/2026_10_29_tune1_wflow_scales.png" \
   "${W}_tune1_set"/flow_[0-3].log "${W}_b2t48_extra"/flow_[01].log "${W}_production_set"/flow_[0-3].log \
   "$R/2026_10_26_wflow_validate_cheap_t42/test.log" > "$OUT/wflow_scales.md"
+
+# ---- §4 time by piece and the T24 control, in the doc's format (added 2026-10-30) ----
+T24=$R/2026_10_20_T24_baseG_s300/hmc.log,$R/2026_10_27_T24_baseG_s300_r1/hmc.log
+python3 "$S/piece_time_table.py" --pieces \
+  --run "baseline=$BASELINE" --run "B1_t48=$B1" --run "B2_t48=$B2" --run "B2_t24=$B2T24" \
+  > "$OUT/piece_time.md"
+python3 "$S/piece_time_table.py" --dh --run "baseline=$BASELINE" --run "B2_t24=$B2T24" --run "T24=$T24" \
+  > "$OUT/t24_table.md"
+
+# ---- the doc against these outputs, cell by cell (added 2026-10-30): fails the regen on any
+# mismatch, so a table pasted into the doc cannot drift from the logs ----
+python3 "$S/check_doc_tables.py" "$BASE/__docs/2026_10_27_tune1_b_candidates_vs_baseline.md" \
+  "2=$OUT/grid_summary.md" "3=$OUT/chroma_summary.md" "4=$OUT/piece_time.md" \
+  "4=$OUT/force_by_monomial.md" "4=$OUT/t24_table.md" "5=$OUT/wflow_scales.md" \
+  | tee "$OUT/doc_check.txt"
 
 echo "outputs in $OUT, $FIGS/2026_10_27_tune1_b_*_2x2.png and $FIGS/2026_10_29_tune1_wflow_scales.png"
