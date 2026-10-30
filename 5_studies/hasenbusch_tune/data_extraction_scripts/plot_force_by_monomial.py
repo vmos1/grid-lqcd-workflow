@@ -2,7 +2,7 @@
 """Force per monomial, candidates vs baseline (tune1-perturbations, 2026-10-29), from Grid hmc.log.
 
 Per trajectory and monomial, from the integrator's per-step lines:
-  average force = mean over the MD steps of "Force average" (site-averaged |F|)
+  average force = mean over the MD steps of "Force average" (|F| RMS over sites, sqrt(Σ|F|²/V): L089)
   peak force    = max over the MD steps of "Force max" (largest single-site |F|)
 Then over the completed trajectories of each run: mean ± standard error (sd/√n), and the largest
 single-trajectory peak. Raw forces, before the stout pullback for the smeared fermion monomials;
@@ -153,7 +153,7 @@ def main(argv):
                      mec="white", mew=0.8, elinewidth=1.3, capsize=2.5, zorder=3)
         axB.plot(xs, [s[r][4] for r in rr], marker=mk, ms=6, ls="none", mfc="white", mec=c, mew=1.3,
                  zorder=2)
-    for ax, ttl, yl in ((axA, "(A) Average force: site-averaged |F|, mean over the MD steps",
+    for ax, ttl, yl in ((axA, "(A) Average force: |F| RMS over sites, mean over the MD steps",
                          "average |F|"),
                         (axB, "(B) Peak force (largest single-site |F| in a trajectory): mean and "
                               "max over the trajectories", "peak |F|")):
