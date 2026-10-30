@@ -27,7 +27,8 @@ driver format; it does not touch the notebook-facing code.
 |---|---|
 | `hmc_log_parser.py` | single-log parser — importable (`parse_log`) **and** a CLI |
 | `extract_forces_run.py` | 6-run grid-vs-quda comparator → Table 3 / 3b Markdown |
-| `integrator_time_split.py` | paired grid-vs-quda per-sector MD time split, averaged over steady trajectories — one table per driver's known level layout (hardcoded per code) |
+| `integrator_time_split.py` | paired grid-vs-quda per-sector MD time split, averaged over steady trajectories — one table per driver's known level layout (hardcoded per code). Gap split, layout-dependent (L199): June–July logs only |
+| `grid_log_time.py` | corrects Grid's misprinted log timestamps (fraction below 0.1 s padded on the wrong side, L198); `StampFixer` for any time taken from stamps; self-test: run it |
 | `traj_step_tables.py` | single-log, per-MD-step timing + force-max tables (see below) — driver-agnostic, no hardcoded level layout |
 | `forces_only_tables.py` | `FORCES_ONLY`-mode logs (heatbath + one force eval per piece, no MD): per-level force/timing table for one log, candidate-scan comparison tables, and same-seed A/B diff (see below) |
 | `forces_only_ladder_cost.py` | **decision layer on top of the above**: applies a per-rung calibration `k = realFdt/screenedF` to turn screened forces into predicted real `F·dt`, then into the minimum integer MDSTEPS a candidate supports and the resulting trajectory seconds. Also fits `F_PFk ~ gap_k^a` across a candidate set (`--exponents`). Answers "is this candidate worth a trajectory run", which the raw table cannot |
@@ -54,7 +55,7 @@ different question: "did this candidate actually work, and how fast was it".
 
 | file | role |
 |---|---|
-| `accept_run_tables.py` | the log parser for acceptance runs, importable (`parse`, `build_columns`, `buckets`) and a CLI. Per-trajectory physics + force-time split (Table 1) and per-piece `max/avg` `\|F·dt\|` (Table 2). `--csv` writes a tidy CSV |
+| `accept_run_tables.py` | the log parser for acceptance runs, importable (`parse`, `build_columns`, `buckets`) and a CLI. Per-trajectory physics + force-time split (Table 1) and per-piece `max/avg` `\|F·dt\|` (Table 2). `--csv` writes a tidy CSV. Since 2026-10-30 the time split reads Grid's own per-call timers (`P update elapsed`, batched pullback, `Smearing in`, plus `other` = MD wall minus those), not gaps between log lines, which credited each gap to the next monomial to print and so depended on the level layout (L199) |
 | `compare_runs_multiwindow.py` | **N-run cross-comparison**, each run spanning several checkpoint-resumed log windows. Imports the parser above — no parsing is reimplemented. Emits config / summary / efficiency / observable / per-sector tables plus every run's Table 1 + Table 2 |
 | `obs_autocorr_compare.py` | autocorrelation-corrected observable comparison from that CSV: `τ_int` (Madras–Sokal automatic windowing), corrected errors, block errors, and pairwise z-scores vs the first run. `--pooled` adds a second report that averages ρ(t) **across** runs before windowing (see below) |
 | `plot_accept_runs.py` | the 2×2 per-trajectory figure (wall time / plaquette / ΔH / max kick) from the tidy CSV. Writes PNG + PDF |

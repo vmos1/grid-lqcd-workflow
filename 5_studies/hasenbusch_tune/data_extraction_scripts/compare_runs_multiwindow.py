@@ -35,9 +35,12 @@ import sys
 from math import sqrt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from accept_run_tables import parse, build_columns, buckets, SMEARKEY
+from accept_run_tables import parse, build_columns, buckets, has_kick, OTHERKEY
 
-SECT_ORDER = ["s", "ldS", "ldL", "PF0", "PF1", "PF2", "PF3", "PF4", "tail", "gauge", "smear"]
+# pbN = level N's batched pullback when shared by several smeared monomials; other = MD wall minus
+# every timed piece (accept_run_tables docstring, 2026-10-30, L199)
+SECT_ORDER = ["s", "ldS", "ldL", "PF0", "PF1", "PF2", "PF3", "PF4", "tail", "gauge",
+              "pb0", "pb1", "pb2", "smear", "other"]
 
 
 def mean(v):
@@ -105,12 +108,12 @@ class Run:
 
     def sigma_force(self, i):
         b = buckets(self.trajs[i])
-        return sum(b.get(k, 0.0) for k, _ in self.cols)
+        return sum(b.get(k, 0.0) for k, _ in self.cols if k != OTHERKEY)
 
     def limiter(self, i):
         """Largest |F.dt| over every monomial and step of this trajectory."""
         t = self.trajs[i]
-        return max((t["fdt"].get(k, 0.0) for k, h in self.cols if k != SMEARKEY),
+        return max((t["fdt"].get(k, 0.0) for k, h in self.cols if has_kick(k)),
                    default=0.0)
 
     def plaq(self, i):
@@ -139,14 +142,14 @@ class Run:
     def sector_fdt_max(self, h):
         """Largest |F.dt| for this monomial over the WHOLE chain."""
         k = self.key_of.get(h)
-        if k is None or k == SMEARKEY:
+        if k is None or not has_kick(k):
             return None
         return max(t["fdt"].get(k, 0.0) for t in self.trajs)
 
     def sector_fdt_avg(self, h):
         """Site-averaged |F.dt| for this monomial, meaned over the chain."""
         k = self.key_of.get(h)
-        if k is None or k == SMEARKEY:
+        if k is None or not has_kick(k):
             return None
         vals = []
         for t in self.trajs:
@@ -343,7 +346,7 @@ def table_per_traj(r, start=2000):
           f"(cold solver caches).  Both excluded from warm timing means.")
 
     print(f"\n### {r.label} — Table 2: kick \\|F·dt\\| per action piece — max / avg\n")
-    cols2 = [c for c in r.cols if c[0] != SMEARKEY]
+    cols2 = [c for c in r.cols if has_kick(c[0])]
     row(["traj", "cfg"] + [h for _, h in cols2])
     sep(2 + len(cols2))
     for i, t in enumerate(r.trajs):

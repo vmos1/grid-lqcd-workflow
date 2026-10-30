@@ -19,6 +19,12 @@ Rows are ordered Light -> Strange -> Gauge with LIGHT/STRANGE sector subtotals.
 grid and quda modes are shown side by side.
 
 Usage: integrator_time_split.py <hmc_log> [<hmc_log> ...]   # any mix of the 6 logs
+
+CAUTION (2026-10-30, L199): this gap split credits time spent AFTER a monomial (its smeared
+pullback, link updates) to whichever monomial prints next, so the result depends on the level
+layout, and Grid's timestamps are misprinted below 0.1 s (L198). Kept for the June-July logs it was
+written for. For any new table use accept_run_tables.py / compare_runs_multiwindow.py, which read
+Grid's own per-call timers.
 """
 import re, sys, os
 from collections import defaultdict
@@ -132,6 +138,8 @@ def render(code, g, gw, q, qw):
     print(f"| **Wall/traj** | | | **{gw:.0f}** | | | **{qw:.0f}** | |")
 
 def main(paths):
+    print("integrator_time_split: gap split, layout-dependent (L199); new tables: "
+          "compare_runs_multiwindow.py", file=sys.stderr)
     byc = defaultdict(dict)
     for p in paths:
         byc[code_of(p)][mode_of(p)] = p

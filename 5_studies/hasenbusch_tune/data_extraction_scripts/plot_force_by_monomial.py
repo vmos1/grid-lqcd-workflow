@@ -179,7 +179,9 @@ def main(argv):
     fig.savefig(out_png, dpi=200, facecolor="white")
     print("wrote %s" % out_png, file=sys.stderr)
 
-    # markdown table: peak force, mean ± standard error and the largest (trajectory)
+    # markdown table: peak force, mean ± standard error and the largest (trajectory). The largest
+    # is printed to 3 significant figures with trailing zeros kept (%#.3g): paste the table as is,
+    # re-rounding it by hand gave 0.715 -> 0.72 (2026-10-30)
     labs = [lab for lab, _ in allstats]
     print("| monomial | " + " | ".join(labs) + " |")
     print("|---|" + "---|" * len(labs))
@@ -190,7 +192,7 @@ def main(argv):
                 cells.append("—")
                 continue
             v = s[r]
-            cells.append("%s, %.3g (%s)" % (fmt(v[2], v[3]), v[4], v[5]))
+            cells.append("%s, %#.3g (%s)" % (fmt(v[2], v[3]), v[4], v[5]))
         print("| %s | %s |" % (r, " | ".join(cells)))
     print()
     print("| monomial (average force) | " + " | ".join(labs) + " |")

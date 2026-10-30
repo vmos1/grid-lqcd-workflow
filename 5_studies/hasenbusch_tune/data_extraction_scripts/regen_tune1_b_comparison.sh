@@ -46,7 +46,9 @@ B2T24=$R/2026_10_20_B2_tail24_s300/hmc.log,$R/2026_10_20_B2_tail24_s300_r2/hmc.l
 
 # Run names (2026-10-27): the letter is the tail MASS (baseline −0.1870, B1 −0.0300, B2 +0.1000),
 # the _tNN suffix the tail's STEP COUNT. The run directories keep their original names
-# (B2_tail24_*, B2_md12_*, ...); the main doc's §1-§6 use the old names (name map at its top).
+# (B2_tail24_*, B2_md12_*, ...); the doc uses the new names throughout.
+# Force time by piece (doc §4) comes from Grid's own per-call timers (accept_run_tables.py,
+# 2026-10-30, L199), not from gaps between log lines.
 python3 "$S/compare_runs_multiwindow.py" \
   --run "baseline=$BASELINE" --run "B1_t48=$B1" --run "B2_t48=$B2" --run "B2_t24=$B2T24" \
   --ladder "baseline=$LADDER_BASE" --ladder "B1_t48=$LADDER_B1" --ladder "B2_t48=$LADDER_B2" \
