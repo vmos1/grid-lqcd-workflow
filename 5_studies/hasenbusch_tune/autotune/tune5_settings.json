@@ -1,0 +1,49 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sbatch *)",
+      "Bash(env N_TRAJ=*)",
+      "Bash(SLURM_JOB_ID=*)",
+      "Bash(bash /global/homes/v/vpa/.claude/bin/tune5_alloc.sh:*)",
+      "Bash(bash /global/homes/v/vpa/.claude/bin/tune5_release.sh:*)",
+      "Bash(bash /global/homes/v/vpa/.claude/bin/tune5_cancel.sh:*)",
+      "Bash(/usr/bin/python3 /global/homes/v/vpa/.claude/bin/tune5_budget_hook.py --status)",
+      "Bash(squeue *)",
+      "Bash(iris user vpa)",
+      "Bash(sacct *)",
+      "Bash(sinfo *)"
+    ],
+    "deny": [
+      "Bash(claude:*)",
+      "Bash(command claude:*)",
+      "Write(//global/homes/v/vpa/.claude/tune5/**)",
+      "Edit(//global/homes/v/vpa/.claude/tune5/**)",
+      "Write(//global/homes/v/vpa/.claude/skills/tune5-autonomous/**)",
+      "Edit(//global/homes/v/vpa/.claude/skills/tune5-autonomous/**)",
+      "Write(//global/homes/v/vpa/.claude/shell-snapshots/**)",
+      "Edit(//global/homes/v/vpa/.claude/shell-snapshots/**)",
+      "Write(//global/homes/v/vpa/.local/bin/**)",
+      "Edit(//global/homes/v/vpa/.local/bin/**)",
+      "Write(//global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/grid-lqcd-workflow/5_studies/hasenbusch_tune/perlmutter/**)",
+      "Edit(//global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/grid-lqcd-workflow/5_studies/hasenbusch_tune/perlmutter/**)",
+      "Write(//global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/grid-lqcd-workflow/5_studies/hasenbusch_tune/bin/**)",
+      "Edit(//global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/grid-lqcd-workflow/5_studies/hasenbusch_tune/bin/**)",
+      "Write(//global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/grid-lqcd-workflow/machines/**)",
+      "Edit(//global/cfs/cdirs/m4599/Users/vayyar/grid_qcd/grid-lqcd-workflow/machines/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 -I /global/homes/v/vpa/.claude/bin/tune5_budget_hook.py || exit 2",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

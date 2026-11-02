@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Tune 5 planner tool: per-call cost model, wall calibration, pricing, and the worker's queue.
+"""Tune 5 planner tool: per-call cost model, wall calibration and pricing.
 
-Campaign tune5-autonomous (__docs/2026_10_28_handoff_tune5_autonomous.md; this tool and the
-queue: __docs/2026_10_28_tune5_worker_queue_cost_model.md). No compute: it reads run logs and
-writes candidate files; the worker (perlmutter/tune5_worker.sh) runs them. Stdlib only, Python
-3.6 compatible, so `python3` and `uv run python` both work.
+Campaign tune5-autonomous (__docs/2026_10_29_tune5_outline.md; the cost model:
+__docs/2026_10_28_tune5_worker_queue_cost_model.md). No compute: it only reads run logs; the
+tune5 session runs candidates with the existing launchers. Stdlib only, Python 3.6 compatible,
+so `python3` and `uv run python` both work.
 
 Subcommands:
   fit       per-call force time of every monomial in the force-only runs (samples >= 1, L014),
@@ -12,8 +12,6 @@ Subcommands:
   calib     wall / model force per trajectory run (pure Grid, TRAJL 1.0, 40 GB, four nodes)
   price     cost of given (ladder, layout) pairs against a reference
   sweep     every nested layout of one ladder, ranked by predicted wall
-  enqueue   write a candidate file into the worker's queue (checked by the worker's --check)
-  status    queue counts, worker logs, results rows
 
 Cost model (all from logs, refit on every call):
   force per trajectory = sum over levels of (3 N_l + 1) x sum of that level's per-call times,
@@ -36,14 +34,11 @@ import glob
 import math
 import os
 import re
-import subprocess
 import sys
 import time
 
 BASE = '/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd'
 RUNS = BASE + '/runs'
-QUEUE = os.environ.get('TUNE5_QUEUE', RUNS + '/2026_10_28_tune5_queue')   # the worker's QUEUE; override only to test
-WORKER = BASE + '/grid-lqcd-workflow/5_studies/hasenbusch_tune/perlmutter/tune5_worker.sh'
 GPU40 = 'totalGlobalMem: 42404806656'
 MC = -0.2445
 EXP = {'mg': 2, 'mixed': 1, 'tail': 1}
@@ -51,6 +46,8 @@ MG_BELOW = -0.226
 FIXED = ('LightLogDet', 'StrangeLogDet', 'Strange', 'Gauge')
 FO_GLOBS = ('2026_10_16_fo8_*', '2026_10_26_fo8_A5*', '*_t5_*')
 TRAJ_GLOBS = ('2026_1[0-2]_*',)
+START_CFG = 'djm-3_cfg_2000'
+MG_ENV = {'HASEN_GRID_FUSED_CLOVER_FORCE=1'}
 TRUST_FROM = (2026, 10, 6)   # trust rule: pure Grid inputs only after the 10-06 fixes (handoff)
 BASELINE_LADDER = '-0.2416,-0.2400,-0.2320,-0.2180,-0.1870'
 BASELINE_LAYOUT = '12/12/48/48'
@@ -162,7 +159,10 @@ def parse_traj(rundir):
     ok = (env.get('TRAJL') == '1.0' and env.get('RAT') == '7e-4/35.0/20' and env.get('QUDA_ENV') == '0'
           and env.get('NODES') == '4' and env.get('DEVICE_MEM_MB') == '8000' and env.get('TOL_DRV') == '1e-11'
           and env.get('INTEGRATOR') == 'ForceGradient' and '_stock_' in env.get('BIN', ''))
-    if not ok:
+    # The per-call times are cfg_2000's, so only runs from cfg_2000 or its own chain (a checkpoint,
+    # or no IMPORT_CFG on a resume), with the default solver settings; other starts solve slower.
+    cfg = env.get('IMPORT_CFG', 'none')
+    if not ok or (cfg.endswith('.lime') and START_CFG not in cfg) or set(env.get('GRID_MG_ENV', '').split()) - MG_ENV:
         return None
     walls, cycles, gpu, tb, last_ts, first_hb = [], [], set(), None, 0.0, None
     with open(log, errors='replace') as f:
@@ -672,90 +672,6 @@ def cmd_sweep(args):
                                                          r['force'], r['wall'], -sv, 'yes' if sv >= args.min_saving else 'no'))
 
 
-def next_number():
-    n = 0
-    for d in ('pending', 'running', 'done', 'failed', 'rejected', 'staging'):
-        for f in glob.glob('%s/%s/[0-9][0-9][0-9]_*' % (QUEUE, d)):
-            n = max(n, int(os.path.basename(f)[:3]))
-    return n + 1
-
-
-def cmd_enqueue(args):
-    routes = auto_routes(args.ladder, args.mg_below) if args.routes == 'auto' else tuple(
-        set(int(x) for x in s.split(',') if x != '') for s in args.routes.split('/'))
-    if len(routes) != 4:
-        sys.exit('--routes is auto or mg/mg_hb/mixed/mixed_hb, e.g. 0,1,2/0,1/3/2,3')
-    kv = [('name', args.name), ('kind', args.kind), ('ladder', args.ladder)]
-    kv += [(k, ','.join(str(x) for x in sorted(s))) for k, s in zip(('mg', 'mg_hb', 'mixed', 'mixed_hb'), routes)]
-    kv += [('seed', str(args.seed)), ('start', args.start)]
-    model = build(args)
-    cal = calib_summary(calibrate(model, args.traj_globs or TRAJ_GLOBS))
-    if args.kind == 'traj':
-        lay = parse_layout(args.layout)
-        r = price_one(model, cal, args.ladder, lay, routes)
-        mm = args.max_min or int(math.ceil((cal['startup'] + args.n_traj * (r['cycle'] + 60)) * 1.3 / 60.0)) + 10
-        mm = max(mm, 30 + 45 * args.n_traj)
-        kv += [('max_min', str(mm)), ('layout', args.layout), ('n_traj', str(args.n_traj))]
-        kv += [('pred_wall_s', str(int(round(r['wall'])))), ('pred_force_s', str(int(round(r['force']))))]
-        pred = 'force %.0f s, wall %.0f s, cycle %.0f s, budget %d min (wall model %s; per-call %s)' % (
-            r['force'], r['wall'], r['cycle'], mm, cal['wall_name'], r['src'])
-    else:
-        kv += [('max_min', str(args.max_min or 60)), ('fo_samples', str(args.fo_samples))]
-        pred = 'force-only, %d samples' % args.fo_samples
-    if args.risk:
-        kv.append(('risk', args.risk))
-    if args.pair:
-        kv.append(('pair', args.pair))
-    for d in ('pending', 'running', 'done', 'failed', 'rejected', 'results', 'staging'):
-        if not os.path.isdir(QUEUE + '/' + d):
-            os.makedirs(QUEUE + '/' + d)
-    fn = '%03d_%s.cand' % (args.number or next_number(), args.name)
-    stage = '%s/staging/%s' % (QUEUE, fn)
-    text = ''.join('%s=%s\n' % kv_ for kv_ in kv)
-    for d in ('staging', 'pending', 'running', 'done', 'failed', 'rejected'):
-        if os.path.exists('%s/%s/%s' % (QUEUE, d, fn)):
-            sys.exit('%s already exists in %s/: pick another --name or --number' % (fn, d))
-    with open(stage, 'w') as f:
-        f.write(text)
-    p = subprocess.Popen(['bash', WORKER, '--check', stage], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         universal_newlines=True)
-    out = p.communicate()[0]
-    print(out.rstrip())
-    if p.returncode != 0:
-        print('NOT queued: the worker refuses it; the file stays in %s' % stage)
-        sys.exit(1)
-    print('prediction: ' + pred)
-    if args.dry_run:
-        print('dry run: left in %s' % stage)
-        return
-    # A second write, not a move: staging/ keeps the checked copy as the planner's record, and the
-    # worker takes a pending file only once it is 30 s old (never half-written).
-    with open('%s/pending/%s' % (QUEUE, fn), 'w') as f:
-        f.write(text)
-    print('queued %s/pending/%s' % (QUEUE, fn))
-
-
-def cmd_status(args):
-    if not os.path.isdir(QUEUE):
-        print('no queue yet (%s)' % QUEUE)
-        return
-    for d in ('pending', 'running', 'done', 'failed', 'rejected', 'staging'):
-        fs = sorted(os.path.basename(f) for f in glob.glob('%s/%s/*.cand' % (QUEUE, d)))
-        print('%-9s %2d  %s' % (d, len(fs), ' '.join(fs)))
-    if os.path.exists(QUEUE + '/STOP'):
-        print('STOP file present: workers exit before their next candidate')
-    for wl in sorted(glob.glob(QUEUE + '/worker_*.log')):
-        with open(wl, errors='replace') as f:
-            last = f.readlines()[-1:]
-        print('%s: %s' % (os.path.basename(wl), last[0].rstrip() if last else '(empty)'))
-    rows = sorted(glob.glob(QUEUE + '/results/*.tsv'))
-    if rows:
-        print()
-        for fn in rows:
-            with open(fn, errors='replace') as f:
-                sys.stdout.write(f.read())
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--mc', type=float, default=MC, help='critical mass of the fit (default %.4f)' % MC)
@@ -785,27 +701,9 @@ def main():
             p.add_argument('--gauge-min', type=int, default=1)
             p.add_argument('--min-saving', type=float, default=5.0)
             p.add_argument('--top', type=int, default=30)
-    p = sub.add_parser('enqueue')
-    p.add_argument('--name', required=True)
-    p.add_argument('--kind', choices=('traj', 'fo'), required=True)
-    p.add_argument('--ladder', required=True)
-    p.add_argument('--routes', default='auto', help="auto, or mg/mg_hb/mixed/mixed_hb lists, e.g. '0,1,2/0,1/3/2,3'")
-    p.add_argument('--seed', type=int, default=300)
-    p.add_argument('--start', default='djm3_2000')
-    p.add_argument('--layout', help='traj: L/S/T/G')
-    p.add_argument('--n-traj', type=int, default=1)
-    p.add_argument('--fo-samples', type=int, default=9)
-    p.add_argument('--max-min', type=int, help='budget in minutes (default: from the cost model)')
-    p.add_argument('--risk', choices=('light', 'strange', 'tail', 'gauge', 'cost', 'none'))
-    p.add_argument('--pair', help='name of the paired reference candidate')
-    p.add_argument('--number', type=int, help='queue position (default: next free)')
-    p.add_argument('--dry-run', action='store_true', help='check and price, leave the file in staging/')
-    sub.add_parser('status')
     args = ap.parse_args()
-    if args.cmd == 'enqueue' and args.kind == 'traj' and not args.layout:
-        ap.error('enqueue --kind traj needs --layout')
-    {'fit': cmd_fit, 'calib': cmd_calib, 'price': cmd_price, 'sweep': cmd_sweep, 'enqueue': cmd_enqueue,
-     'status': cmd_status}.get(args.cmd, lambda a: ap.print_help())(args)
+    {'fit': cmd_fit, 'calib': cmd_calib, 'price': cmd_price,
+     'sweep': cmd_sweep}.get(args.cmd, lambda a: ap.print_help())(args)
 
 
 if __name__ == '__main__':
