@@ -136,6 +136,15 @@ LEVEL_SPECS = {
     # alone on a middle level, 12 / 24 / 48. One monomial on the middle level, the
     # pattern C2 ran with (its strange alone). Grid: CUSTOM_LEVEL_* 0/0/1/2.
     "t24":   [(None, ["logdets", "rungs", "strange"]), (1, ["tail"]), (1, ["gauge"])],
+    # Tune 2 finalist (2026-11-02, tune2-vary-steps): baseline ladder, light rungs and
+    # log-dets at 8, strange alone at 16, tail alone at 32, gauge alone at 128. Four
+    # levels, one monomial on each nested level (t24 and c2 each ran one). Grid:
+    # CUSTOM_LEVEL_* 0/1/2/3, MULT 1,1,2, MDSTEPS 8.
+    "l8s16t32g128": [(None, ["logdets", "rungs"]), (1, ["strange"]), (1, ["tail"]),
+                     (2, ["gauge"])],
+    # Tune 2 hedge: light rungs, log-dets and strange together at 10, tail alone at
+    # 40 (n_steps 2), gauge alone at 80. Grid: CUSTOM_LEVEL_* 0/0/1/2, MULT 2,1, MDSTEPS 10.
+    "l10t40g80": [(None, ["logdets", "rungs", "strange"]), (2, ["tail"]), (1, ["gauge"])],
 }
 
 STATIC_GROUPS = {
