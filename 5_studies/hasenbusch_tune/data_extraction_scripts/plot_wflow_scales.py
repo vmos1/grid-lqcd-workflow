@@ -39,7 +39,8 @@ BAND_IN = "#cfcfcf"
 N_STREAM = 4  # configurations per tune 1 stream: the inner band is sd/sqrt(N_STREAM)
 SLOT = {"baseline": ("#0072B2", "o"), "B1_t48": ("#E69F00", "s"), "B2_t48": ("#009E73", "^"),
         "B2_t24": ("#D55E00", "D"), "chain 2": ("#CC79A7", "v"),
-        "D_8_16_32_64": ("#56B4E9", "P")}   # tune 2 finalist 8/16/32/128 (2026-11-04)
+        "D_8_16_32_64": ("#56B4E9", "P"),   # tune 2 finalist, chains run at gauge 128 (2026-11-04)
+        "D_10_40_80": ("#000000", "X")}     # tune 2 hedge, five single draws from cfg_2000
 ENS = "cl21_48_96_b6p3_m0p2416_m0p2050"
 # (group, row label, path fragment, colour, marker, filled); top to bottom, first match wins
 ROWS = [
@@ -52,6 +53,7 @@ ROWS = [
     ("Grid", "Grid B2_t48", "_B2_md12_s30", *SLOT["B2_t48"], True),
     ("Grid", "Grid B2_t24", "_B2_tail24_s30", *SLOT["B2_t24"], True),
     ("Grid", "Grid D_8_16_32_64", "_t2fin_8_16_32_128_s300", *SLOT["D_8_16_32_64"], True),
+    ("Grid", "Grid D_10_40_80 (5 single draws)", "_10_10_40_80_s30", *SLOT["D_10_40_80"], True),
     ("Chroma", "Chroma baseline chain 2", "chroma_cfgs/baseg_mds12_base_20_s301/", *SLOT["chain 2"], False),
     ("Chroma", "Chroma B1_t48", "chroma_baseg_mds12_b1_20_s300_cfg", *SLOT["B1_t48"], False),
     ("Chroma", "Chroma B2_t24", "chroma_baseg_mds12_b2t24_20_s300_cfg", *SLOT["B2_t24"], False),

@@ -21,7 +21,7 @@
 #   __docs/figs/2026_11_03_tune2_{grid,chroma}_2x2.png   the figures (repo uv env: matplotlib)
 #   piece_time.md                     time by piece (piece_time_table.py, Grid's own timers)
 #   wflow_scales.md, __docs/figs/2026_11_03_tune2_wflow_scales.png   Wilson-flow scales, once the
-#                                     flow logs exist (runs/*_wflow_t2fin_seg{1,2})
+#                                     flow logs exist (runs/*_wflow_t2fin_seg{1,2}, *_wflow_t2hedge_draws)
 #   doc_check.txt                     check_doc_tables.py against the doc, once the doc exists
 #
 # Usage:  regen_tune2_comparison.sh [outdir]
@@ -97,7 +97,7 @@ python3 "$S/piece_time_table.py" --pieces \
   --run "baseline=$BASELINE" --run "D_8_16_32_64=$FIN" > "$OUT/piece_time.md"
 
 # ---- Wilson-flow scales against the production ensemble, once the flow logs exist ----
-WF=$(ls "$R"/*_wflow_t2fin_seg*/flow_*.log 2>/dev/null || true)
+WF=$(ls "$R"/*_wflow_t2fin_seg*/flow_*.log "$R"/*_wflow_t2hedge_draws/flow_*.log 2>/dev/null || true)
 if [ -n "$WF" ]; then
   $UV run --project "$BASE/grid-lqcd-workflow" python "$S/plot_wflow_scales.py" \
     "$FIGS/2026_11_03_tune2_wflow_scales.png" \
