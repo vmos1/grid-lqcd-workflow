@@ -44,7 +44,8 @@ SECT_ORDER = ["s", "ldS", "ldL", "PF0", "PF1", "PF2", "PF3", "PF4", "tail", "gau
 
 
 def mean(v):
-    return sum(v) / len(v)
+    # nan for an empty list: a run that stalled in its second trajectory has no warm ones (2026-11-09)
+    return sum(v) / len(v) if v else float("nan")
 
 
 def sem(v):
@@ -206,7 +207,7 @@ def table_summary(runs):
         [f"{mean([r.wall(i) for i in r.warm_idx()]):.0f} s" for r in runs])
     row(["Warm wall spread"] +
         [f"{min(r.wall(i) for i in r.warm_idx()):.0f}–{max(r.wall(i) for i in r.warm_idx()):.0f} s"
-         for r in runs])
+         if r.warm_idx() else "—" for r in runs])
     row(["Avg cycle time, warm *(full traj)*"] +
         [f"{mean([r.cycle(i) for i in r.warm_idx()]):.0f} s" if r.has_cycle() else "—"
          for r in runs])
