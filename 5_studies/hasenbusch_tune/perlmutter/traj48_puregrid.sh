@@ -45,6 +45,10 @@
 #   DEVICE_MEM_MB       default 8000 (--device-mem)
 #   INTEGRATOR_VERBOSE_MEM  default 0 (off); 1 = MemoryManager::Print per force call
 #   GPU_MON_MS          default 2000 (nvidia-smi sampling period); 0 = no sampler
+#   LAUNCH_PREFIX       (2026-11-10, profiling) words inserted between select_gpu and the binary,
+#                       split on spaces, e.g. common/nsys_rank.sh (Nsight Systems on rank 0 only,
+#                       its NSYS_* settings exported by the caller). Empty (default) = the old
+#                       launch line. Recorded in the ENV line only when set.
 #   SRUN_EXTRA          appended verbatim to srun (e.g. --overlap)
 #   DIAG_TOL_STRANGE, DIAG_MDSTEPS, DIAG_TRAJL  diagnostic overrides (2026-10-02, physics review
 #                       tests T1-T3): strange multishift tolerance, MD steps, trajectory length.
@@ -744,7 +748,9 @@ printf '%s\n' \
   'exec numactl -m $NUMA -N $NUMA "$@"' > "$SELECT_GPU"
 chmod +x "$SELECT_GPU"
 
-LAUNCH=("$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}")
+LAUNCH_PREFIX=${LAUNCH_PREFIX:-}
+read -r -a LAUNCH_PREFIX_WORDS <<< "$LAUNCH_PREFIX"
+LAUNCH=("$SELECT_GPU" "${LAUNCH_PREFIX_WORDS[@]}" "$BIN" "${GRID_ARGS[@]}")
 if [ "$GPU_MON_MS" -gt 0 ]; then
   # Runs inside the main step (no second srun): nvidia-smi ignores CUDA_VISIBLE_DEVICES
   # and sees the step's four GPUs per node. Backgrounded with its own timeout as a
@@ -809,6 +815,10 @@ ENV_KV=(
   "PHYS=$PHYS"
   "HASEN_GRID_EXTRA=\"$HASEN_GRID_EXTRA\"" "GRID_MG_ENV=\"$GRID_MG_ENV\"" "GRID_FLAGS=\"${GRID_ARGS[*]}\""
 )
+if [ -n "$LAUNCH_PREFIX" ]; then
+  ENV_KV+=("LAUNCH_PREFIX=\"$LAUNCH_PREFIX\""
+           "NSYS=\"ranks=${NSYS_RANKS:-0} trace=${NSYS_TRACE:-cuda,nvtx} delay=${NSYS_DELAY:-0} duration=${NSYS_DURATION:-all} out=${NSYS_OUT:-unset}\"")
+fi
 printf 'ENV TRAJ48_PUREGRID %s\n' "${ENV_KV[*]}" > "$LOG"
 {
   printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"
