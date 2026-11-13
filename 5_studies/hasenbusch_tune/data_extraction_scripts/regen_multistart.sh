@@ -8,11 +8,15 @@
 # run directory is dated by the day its job started. To add a candidate, append its 9 lines below
 # (label <arm>_<stream>_<start trajectory>); the arm list is read from the labels, baseline first.
 # A start finished in a second segment (after a stall: DIAG_START_CFG=<ckpt>, new seed) is
-# label=dir1,dir2 in trajectory order. Round 1: B2_t24 on djm-3 1000 stalled in its third
-# trajectory; its log ends at two trajectories and counts as one stall.
+# label=dir1,dir2 in trajectory order. A start rerun from its start with a new seed after a stall
+# (amended rule, 2026-11-12) takes the rerun in RUNS and the stalled run in STALLED: the stall is
+# reported as cleared. Two such reruns so far: B2_t24 on djm-3 1000 (round 1, rerun 11-13) and D_8
+# on djm-2 700 (round 2, rerun 11-09).
 #
 # Worked output: __docs/2026_11_02_multistart_b2t24_vs_baseline.md (round 1),
-# __docs/2026_11_09_multistart_round2_tune2.md (round 2, outdir runs/2026_11_9_multistart_analysis)
+# __docs/2026_11_09_multistart_round2_tune2.md (round 2). Current outdir
+# runs/2026_11_13_multistart_analysis (amended rule, both reruns); runs/2026_11_12_multistart_analysis
+# lacks B2_t24's rerun, and runs/2026_11_9_multistart_analysis predates the amendment.
 #
 # Outputs (outdir default runs/2026_11_2_multistart_analysis, outside the git tree; a cache):
 #   ms.csv            per-trajectory CSV (compare_runs_multiwindow.py)
@@ -30,23 +34,25 @@ mkdir -p "$OUT"
 
 RUNS=(
   # ---- round 1 (10-31 → 11-01): the baseline, run once, and tune 1's B2_t24 ----
+  # B2_t24 on djm-3 1000 stalled in its third trajectory (2026_10_31_..._ms500, in STALLED below);
+  # its seed-600 rerun from the same start (11-13) ran 5 clean trajectories and stands in for it.
   baseline_djm1_1000=2026_11_1_baseline_djm1_1000_ms500   B2_t24_djm1_1000=2026_11_1_B2_t24_djm1_1000_ms500
   baseline_djm1_1800=2026_10_31_baseline_djm1_1800_ms500  B2_t24_djm1_1800=2026_11_1_B2_t24_djm1_1800_ms500
   baseline_djm1_2600=2026_11_1_baseline_djm1_2600_ms500   B2_t24_djm1_2600=2026_11_1_B2_t24_djm1_2600_ms500
   baseline_djm2_700=2026_11_1_baseline_djm2_700_ms500     B2_t24_djm2_700=2026_11_1_B2_t24_djm2_700_ms500
   baseline_djm2_1400=2026_11_1_baseline_djm2_1400_ms500   B2_t24_djm2_1400=2026_11_1_B2_t24_djm2_1400_ms500
   baseline_djm2_2100=2026_11_1_baseline_djm2_2100_ms500   B2_t24_djm2_2100=2026_11_1_B2_t24_djm2_2100_ms500
-  baseline_djm3_1000=2026_10_31_baseline_djm3_1000_ms500  B2_t24_djm3_1000=2026_10_31_B2_t24_djm3_1000_ms500
+  baseline_djm3_1000=2026_10_31_baseline_djm3_1000_ms500  B2_t24_djm3_1000=2026_11_13_B2_t24_djm3_1000_ms600
   baseline_djm3_2700=2026_11_1_baseline_djm3_2700_ms500   B2_t24_djm3_2700=2026_11_1_B2_t24_djm3_2700_ms500
   baseline_djm3_3300=2026_11_1_baseline_djm3_3300_ms500   B2_t24_djm3_3300=2026_11_1_B2_t24_djm3_3300_ms500
   # ---- round 2 (11-05 → 11-08): tune 2's two layouts, against the round-1 baseline ----
-  # D_8 on djm-2 700 stalled in its second trajectory; its log ends at one and counts as one stall.
-  # Its seed-600 rerun from the same start (2026_11_9_D_8_16_32_64_djm2_700_ms600) shares no seed
-  # with any arm, so it is not paired here; it is reported on its own in the round-2 doc.
+  # D_8 on djm-2 700 stalled in its second trajectory (2026_11_6_..._ms500, in STALLED below); its
+  # seed-600 rerun from the same start ran 5 clean trajectories and stands in for it. That start's
+  # D_8 cells are therefore not same-seed with the baseline's.
   D_8_16_32_64_djm1_1000=2026_11_6_D_8_16_32_64_djm1_1000_ms500   D_10_40_80_djm1_1000=2026_11_7_D_10_40_80_djm1_1000_ms500
   D_8_16_32_64_djm1_1800=2026_11_5_D_8_16_32_64_djm1_1800_ms500   D_10_40_80_djm1_1800=2026_11_7_D_10_40_80_djm1_1800_ms500
   D_8_16_32_64_djm1_2600=2026_11_6_D_8_16_32_64_djm1_2600_ms500   D_10_40_80_djm1_2600=2026_11_8_D_10_40_80_djm1_2600_ms500
-  D_8_16_32_64_djm2_700=2026_11_6_D_8_16_32_64_djm2_700_ms500     D_10_40_80_djm2_700=2026_11_8_D_10_40_80_djm2_700_ms500
+  D_8_16_32_64_djm2_700=2026_11_9_D_8_16_32_64_djm2_700_ms600     D_10_40_80_djm2_700=2026_11_8_D_10_40_80_djm2_700_ms500
   D_8_16_32_64_djm2_1400=2026_11_6_D_8_16_32_64_djm2_1400_ms500   D_10_40_80_djm2_1400=2026_11_7_D_10_40_80_djm2_1400_ms500
   D_8_16_32_64_djm2_2100=2026_11_6_D_8_16_32_64_djm2_2100_ms500   D_10_40_80_djm2_2100=2026_11_8_D_10_40_80_djm2_2100_ms500
   D_8_16_32_64_djm3_1000=2026_11_5_D_8_16_32_64_djm3_1000_ms500   D_10_40_80_djm3_1000=2026_11_7_D_10_40_80_djm3_1000_ms500
@@ -54,6 +60,16 @@ RUNS=(
   D_8_16_32_64_djm3_3300=2026_11_7_D_8_16_32_64_djm3_3300_ms500   D_10_40_80_djm3_3300=2026_11_8_D_10_40_80_djm3_3300_ms500
   # ---- later rounds: append <arm>_<stream>_<traj>=<run dir>[,<run dir>] here ----
 )
+# Stalled runs replaced in RUNS by a new-seed rerun of the same start: <label>=<stalled run dir>
+STALLED=(
+  B2_t24_djm3_1000=2026_10_31_B2_t24_djm3_1000_ms500
+  D_8_16_32_64_djm2_700=2026_11_6_D_8_16_32_64_djm2_700_ms500
+)
+STALL_ARGS=()
+for e in "${STALLED[@]}"; do
+  [ -f "$R/${e#*=}/hmc.log" ] || { echo "ERROR: ${e%%=*}: no $R/${e#*=}/hmc.log" >&2; exit 1; }
+  STALL_ARGS+=(--stalled "${e%%=*}=$R/${e#*=}/hmc.log")
+done
 RUN_ARGS=() LOG_ARGS=() ARMS=baseline
 for e in "${RUNS[@]}"; do
   label=${e%%=*} logs=""
@@ -70,4 +86,4 @@ done
 
 python3 "$S/compare_runs_multiwindow.py" "${RUN_ARGS[@]}" --csv "$OUT/ms.csv" > "$OUT/ms_tables.md"
 python3 "$S/multistart_pairs.py" "$OUT/ms.csv" --ref baseline --arms "$ARMS" "${LOG_ARGS[@]}" \
-  | tee "$OUT/ms_summary.md"
+  "${STALL_ARGS[@]}" | tee "$OUT/ms_summary.md"

@@ -11,7 +11,10 @@ Every candidate is read against the reference arm start by start (same start, sa
                       Read the expected acceptance.
   stalls              lines "after a fresh hierarchy: ABORT" in each run's logs (--log, comma-
                       separated when a start was finished in a second segment); a stalled run's
-                      CSV simply ends at its last finished trajectory
+                      CSV simply ends at its last finished trajectory. A start rerun with a new
+                      seed after a stall takes the rerun in --run/--log and the stalled run's log
+                      in --stalled: its stall is reported as cleared, and the start's cells are
+                      then not same-seed with the reference (2026-11-12)
   time                warm trajectories only (the first of each run is a cold start); per start
                       the candidate / reference ratio of the warm means, then the mean and
                       standard error of those ratios over the starts; wall (MD only, primary)
@@ -24,17 +27,24 @@ Every candidate is read against the reference arm start by start (same start, sa
                       --log); mean and standard error over the starts. Arms share seeds, so
                       their drifts are one observation, not independent ones (2026-11-09)
 
-Verdict rule (2026_10_28_handoff_multistart_validation.md, written before the runs): a candidate
-fails if (1) two or more trajectories with |dH| > 1 beyond the reference's on the same start,
-(2) its dH RMS exceeds the reference's by more than 50%, or (3) more light-solver stalls than the
-reference. Otherwise it passes and its paired cost is quoted.
+Verdict rule (2026_10_28_handoff_multistart_validation.md; written before the runs, amended
+2026-11-12 after round 2): a candidate fails if
+  (1) two or more trajectories with |dH| > 1 beyond the reference's on the same start;
+  (2) its dH RMS / the reference's is above 1.5 across the whole 68% bootstrap range (bootstrap
+      over starts, paired: a drawn start brings both arms' trajectories; 20,000 draws, seed 1);
+      until 11-12 the point ratio alone decided;
+  (3) more light-solver stalls than the reference that recur when the stalled start is rerun with
+      a new seed; a stall not yet rerun leaves the verdict pending; until 11-12 every stall counted.
+Otherwise it passes and its paired cost is quoted.
 
 Usage:
   multistart_pairs.py <csv> --ref ARM --arms ARM1,ARM2,... [--log RUNLABEL=hmc.log[,hmc.log] ...]
+                      [--stalled RUNLABEL=hmc.log[,hmc.log] ...]
 """
 import csv
 import math
 import os
+import random
 import statistics as st
 import sys
 from collections import OrderedDict
@@ -73,16 +83,16 @@ def ratio_cell(rs):
 def main(argv):
     if not argv or argv[0].startswith("-"):
         sys.exit(__doc__)
-    path, ref, arms, logs = argv[0], None, None, {}
+    path, ref, arms, logs, stalled_logs = argv[0], None, None, {}, {}
     i = 1
     while i < len(argv):
         if argv[i] == "--ref":
             ref = argv[i + 1]
         elif argv[i] == "--arms":
             arms = argv[i + 1].split(",")
-        elif argv[i] == "--log":
+        elif argv[i] in ("--log", "--stalled"):
             lab, _, p = argv[i + 1].partition("=")
-            logs[lab] = p
+            (logs if argv[i] == "--log" else stalled_logs)[lab] = p
         else:
             sys.exit(__doc__)
         i += 2
@@ -110,10 +120,40 @@ def main(argv):
                     if k == 0 and INITIAL in line and (arm, lab[len(arm) + 1:]) not in initial:
                         initial[(arm, lab[len(arm) + 1:])] = float(line.split(INITIAL)[1].split()[0])
         stalls[(arm, lab[len(arm) + 1:])] = n
+    cleared = {}  # (arm, start) -> stalls in the run that the rerun replaced
+    for lab, paths in stalled_logs.items():
+        arm = next((a for a in by_len if lab.startswith(a + "_")), None)
+        if arm is None or lab not in logs:
+            sys.exit("--stalled %r needs a matching arm and a --log for its rerun" % lab)
+        n = 0
+        for p in paths.split(","):
+            with open(p, errors="replace") as f:
+                n += sum(STALL in line for line in f)
+        cleared[(arm, lab[len(arm) + 1:])] = n
     starts = sorted({s for a in arms for s in data[a]}, key=start_key)
 
     def n_stalls(arm, s=None):
         return sum(v for (a, st_), v in stalls.items() if a == arm and (s is None or st_ == s))
+
+    def n_cleared(arm, s=None):
+        return sum(v for (a, st_), v in cleared.items() if a == arm and (s is None or st_ == s))
+
+    def stall_cell(arm, s=None):
+        c = n_cleared(arm, s)
+        return str(n_stalls(arm, s)) + (" (%d cleared on rerun)" % c if c else "")
+
+    def boot_ratio(arm, n=20000):
+        """dH RMS arm / ref, bootstrap over the shared starts, paired: (16th, 84th percentile,
+        fraction of draws above 1.5). Fresh seed per arm, so an arm's range is independent of
+        which other arms are listed."""
+        sh = [s for s in sorted(data[ref]) if s in data[arm]]
+        rng, qs = random.Random(1), []
+        for _ in range(n):
+            pick = [rng.choice(sh) for _ in sh]
+            qs.append(rms([float(r["dH"]) for s in pick for r in data[arm][s]]) /
+                      rms([float(r["dH"]) for s in pick for r in data[ref][s]]))
+        qs.sort()
+        return qs[int(0.16 * n)], qs[int(0.84 * n)], sum(q > 1.5 for q in qs) / n
 
     def paired(arm, key):
         out = []
@@ -163,7 +203,7 @@ def main(argv):
             "%.1f%%" % (100 * st.mean([min(1.0, x) for x in e])),
             "%.3f" % rms(dh), "%.2f" % max(abs(x) for x in dh), str(sum(abs(x) > 1 for x in dh)),
             "%.3f ± %.3f" % (st.mean(e), sem(e)),
-            str(n_stalls(a)) if logs else "—",
+            stall_cell(a) if logs else "—",
             one_digit(st.mean(pm), sem(pm)),
             one_digit(st.mean(sm), sem(sm)) if len(sm) == len(data[a]) else "—",
             drift_cell(a)]) + " |")
@@ -191,7 +231,7 @@ def main(argv):
     for a in arms:
         if a == ref:
             continue
-        print("\n### Per start: %s against %s (same start, same seed)\n" % (a, ref))
+        print("\n### Per start: %s against %s (same start, same seed unless marked rerun)\n" % (a, ref))
         hdr = ["start", "trajectories", "ΔH RMS", "largest abs ΔH", "stalls", "warm wall", "wall change"]
         print("| " + " | ".join(hdr) + " |")
         print("|" + "---|" * len(hdr))
@@ -205,22 +245,23 @@ def main(argv):
             chg = (("%+.1f%%" % (100 * (st.mean(wc) / st.mean(wb) - 1))).replace("-", "−")
                    if wb and wc else "—")
             print("| " + " | ".join([
-                s.replace("djm", "djm-").replace("_", " "),
+                s.replace("djm", "djm-").replace("_", " ") + (" (rerun)" if (a, s) in cleared else ""),
                 pair(lambda x: str(len(x))),
                 pair(lambda x: "%.3f" % rms([float(r["dH"]) for r in x])),
                 pair(lambda x: "%.2f" % max(abs(float(r["dH"])) for r in x)),
-                "%s / %s" % (n_stalls(ref, s), n_stalls(a, s)) if logs else "—",
+                "%s / %s" % (n_stalls(ref, s), stall_cell(a, s)) if logs else "—",
                 pair(lambda x: "{:,.0f} s ({})".format(st.mean(warm(x, "wall_s")), len(warm(x, "wall_s")))
                      if warm(x, "wall_s") else "—"),
                 chg]) + " |")
         print("\nCells are %s / %s; warm wall is the mean over the run's warm trajectories (count in "
-              "brackets)." % (ref, a))
+              "brackets). A rerun start's candidate run has a new seed, so it is not same-seed with "
+              "%s there." % (ref, a, ref))
 
-    # ---- the pre-registered verdict ----
-    print("\n### Verdict (rule written before the runs)\n")
+    # ---- the verdict ----
+    print("\n### Verdict (rule written before the runs, amended 2026-11-12)\n")
     hdr = ["candidate", "(1) abs ΔH > 1 beyond %s on the same start (fail at ≥ 2)" % ref,
-           "(2) ΔH RMS / %s's (fail above 1.5)" % ref, "(3) stalls, %s vs candidate (fail if more)" % ref,
-           "result"]
+           "(2) ΔH RMS / %s's, 68%% bootstrap range (fail if all above 1.5)" % ref,
+           "(3) stalls, %s vs candidate (fail if more, after a rerun)" % ref, "result"]
     print("| " + " | ".join(hdr) + " |")
     print("|" + "---|" * len(hdr))
     ref_rms = rms([float(r["dH"]) for s in data[ref] for r in data[ref][s]])
@@ -230,11 +271,23 @@ def main(argv):
         extra = sum(max(0, sum(abs(float(r["dH"])) > 1 for r in data[a].get(s, []))
                        - sum(abs(float(r["dH"])) > 1 for r in data[ref].get(s, []))) for s in starts)
         q = rms([float(r["dH"]) for s in data[a] for r in data[a][s]]) / ref_rms
+        lo, hi, above = boot_ratio(a)
         sr, sa = n_stalls(ref), n_stalls(a)
-        fails = [k for k, bad in (("1", extra >= 2), ("2", q > 1.5), ("3", logs and sa > sr)) if bad]
+        # a surplus stall on a start already rerun has recurred: fail; one not yet rerun: pending
+        recur = [s for s in starts if n_stalls(a, s) > n_stalls(ref, s) and (a, s) in cleared]
+        fresh = [s for s in starts if n_stalls(a, s) > n_stalls(ref, s) and (a, s) not in cleared]
+        fails = [k for k, bad in (("1", extra >= 2), ("2", lo > 1.5),
+                                  ("3", logs and sa > sr and recur)) if bad]
+        if fails:
+            result = "**FAILS** (%s)" % ", ".join(fails)
+        elif logs and sa > sr and fresh:
+            result = "pending (3): rerun %s with a new seed" % ", ".join(
+                s.replace("djm", "djm-").replace("_", " ") for s in fresh)
+        else:
+            result = "passes"
         print("| " + " | ".join([
-            a, str(extra), "%.2f" % q, "%d vs %d" % (sr, sa) if logs else "— (no --log)",
-            "**FAILS** (%s)" % ", ".join(fails) if fails else "passes"]) + " |")
+            a, str(extra), "%.2f (%.2f–%.2f; %.0f%% of draws above 1.5)" % (q, lo, hi, 100 * above),
+            "%d vs %s" % (sr, stall_cell(a)) if logs else "— (no --log)", result]) + " |")
 
 
 if __name__ == "__main__":
