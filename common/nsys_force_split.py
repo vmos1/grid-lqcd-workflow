@@ -354,8 +354,15 @@ class Profile:
 
     def _load(self):
         k = "CUPTI_ACTIVITY_KIND_KERNEL"
-        namecol = "demangledName" if "demangledName" in self._cols(k) else "shortName"
-        a = self._fetch("SELECT start, end, %s FROM %s" % (namecol, k), 3)
+        if k in self.tables:
+            namecol = "demangledName" if "demangledName" in self._cols(k) else "shortName"
+            a = self._fetch("SELECT start, end, %s FROM %s" % (namecol, k), 3)
+        else:
+            # Either no kernel ran in the window (program start-up), or the profiler lost its
+            # kernel records (2026-11-13, allocation 61232844: one report of four had copies
+            # and API calls but no kernel table, another had no CUDA data at all).
+            print("WARNING: no GPU kernel records in this report; kernel, busy and idle figures below are not valid")
+            a = np.zeros((0, 3), dtype=np.int64)
         self.k_s, self.k_e = a[:, 0] / 1e9, a[:, 1] / 1e9
         # raw_idx: one index per demangled name (used by the offset fit, which wants the finest
         # split); k_idx: one index per short name (template instantiations merged), for reporting.

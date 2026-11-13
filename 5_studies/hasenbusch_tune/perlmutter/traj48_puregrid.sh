@@ -817,7 +817,7 @@ ENV_KV=(
 )
 if [ -n "$LAUNCH_PREFIX" ]; then
   ENV_KV+=("LAUNCH_PREFIX=\"$LAUNCH_PREFIX\""
-           "NSYS=\"ranks=${NSYS_RANKS:-0} trace=${NSYS_TRACE:-cuda,nvtx} delay=${NSYS_DELAY:-0} duration=${NSYS_DURATION:-all} out=${NSYS_OUT:-unset}\"")
+           "NSYS=\"ranks=${NSYS_RANKS:-0} trace=${NSYS_TRACE:-cuda,nvtx} sample=${NSYS_SAMPLE:-none} delay=${NSYS_DELAY:-0} duration=${NSYS_DURATION:-all} out=${NSYS_OUT:-unset}\"")
 fi
 printf 'ENV TRAJ48_PUREGRID %s\n' "${ENV_KV[*]}" > "$LOG"
 {

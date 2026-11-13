@@ -34,15 +34,34 @@
 #                  In the sqlite export every event time counts from the start of collection
 #                  (window = 0..duration); the program launch is the "Process was launched"
 #                  row of DIAGNOSTIC_EVENT, at about -NSYS_DELAY.
+#   NSYS_SAMPLE    default none: no CPU sampling, no context-switch tracing. process-tree
+#                  (2026-11-13) samples the profiled rank's host threads with call stacks and
+#                  traces their context switches, to see what the host does while the GPU is
+#                  idle. Needs perf_event_paranoid <= 2 (`nsys status -e`). system-wide needs
+#                  root and is refused here. Measured 2026-11-13 (allocation 61232844, 48^3):
+#                  a 90 s window gives a 108 MB report and does not slow the run; the compute
+#                  nodes are at paranoid 2, so time inside the Linux kernel is not sampled.
+#                  Analysis: nsys_host_idle.py, nsys_copy_stacks.py.
+#   NSYS_BACKTRACE with sampling only, default dwarf. The GPU nodes are AMD (no lbr) and Grid
+#                  is built without frame pointers (no fp). nsys's dwarf defaults: one IP
+#                  sample per 2,000,000 CPU cycles, a call stack on every 4th.
+#   NSYS_SAMPLING_PERIOD  with sampling only: CPU cycles per sample, 125000..16000000.
+#   NSYS_CUDABACKTRACE    with sampling only: a call stack on each CUDA API call of the given
+#                  classes that lasts longer than the threshold in ns, e.g. memory:200000 (the
+#                  copies, cudaMalloc, cudaFree over 0.2 ms). Adds overhead to every such call.
 #   NSYS           nsys binary (default the HPC SDK 25.5 one, as run_benchmark_v2.sh)
-# CPU sampling and context-switch tracing stay off (they need perf_event permissions).
 # --kill=none: the end of collection never signals the program, which runs to its normal end.
 # =============================================================================
 NSYS=${NSYS:-/opt/nvidia/hpc_sdk/Linux_x86_64/25.5/profilers/Nsight_Systems/bin/nsys}
 RANK=${SLURM_PROCID:-0}
 RANKS=${NSYS_RANKS:-0}
 TRACE=${NSYS_TRACE:-cuda,nvtx}
+SAMPLE=${NSYS_SAMPLE:-none}
 # Checked on every rank, before the unprofiled ones exec, so the whole step fails at once.
+case "$SAMPLE" in
+  none|process-tree) ;;
+  *) echo "nsys_rank.sh: NSYS_SAMPLE=$SAMPLE: use none or process-tree" >&2; exit 2 ;;
+esac
 case ",$TRACE," in
   *",mpi,"*)
     if [ "$RANKS" != all ]; then
@@ -65,8 +84,15 @@ mkdir -p "$(dirname "$NSYS_OUT")"
 # goes next to the report instead. The profiled program inherits this TMPDIR.
 export TMPDIR=$(dirname "$NSYS_OUT")/tmp_r$RANK
 mkdir -p "$TMPDIR"
-OPTS=(--trace="$TRACE" --sample=none --cpuctxsw=none --kill=none
+OPTS=(--trace="$TRACE" --kill=none
       --force-overwrite=false --output="${NSYS_OUT}_r${RANK}")
+if [ "$SAMPLE" = none ]; then
+  OPTS+=(--sample=none --cpuctxsw=none)
+else
+  OPTS+=(--sample="$SAMPLE" --cpuctxsw="$SAMPLE" --backtrace="${NSYS_BACKTRACE:-dwarf}")
+  [ -n "${NSYS_SAMPLING_PERIOD:-}" ] && OPTS+=(--sampling-period="$NSYS_SAMPLING_PERIOD")
+  [ -n "${NSYS_CUDABACKTRACE:-}" ] && OPTS+=(--cudabacktrace="$NSYS_CUDABACKTRACE")
+fi
 case ",$TRACE," in *",mpi,"*) OPTS+=(--mpi-impl=mpich) ;; esac
 [ -n "${NSYS_DELAY:-}" ] && OPTS+=(--delay="$NSYS_DELAY")
 [ -n "${NSYS_DURATION:-}" ] && OPTS+=(--duration="$NSYS_DURATION")
