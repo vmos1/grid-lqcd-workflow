@@ -12,6 +12,8 @@ pasted into a doc cannot silently disagree with the logs.
 Pairing and matching:
   - a generated table is compared with the doc table in that section with the same header row
     (case and ** ignored); a generated table with no such doc table is listed, not an error;
+    tables sharing one header (multistart_pairs.py's per-start tables) pair in order, the n-th
+    generated with the n-th in the doc (2026-11-16; until then all paired with the first);
   - rows are matched by their leading label cells: the fewest leading cells that are unique in
     the generated table (e.g. "Grid | baseline"). A doc label may add a bracket ("rung 1
     (−0.2416/−0.2400)" matches "rung 1");
@@ -93,6 +95,7 @@ def main(argv):
     dtabs_of = {sid: tables(lines) for sid, lines in secs.items()}
     bad, unchecked, ok = 0, [], 0
     paired_doc = set()
+    nth = {}  # (section, header) -> generated tables with that header seen so far
     for sid, fname in pairs:
         if sid not in secs:
             print("ERROR  section %s not found in %s" % (sid, doc))
@@ -103,12 +106,15 @@ def main(argv):
         for ghead, grows in gtabs:
             dt = [i for i, t in enumerate(dtabs)
                   if [norm(c) for c in t[0]] == [norm(c) for c in ghead]]
-            if not dt:
+            hkey = (sid, tuple(norm(c) for c in ghead))
+            i = nth.get(hkey, 0)
+            nth[hkey] = i + 1
+            if i >= len(dt):
                 unchecked.append("§%s generated table not in the doc: %s (%s)" % (
                     sid, " | ".join(ghead), fname))
                 continue
-            dhead, drows = dtabs[dt[0]]
-            paired_doc.add((sid, dt[0]))
+            dhead, drows = dtabs[dt[i]]
+            paired_doc.add((sid, dt[i]))
             k = key_width(grows)
             used = set()
             for _, gcells in grows:

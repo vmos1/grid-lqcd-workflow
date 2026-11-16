@@ -18,8 +18,14 @@ On stdout, two markdown tables: the per-stream means (t0, w0) and, from 2026-10-
 configurations one by one with their plaquettes, mean and spread, in the doc's §5 format (for
 check_doc_tables.py).
 
+Options (2026-11-16, candidates benchmark), before the logs:
+  --rows 'LABEL,LABEL,...'  keep only these Grid/Chroma rows (production and cfg_2000 always kept);
+                            configurations of the other rows are dropped silently
+  --n-stream N              the inner band's n (default 4, the tune 1 streams' size)
+  --title TEXT              the figure title
+
 Usage:
-  plot_wflow_scales.py <out.png> <flow log> [<flow log> ...]
+  plot_wflow_scales.py <out.png> [--rows ...] [--n-stream N] [--title ...] <flow log> [<flow log> ...]
 """
 import math
 import os
@@ -53,6 +59,8 @@ ROWS = [
     ("Grid", "Grid B2_t48", "_B2_md12_s30", *SLOT["B2_t48"], True),
     ("Grid", "Grid B2_t24", "_B2_tail24_s30", *SLOT["B2_t24"], True),
     ("Grid", "Grid D_8_16_32_64", "_t2fin_8_16_32_128_s300", *SLOT["D_8_16_32_64"], True),
+    # the 20-trajectory chain from cfg_2000 (candidates benchmark, 2026-11-16)
+    ("Grid", "Grid D_10_40_80", "_D_10_40_80_s300", *SLOT["D_10_40_80"], True),
     ("Grid", "Grid D_10_40_80 (5 single draws)", "_10_10_40_80_s30", *SLOT["D_10_40_80"], True),
     ("Chroma", "Chroma baseline chain 2", "chroma_cfgs/baseg_mds12_base_20_s301/", *SLOT["chain 2"], False),
     ("Chroma", "Chroma B1_t48", "chroma_baseg_mds12_b1_20_s300_cfg", *SLOT["B1_t48"], False),
@@ -139,7 +147,8 @@ def scales(logs):
     return out
 
 
-def main(out_png, logs):
+def main(out_png, logs, keep=None, n_stream=N_STREAM,
+         title="Wilson-flow scales: tune 1 streams against the production ensemble (48³×96, clover E)"):
     vals = scales(logs)
     rows = {r[1]: [] for r in ROWS}
     for cfg, tw in vals.items():
@@ -148,7 +157,12 @@ def main(out_png, logs):
             print("skipped (no row): %s" % cfg, file=sys.stderr)
             continue
         rows[hit[1]].append(tw)
-    ROW = [r for r in ROWS if rows[r[1]]]
+    if keep is not None:
+        unknown = [k for k in keep if k not in rows]
+        if unknown:
+            sys.exit("plot_wflow_scales: --rows names no row: %s" % ", ".join(unknown))
+    ROW = [r for r in ROWS if rows[r[1]] and
+           (keep is None or r[0] in ("production", "start") or r[1] in keep)]
 
     # y positions: one unit per row, a gap between groups
     ys, y, prev = {}, 0.0, None
@@ -172,7 +186,7 @@ def main(out_png, logs):
             m, sd = st.mean(pv), st.stdev(pv)
             ax.axvspan(m - sd, m + sd, color=BAND, zorder=0, lw=0)
             # inner band: the spread of a mean of N_STREAM independent configurations
-            ax.axvspan(m - sd / math.sqrt(N_STREAM), m + sd / math.sqrt(N_STREAM), color=BAND_IN,
+            ax.axvspan(m - sd / math.sqrt(n_stream), m + sd / math.sqrt(n_stream), color=BAND_IN,
                        zorder=0, lw=0)
             ax.axvline(m, color=P.MUTED, ls="--", lw=0.9, zorder=1)
         for g, lab, _, c, mk, filled in ROW:
@@ -223,12 +237,11 @@ def main(out_png, logs):
               label="production: mean (dashed) ± sd of single configurations (%d)" % len(prod)),
         Patch(facecolor=BAND_IN, edgecolor="none",
               label="± sd/√%d: expected spread of a mean of %d independent configurations"
-              % (N_STREAM, N_STREAM)),
+              % (n_stream, n_stream)),
         Line2D([0], [0], marker="o", ms=8, color=GREY, mfc="white", mew=1.6, ls="none",
                label="open marker = Chroma, filled = Grid"),
     ]
-    fig.text(0.01, 0.98, "Wilson-flow scales: tune 1 streams against the production ensemble "
-             "(48³×96, clover E)", fontsize=13, color=P.INK, ha="left", va="top")
+    fig.text(0.01, 0.98, title, fontsize=13, color=P.INK, ha="left", va="top")
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.55, 0.94), frameon=False,
                fontsize=9, ncol=2)
     fig.savefig(out_png, dpi=200, facecolor="white")
@@ -237,4 +250,15 @@ def main(out_png, logs):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2:])
+    a, kw = sys.argv[2:], {}
+    while a and a[0].startswith("--"):
+        if a[0] == "--rows":
+            kw["keep"] = [s.strip() for s in a[1].split(",")]
+        elif a[0] == "--n-stream":
+            kw["n_stream"] = int(a[1])
+        elif a[0] == "--title":
+            kw["title"] = a[1]
+        else:
+            sys.exit("plot_wflow_scales: unknown option %s" % a[0])
+        a = a[2:]
+    main(sys.argv[1], a, **kw)

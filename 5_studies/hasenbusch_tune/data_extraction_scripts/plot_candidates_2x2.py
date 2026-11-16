@@ -15,13 +15,18 @@ mean of the plaquette (the 10-27 panel D) was dropped 10-29: it only restates B.
 --band MEAN,SD,LABEL shades a reference value (mean ± sd) in B, e.g. the production ensemble's
 plaquette.
 
+--named-colors (2026-11-16, candidates benchmark): a run named in NAMED takes that colour and marker
+(the same per-name palette as plot_wflow_scales.SLOT), so a candidate keeps one colour across every
+figure of a doc; other runs keep their --order slot. Off by default, so older figures regenerate
+unchanged.
+
 Colour follows the run, given in fixed order by --order (Okabe-Ito slots, validated CVD-safe; each
 run also has its own marker shape, so identity never rests on colour alone). Pass the same labels in
 the same slots for the Grid and the Chroma figure so an entity keeps its colour across both.
 
 Usage:
   plot_candidates_2x2.py <in.csv> <out.png> --order 'L1,L2,...' [--title '...'] [--display 'L1=text;L2=text']
-                         [--band 'MEAN,SD,LABEL']
+                         [--band 'MEAN,SD,LABEL'] [--named-colors]
 """
 import os
 import sys
@@ -34,6 +39,11 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
 SLOTS = [("#0072B2", "o"), ("#E69F00", "s"), ("#009E73", "^"), ("#D55E00", "D"), ("#CC79A7", "v")]
+# --named-colors: as plot_wflow_scales.SLOT, plus the Chroma baseline chains' labels
+NAMED = {"baseline": ("#0072B2", "o"), "baseline chain 1": ("#0072B2", "o"),
+         "baseline chain 2": ("#CC79A7", "v"), "B1_t48": ("#E69F00", "s"),
+         "B2_t48": ("#009E73", "^"), "B2_t24": ("#D55E00", "D"),
+         "D_8_16_32_64": ("#56B4E9", "P"), "D_10_40_80": ("#000000", "X")}
 BAND = "#e6e6e6"
 
 
@@ -45,9 +55,13 @@ def _band(ax, band):
 
 def main(argv):
     csv_path, out_png = argv[0], argv[1]
-    order, title, display, band = None, "", {}, None
+    order, title, display, band, named = None, "", {}, None, False
     i = 2
     while i < len(argv):
+        if argv[i] == "--named-colors":
+            named = True
+            i += 1
+            continue
         if argv[i] == "--order":
             order = argv[i + 1].split(",")
         elif argv[i] == "--title":
@@ -63,7 +77,7 @@ def main(argv):
     df = df[df["run"].isin(runs)].copy()
     df["run"] = pd.Categorical(df["run"], categories=runs, ordered=True)
     df = df.sort_values(["run", "traj_abs"])
-    sty = {r: SLOTS[k] for k, r in enumerate(runs)}
+    sty = {r: (NAMED[r] if named and r in NAMED else SLOTS[k]) for k, r in enumerate(runs)}
 
     ncol = len(runs) if len(runs) <= 3 else 3
     legend_rows = -(-(len(runs) + (1 if band else 0)) // ncol)

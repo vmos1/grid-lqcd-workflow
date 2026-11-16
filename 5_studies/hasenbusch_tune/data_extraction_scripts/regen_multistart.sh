@@ -22,6 +22,8 @@
 #   ms.csv            per-trajectory CSV (compare_runs_multiwindow.py)
 #   ms_tables.md      compare_runs_multiwindow.py's full report, per run
 #   ms_summary.md     multistart_pairs.py: per arm, per start, and the pre-registered verdict
+#   ms_runs.txt       the manifest as resolved, one <label>=<log>[,<log>] per line (2026-11-16;
+#                     regen_candidates_benchmark.sh groups it by arm for time by piece)
 #
 # Usage:  regen_multistart.sh [outdir]
 
@@ -70,7 +72,7 @@ for e in "${STALLED[@]}"; do
   [ -f "$R/${e#*=}/hmc.log" ] || { echo "ERROR: ${e%%=*}: no $R/${e#*=}/hmc.log" >&2; exit 1; }
   STALL_ARGS+=(--stalled "${e%%=*}=$R/${e#*=}/hmc.log")
 done
-RUN_ARGS=() LOG_ARGS=() ARMS=baseline
+RUN_ARGS=() LOG_ARGS=() MANIFEST=() ARMS=baseline
 for e in "${RUNS[@]}"; do
   label=${e%%=*} logs=""
   IFS=, read -ra dirs <<< "${e#*=}"
@@ -80,10 +82,12 @@ for e in "${RUNS[@]}"; do
   done
   RUN_ARGS+=(--run "$label=$logs")
   LOG_ARGS+=(--log "$label=$logs")
+  MANIFEST+=("$label=$logs")
   arm=${label%_djm*}
   [[ ",$ARMS," == *",$arm,"* ]] || ARMS=$ARMS,$arm
 done
 
+printf '%s\n' "${MANIFEST[@]}" > "$OUT/ms_runs.txt"
 python3 "$S/compare_runs_multiwindow.py" "${RUN_ARGS[@]}" --csv "$OUT/ms.csv" > "$OUT/ms_tables.md"
 python3 "$S/multistart_pairs.py" "$OUT/ms.csv" --ref baseline --arms "$ARMS" "${LOG_ARGS[@]}" \
   "${STALL_ARGS[@]}" | tee "$OUT/ms_summary.md"

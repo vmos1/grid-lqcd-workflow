@@ -10,14 +10,20 @@ the same in every run, so runs compare like with like.
 
 Monomials are named by role, not by (level, index): B2_t24 has a different level layout. Rungs are
 numbered from the light end (rung 4 ends on the tail mass, which differs between candidates); the two
-log-dets are told apart by order of appearance (1-flavour first, as in accept_run_tables.py).
+log-dets are told apart by force, the 2-flavour one's being twice the 1-flavour's (until 2026-11-16 by
+order of appearance, which D_8_16_32_64's four-level layout reverses).
 A trajectory with no "Total H after" line (an aborted solve) is left out and listed on stderr.
 
 Output: a two-panel figure (A average, B peak; log scale) and, on stdout, the markdown table.
 Colours and markers as plot_candidates_2x2.py (Okabe-Ito slots, fixed order).
 
+--starts (2026-11-16): the logs of a --run are independent starts (multistart-validation), not
+segments of one chain; trajectories are keyed by stream and number, so equal numbers do not collide.
+--named-colors (2026-11-16): per-name colours as plot_candidates_2x2.NAMED.
+
 Usage:
   plot_force_by_monomial.py <out.png> --run 'LABEL=log1,log2,...' [--run ...] [--title '...']
+                            [--starts] [--named-colors]
 """
 import collections
 import math
@@ -60,10 +66,17 @@ def role_map(names):
     return out
 
 
-def parse(paths):
-    """{traj: {"avg": {role: [..]}, "max": {role: [..]}, "dH": x or None}}; aborted kept as 'N*'."""
+def parse(paths, starts=False):
+    """{traj: {"avg": {role: [..]}, "max": {role: [..]}, "dH": x or None}}; aborted kept as 'N*'.
+    starts=True: the logs are independent starts, not segments of one chain, so a trajectory is
+    keyed '<stream> <N>' (from a multistart run dir, ..._djm<k>_<traj>_ms<seed>) and two starts
+    with the same trajectory numbers (djm-1 1000, djm-3 1000) both count."""
     out = collections.OrderedDict()
     for p in paths:
+        tag = ""
+        if starts:
+            m = re.search(r"_djm(\d)_\d+_ms\d+", p)
+            tag = ("djm-%s " % m.group(1)) if m else os.path.basename(os.path.dirname(p)) + " "
         names, rows, cur = collections.OrderedDict(), [], None
         for line in open(p, errors="ignore"):
             m = TRAJ.search(line)
@@ -85,10 +98,21 @@ def parse(paths):
             if m:
                 cur["dH"] = float(m.group(1))
         roles = role_map(names)
+        # The log-dets' order of appearance depends on the level layout (D_8_16_32_64's four levels
+        # list the 2-flavour one first, 2026-11-16), so name them by force instead: the 2-flavour
+        # log-det's average force is twice the 1-flavour's (0.072 against 0.035).
+        ld = [k for k, v in roles.items() if v.startswith("log-det")]
+        if len(ld) == 2:
+            size = [st.mean([x for r in rows for x in r["avg"].get(k, [])] or [0.0]) for k in ld]
+            if size[0] > size[1]:
+                roles[ld[0]], roles[ld[1]] = roles[ld[1]], roles[ld[0]]
         for r in rows:
             d = {"avg": {roles[k]: v for k, v in r["avg"].items()},
                  "max": {roles[k]: v for k, v in r["max"].items()}, "dH": r["dH"]}
-            key = r["t"] if r["dH"] is not None else "%d*" % r["t"]
+            if starts:
+                key = "%s%d" % (tag, r["t"]) + ("" if r["dH"] is not None else "*")
+            else:
+                key = r["t"] if r["dH"] is not None else "%d*" % r["t"]
             out[key] = d  # a later segment's trajectory replaces an earlier one
     return out
 
@@ -122,8 +146,14 @@ def fmt(v, e):
 
 def main(argv):
     out_png, runs, title = argv[0], [], "Grid: force per monomial, baseline vs B candidates"
+    starts, named = False, False
     i = 1
     while i < len(argv):
+        if argv[i] in ("--starts", "--named-colors"):
+            starts = starts or argv[i] == "--starts"
+            named = named or argv[i] == "--named-colors"
+            i += 1
+            continue
         if argv[i] == "--run":
             lab, paths = argv[i + 1].split("=", 1)
             runs.append((lab, paths.split(",")))
@@ -132,7 +162,7 @@ def main(argv):
         i += 2
     allstats = []
     for lab, paths in runs:
-        data = parse(paths)
+        data = parse(paths, starts)
         for t, d in data.items():
             if d["dH"] is None:
                 print("%s: trajectory %s aborted, left out" % (lab, t), file=sys.stderr)
@@ -142,8 +172,12 @@ def main(argv):
     fig, (axA, axB) = plt.subplots(2, 1, figsize=(11, 8.2), sharex=True)
     fig.subplots_adjust(top=0.83, bottom=0.08, left=0.08, right=0.98, hspace=0.25)
     width = 0.17
+    if named:
+        from plot_candidates_2x2 import NAMED
+    sty = [NAMED[lab] if named and lab in NAMED else SLOTS[j]
+           for j, (lab, _) in enumerate(allstats)]
     for j, (lab, s) in enumerate(allstats):
-        c, mk = SLOTS[j]
+        c, mk = sty[j]
         off = (j - (len(allstats) - 1) / 2) * width
         xs = [k + off for k, r in enumerate(roles) if r in s]
         rr = [r for r in roles if r in s]
@@ -167,7 +201,7 @@ def main(argv):
     axB.set_xticklabels(roles, fontsize=9, color=P.INK)
     axB.set_xlim(-0.5, len(roles) - 0.5)
 
-    handles = [Line2D([0], [0], color=SLOTS[j][0], marker=SLOTS[j][1], ls="none", ms=7,
+    handles = [Line2D([0], [0], color=sty[j][0], marker=sty[j][1], ls="none", ms=7,
                       mec="white", label=lab) for j, (lab, _) in enumerate(allstats)]
     handles += [Line2D([0], [0], color=P.MUTED, marker="o", ls="-", lw=1.2, ms=6,
                        label="mean over the trajectories ± standard error"),
