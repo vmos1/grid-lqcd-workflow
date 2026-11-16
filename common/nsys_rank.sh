@@ -49,6 +49,11 @@
 #   NSYS_CUDABACKTRACE    with sampling only: a call stack on each CUDA API call of the given
 #                  classes that lasts longer than the threshold in ns, e.g. memory:200000 (the
 #                  copies, cudaMalloc, cudaFree over 0.2 ms). Adds overhead to every such call.
+#   NSYS_CUDA_MEMORY      true = --cuda-memory-usage=true (2026-11-16): one event per device
+#                  allocation and free, with its size and address (sqlite table
+#                  CUDA_GPU_MEMORY_USAGE_EVENTS), to account for the GPU memory in use. Call
+#                  stacks on the allocations need sampling plus NSYS_CUDABACKTRACE=memory:<ns>.
+#                  nsys warns of significant overhead: a memory probe, not a timing.
 #   NSYS           nsys binary (default the HPC SDK 25.5 one, as run_benchmark_v2.sh)
 # --kill=none: the end of collection never signals the program, which runs to its normal end.
 # =============================================================================
@@ -94,6 +99,7 @@ else
   [ -n "${NSYS_CUDABACKTRACE:-}" ] && OPTS+=(--cudabacktrace="$NSYS_CUDABACKTRACE")
 fi
 case ",$TRACE," in *",mpi,"*) OPTS+=(--mpi-impl=mpich) ;; esac
+[ "${NSYS_CUDA_MEMORY:-false}" = true ] && OPTS+=(--cuda-memory-usage=true)
 [ -n "${NSYS_DELAY:-}" ] && OPTS+=(--delay="$NSYS_DELAY")
 [ -n "${NSYS_DURATION:-}" ] && OPTS+=(--duration="$NSYS_DURATION")
 echo "nsys_rank.sh: rank $RANK profiled: $NSYS profile ${OPTS[*]} $*" >&2
