@@ -2,8 +2,9 @@
 # =============================================================================
 # gate16_puregrid.sh -- one 16^3x48 case of the pure-Grid compact-Schur driver
 # (src/gen_qcd_hasenbusch_tune_compact_schur.cc) on one lq2 node, 4 ranks on the job's 4 A100
-# (one per rank) or 2 (two ranks per GPU, the QOS test cap), run INSIDE a Slurm job with
-# OpenMPI mpirun. Never submits; the job script is gate16_m10_gpu_job.sh.
+# (one per rank) or 2 (two ranks per GPU, the QOS test cap), or with LQ_TARGET=cpu on one lq3
+# node (4 ranks x 16 cores), run INSIDE a Slurm job with OpenMPI mpirun. Never submits; the
+# job scripts are gate16_m10_gpu_job.sh and gate16_m10_cpu_job.sh.
 #   CASE=traj    one HMC trajectory   = the recipe of ../perlmutter/smoke16_puregrid.sh
 #   CASE=forces  one FORCES_ONLY pass = the recipe of ../perlmutter/forces16_puregrid.sh
 #
@@ -36,6 +37,13 @@
 #   GPU_MPS             1 = start NVIDIA's MPS daemon for this case (pipe and log dirs in node
 #                       /tmp, log copied to the rundir), so ranks sharing a GPU run concurrently
 #                       instead of in time slices; default 0
+#   LQ_TARGET           gpu (default, lq2) or cpu (lq3, read by machines/lq.sh too). cpu: no GPU
+#                       table and no select_gpu wrapper; mpirun binds each rank to
+#                       SLURM_CPUS_PER_TASK cores (ppr:N:node:PE=T --bind-to core) with
+#                       OMP_NUM_THREADS=T; Grid flags --threads T --shm 2048 (the GPU-only
+#                       --accelerator-threads, --shm-mpi, --comms-overlap dropped; Grid-CPU
+#                       measured --comms-overlap 5-15% slower on one lq3 node). Same ENV line;
+#                       its GRID_FLAGS field shows the CPU flags.
 #
 # Checks before anything runs: ldd (0 unresolved, no libquda) with machines/lq.sh loaded; the
 # binary's sha256 equals its release's PROVENANCE.txt exe line (when the binary sits in
@@ -67,6 +75,10 @@ G_SEED=${HMC_SEED_OFFSET:-200}
 G_MIN=${CASE_MIN:-10}
 G_NRANKS=${NRANKS:-4}
 G_MPS=${GPU_MPS:-0}
+G_TARGET=${LQ_TARGET:-gpu}
+case "$G_TARGET" in gpu|cpu) ;; *) die "LQ_TARGET must be gpu or cpu, got '$G_TARGET'" ;; esac
+{ [ "$G_TARGET" = gpu ] || [ "$G_MPS" = 0 ]; } || die "GPU_MPS=1 needs LQ_TARGET=gpu"
+export LQ_TARGET=$G_TARGET
 [[ "$G_MPI" =~ ^[1-9]\.[1-9]\.[1-9]\.[1-9]$ ]] || die "MPI_GEOM must look like 1.1.1.4, got '$G_MPI'"
 [[ "$G_SEED" =~ ^[0-9]+$ ]] || die "HMC_SEED_OFFSET must be a non-negative integer, got '$G_SEED'"
 [[ "$G_MIN" =~ ^[1-9][0-9]*$ ]] || die "CASE_MIN must be a positive integer, got '$G_MIN'"
@@ -91,10 +103,11 @@ fi
 [ "$N_QUDA" -eq 0 ] || die "ldd shows libquda in $BIN; this launcher is for pure-Grid builds only"
 LIBMPI=$(printf '%s\n' "$LDD_OUT" | grep -o -m1 '/[^ ]*libmpi\.so[^ ]*' || true)
 MPIRUN_BIN=$(command -v mpirun || true)
-case $LQ_MPI_STACK in
-  gompi) STACK_DIR=/srv/software/el8/x86_64/eb/OpenMPI/ ;;
-  hpcx)  STACK_DIR=${HPCX_DIR:?lq.sh set LQ_MPI_STACK=hpcx but HPCX_DIR is unset}/ ;;
-  *)     die "LQ_MPI_STACK must be gompi or hpcx, got '$LQ_MPI_STACK'" ;;
+case $G_TARGET/$LQ_MPI_STACK in
+  gpu/gompi)       STACK_DIR=/srv/software/el8/x86_64/eb/OpenMPI/ ;;
+  gpu/hpcx)        STACK_DIR=${HPCX_DIR:?lq.sh set LQ_MPI_STACK=hpcx but HPCX_DIR is unset}/ ;;
+  cpu/lq3-ompi418) STACK_DIR=${LQ_CPU_MPI_ROOT:?lq.sh set LQ_TARGET=cpu but LQ_CPU_MPI_ROOT is unset}/ ;;
+  *)               die "LQ_TARGET=$G_TARGET with LQ_MPI_STACK=$LQ_MPI_STACK is not a known stack" ;;
 esac
 [[ "$LIBMPI" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but $BIN loads libmpi from '$LIBMPI'"
 [[ "$MPIRUN_BIN" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but mpirun is '$MPIRUN_BIN'"
@@ -104,7 +117,9 @@ if [ -f "$PROV" ]; then
   WANT=$(grep -m1 '^exe:' "$PROV" | grep -o 'sha256=[0-9a-f]*' | cut -d= -f2)
   [ "$WANT" = "$BIN_SHA256" ] || die "sha256 of $BIN is $BIN_SHA256, its release record $PROV says '${WANT}'"
 fi
-command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found: not a GPU node ($(hostname))"
+if [ "$G_TARGET" = gpu ]; then
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found: not a GPU node ($(hostname))"
+fi
 
 # ---- 3. Clear every knob this run does not set (the Perlmutter families) ------------------
 # QUDA_*, HASEN_* (except HASEN_GRID_*), HMC_MG_*, USE_HMC_MG, FORCES_*, CKPT_*, TXQCD_*,
@@ -161,8 +176,15 @@ if [ "$G_MODE" = forces ]; then
 fi
 
 # ---- 8. Threads and Grid flags --------------------------------------------------------------
-export OMP_NUM_THREADS=8
-GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap)
+if [ "$G_TARGET" = gpu ]; then
+  export OMP_NUM_THREADS=8
+  GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap)
+else
+  CPU_T=${SLURM_CPUS_PER_TASK:-16}
+  [[ "$CPU_T" =~ ^[1-9][0-9]*$ ]] || die "SLURM_CPUS_PER_TASK must be a positive integer, got '$CPU_T'"
+  export OMP_NUM_THREADS=$CPU_T OMP_PLACES=cores OMP_PROC_BIND=close
+  GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --threads "$CPU_T" --shm 2048)
+fi
 
 # ---- 9. Run directory (refuse to overwrite) ---------------------------------------------------
 DATE_TAG=$(date +%Y_%-m_%-d)
@@ -171,18 +193,19 @@ RUN_DIR=$ROOT/runs/${DATE_TAG}_${RUN}
 mkdir -p "$RUN_DIR" || die "cannot create $RUN_DIR"
 LOG=$RUN_DIR/hmc.log
 
-# ---- 10. GPU and NUMA table, select_gpu wrapper ---------------------------------------------
-# The GPUs Slurm gave the job; each rank bound to its GPU's NUMA domain as read from sysfs
+# ---- 10. Binding: GPU and NUMA table with the select_gpu wrapper (gpu), cores (cpu) -----------
+# gpu: the GPUs Slurm gave the job; each rank bound to its GPU's NUMA domain as read from sysfs
 # (lq2: 2 sockets x 32 cores; the GPU-socket wiring is read, not assumed).
 # CUDA_DEVICE_ORDER=PCI_BUS_ID makes the CUDA index equal the nvidia-smi index used here.
+HAVE_NUMACTL=yes
+command -v numactl >/dev/null 2>&1 || HAVE_NUMACTL=no
+if [ "$G_TARGET" = gpu ]; then
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
   CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd,)
 fi
 IFS=, read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"
 NGPU=${#GPUS[@]}
 { [ "$NGPU" -ge 1 ] && [ $((NTASKS % NGPU)) -eq 0 ]; } || die "the GPU count must divide $NTASKS, CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES'"
-HAVE_NUMACTL=yes
-command -v numactl >/dev/null 2>&1 || HAVE_NUMACTL=no
 GNUMA=()
 BUSES=()
 for g in "${GPUS[@]}"; do
@@ -219,19 +242,31 @@ printf '%s\n' \
   '[ "$N" -lt 0 ] || exec numactl -m "$N" -N "$N" "$@"' \
   'exec "$@"' > "$SELECT_GPU"
 chmod +x "$SELECT_GPU"
+WRAP=("$SELECT_GPU")
 MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node" --bind-to none --wdir "$RUN_DIR")
+PROBE='echo "gpu=$CUDA_VISIBLE_DEVICES $(numactl --show 2>/dev/null | grep -E "^(nodebind|membind)" | tr "\n" " ")"'
+else
+# cpu: mpirun places the ranks in order over the node and binds each to CPU_T cores (on lq3,
+# ranks 0-1 on socket 0 and 2-3 on socket 1 with 4 x 16 cores); memory is first-touch local.
+WRAP=()
+MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node:PE=${CPU_T}" --bind-to core --wdir "$RUN_DIR")
+PROBE='echo "cpus=$(taskset -cp $$ | cut -d: -f2 | tr -d " ") $(numactl --show 2>/dev/null | grep -E "^(nodebind|membind)" | tr "\n" " ")"'
+fi
 
-# Gate: every rank runs the wrapper and reports its GPU and binding; a failure stops here.
-if ! timeout -k 10s 3m "${MPIRUN[@]}" --tag-output "$SELECT_GPU" bash -c 'echo "gpu=$CUDA_VISIBLE_DEVICES $(numactl --show 2>/dev/null | grep -E "^(nodebind|membind)" | tr "\n" " ")"' > "$RUN_DIR/numa_binding.raw" 2>&1; then
+# Gate: every rank reports its GPU or cores and its NUMA binding; a failure stops here.
+if ! timeout -k 10s 3m "${MPIRUN[@]}" --tag-output "${WRAP[@]}" bash -c "$PROBE" > "$RUN_DIR/numa_binding.raw" 2>&1; then
   cat "$RUN_DIR/numa_binding.raw" >&2
-  die "binding probe failed: mpirun could not start the wrapper on every rank. Nothing was run (rundir $RUN_DIR)."
+  die "binding probe failed: mpirun could not start every rank. Nothing was run (rundir $RUN_DIR)."
 fi
 sed -n -E 's/^\[[0-9]+,([0-9]+)\]<stdout>:/\1: /p' "$RUN_DIR/numa_binding.raw" | sort -n > "$RUN_DIR/numa_binding.txt"
 [ "$(wc -l < "$RUN_DIR/numa_binding.txt")" -eq "$NTASKS" ] || die "binding probe returned $(wc -l < "$RUN_DIR/numa_binding.txt") of $NTASKS ranks (see $RUN_DIR/numa_binding.raw)"
 
 # Optional MPS daemon (GPU_MPS=1), started on the job's GPUs and stopped when this script exits.
 # Its pipe directory must be on a local filesystem (named pipes), hence node /tmp.
-COMPUTE_MODE=$(nvidia-smi --query-gpu=compute_mode --format=csv,noheader -i "${GPUS[0]}" 2>/dev/null || echo unknown)
+COMPUTE_MODE=na
+if [ "$G_TARGET" = gpu ]; then
+  COMPUTE_MODE=$(nvidia-smi --query-gpu=compute_mode --format=csv,noheader -i "${GPUS[0]}" 2>/dev/null || echo unknown)
+fi
 MPS_STATE=off
 stop_mps() {
   echo quit | nvidia-cuda-mps-control
@@ -283,20 +318,29 @@ fi
   printf 'BIN_PATH %s\n' "$BIN"
   sed 's/^/NUMA /' "$RUN_DIR/numa_binding.txt"
   printf 'CMD '
-  printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}"
+  printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "${WRAP[@]}" "$BIN" "${GRID_ARGS[@]}"
   printf '\n'
-  printf 'LAUNCH host=%s mpi_stack=%s libmpi=%s mps=%s compute_mode="%s" ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
+  if [ "$G_TARGET" = gpu ]; then
+  printf 'LAUNCH host=%s target=gpu mpi_stack=%s libmpi=%s mps=%s compute_mode="%s" ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
     "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$MPS_STATE" "$COMPUTE_MODE" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
     "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${GNUMA[*]}")" \
     "$(IFS=,; echo "${RANKS[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
     "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")" \
     "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
     "$(compgen -e | grep '^UCX_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)"
+  else
+  printf 'LAUNCH host=%s target=cpu mpi_stack=%s libmpi=%s ompi="%s" cxx="%s" cpu="%s" cores=%s numa_nodes=%s threads_per_rank=%s omp="%s" numactl=%s mca="%s" ucx="%s"\n' \
+    "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$(mpirun --version 2>&1 | head -1)" "$(mpicxx --version 2>&1 | head -1)" \
+    "$(lscpu | sed -n 's/^Model name: *//p' | head -1)" "$(nproc)" "$(lscpu | sed -n 's/^NUMA node(s): *//p')" "$CPU_T" \
+    "OMP_NUM_THREADS=$OMP_NUM_THREADS OMP_PLACES=$OMP_PLACES OMP_PROC_BIND=$OMP_PROC_BIND" "$HAVE_NUMACTL" \
+    "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
+    "$(compgen -e | grep '^UCX_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)"
+  fi
 } >> "$LOG"
 
 # ---- 12. Launch -------------------------------------------------------------------------------
 echo "running $(basename "$BIN") CASE=$G_MODE MPI=$G_MPI -> $LOG"
-timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}" >> "$LOG" 2>&1
+timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "${WRAP[@]}" "$BIN" "${GRID_ARGS[@]}" >> "$LOG" 2>&1
 rc=$?
 printf 'exit=%s\n' "$rc" >> "$LOG"
 
