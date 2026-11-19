@@ -239,8 +239,9 @@ configure_grid() {
     )
   else
     # The lq3 reference build's flags (Grid-CPU systems/LQ3/config-command), with the GPU
-    # build's comms/fermion/gparity/lime choices; no FFTW (the driver does no FFT).
-    # GMP/MPFR are spack's (exported by lq.sh), rpath'd so the binary finds them without it.
+    # build's comms/fermion/gparity/lime choices. FFTW is required: stock FFT.h does not
+    # compile on CPU without it (job 1363360). GMP/MPFR/FFTW are spack's (exported by lq.sh),
+    # rpath'd so the binary finds them without it.
     cmd=(
       "${STAGE_SRC}/configure"
       --prefix="${INSTALL_PREFIX}"
@@ -253,8 +254,9 @@ configure_grid() {
       --with-lime="${CLIME_ROOT}"
       --with-gmp="${GMP}"
       --with-mpfr="${MPFR}"
+      --with-fftw="${FFTW}"
       CXX=mpicxx
-      LDFLAGS="-L${GMP}/lib -L${MPFR}/lib -Wl,-rpath,${GMP}/lib -Wl,-rpath,${MPFR}/lib"
+      LDFLAGS="-L${GMP}/lib -L${MPFR}/lib -L${FFTW}/lib -Wl,-rpath,${GMP}/lib -Wl,-rpath,${MPFR}/lib -Wl,-rpath,${FFTW}/lib"
       CXXFLAGS="-std=c++17 -march=znver5 -fPIE"
     )
   fi
@@ -267,7 +269,7 @@ configure_grid() {
       printf 'nvcc:       %s\n' "$(nvcc --version | tail -1)"
     else
       printf 'os:         %s\n' "$(. /etc/os-release && echo "${PRETTY_NAME}")"
-      printf 'spack:      gcc-15-toolset, GMP=%s MPFR=%s\n' "${GMP}" "${MPFR}"
+      printf 'spack:      gcc-15-toolset, GMP=%s MPFR=%s FFTW=%s\n' "${GMP}" "${MPFR}" "${FFTW}"
       printf 'mpi:        %s (%s)\n' "${LQ_CPU_MPI_ROOT}" "$(mpirun --version 2>&1 | head -1)"
     fi
     printf 'mpicxx:     %s (%s)\n' "$(command -v mpicxx)" "$(mpicxx --version | head -1)"

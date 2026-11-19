@@ -72,16 +72,21 @@ cpu)
     elif ! grep -q '^VERSION_ID="9' /etc/os-release 2>/dev/null; then
         _lq_err="LQ_TARGET=cpu needs an EL9 lq3 node; $(hostname) runs $(. /etc/os-release && echo "${PRETTY_NAME}")"
     else
+        # FFTW is required, not optional: stock Grid's CPU FFT.h does not compile without it
+        # (GPU builds use cuFFT instead; job 1363360 failed in FFT.h without --with-fftw).
         source /srv/software/el9/spack/v1.2.2/setup-env.sh &&
             spack env activate gcc-15-toolset &&
-            spack load gcc@15 || _lq_err="spack gcc-15-toolset setup failed"
+            spack load gcc@15 &&
+            spack load fftw || _lq_err="spack gcc-15-toolset setup failed"
         if [ -z "${_lq_err}" ]; then
             export GMP=$(spack find --paths gmp | awk '/^gmp/ {print $2}')
             export MPFR=$(spack find --paths mpfr | awk '/^mpfr/ {print $2}')
-            { [ -d "${GMP}/lib" ] && [ -d "${MPFR}/lib" ]; } || _lq_err="spack gmp/mpfr not found (GMP='${GMP}' MPFR='${MPFR}')"
+            export FFTW=$(spack find --paths fftw | awk '/^fftw/ {print $2}')
+            { [ -d "${GMP}/lib" ] && [ -d "${MPFR}/lib" ] && [ -d "${FFTW}/lib" ]; } ||
+                _lq_err="spack gmp/mpfr/fftw not found (GMP='${GMP}' MPFR='${MPFR}' FFTW='${FFTW}')"
             export LQ_CPU_MPI_ROOT=/lustre2/nplqcd/install/openmpi-4.1.8-ucx-gcc15
             export PATH=${LQ_CPU_MPI_ROOT}/bin:${PATH}
-            export LD_LIBRARY_PATH=${LQ_CPU_MPI_ROOT}/lib:${GMP}/lib:${MPFR}/lib:${LD_LIBRARY_PATH}
+            export LD_LIBRARY_PATH=${LQ_CPU_MPI_ROOT}/lib:${GMP}/lib:${MPFR}/lib:${FFTW}/lib:${LD_LIBRARY_PATH}
             export OMPI_MCA_pml=ucx OMPI_MCA_osc=ucx UCX_NET_DEVICES=mlx5_0:1
         fi
     fi

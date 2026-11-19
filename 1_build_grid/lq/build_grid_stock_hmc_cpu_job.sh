@@ -31,7 +31,7 @@ echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date)"
 LQ_TARGET=cpu source "${WF}/machines/lq.sh"
 echo "mpicxx: $(command -v mpicxx) ($(mpicxx --version | head -1))"
 echo "mpirun: $(mpirun --version 2>&1 | head -1)"
-echo "GMP=${GMP} MPFR=${MPFR}"
+echo "GMP=${GMP} MPFR=${MPFR} FFTW=${FFTW}"
 
 echo
 echo "---- MPI locality check (16 ranks x 4 cores)"
