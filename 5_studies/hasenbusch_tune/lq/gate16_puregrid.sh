@@ -1,0 +1,255 @@
+#!/bin/bash
+# =============================================================================
+# gate16_puregrid.sh -- one 16^3x48 case of the pure-Grid compact-Schur driver
+# (src/gen_qcd_hasenbusch_tune_compact_schur.cc) on one lq2 node, 4 x A100, run INSIDE a
+# Slurm job with OpenMPI mpirun. Never submits; the job script is gate16_m10_gpu_job.sh.
+#   CASE=traj    one HMC trajectory   = the recipe of ../perlmutter/smoke16_puregrid.sh
+#   CASE=forces  one FORCES_ONLY pass = the recipe of ../perlmutter/forces16_puregrid.sh
+#
+# Purpose: the 16^3 gate of an lq release against the Perlmutter reference
+# (__docs/2026_11_18_handoff_lq_port.md section 7c). Physics, seed, tolerances, Grid flags
+# and decomposition are the Perlmutter recipe's, value for value; the only lq changes are the
+# launcher (mpirun, not srun) and the GPU/NUMA wrapper.
+#
+# Log format. Line 1 of hmc.log is the ENV line in the Perlmutter format: tag SMOKE16_PUREGRID
+# (traj) or FORCES16_PUREGRID (forces), the same fields in the same order, so the two logs
+# diff field by field. MPICH_IPC and MPICH_RDMA read "na" (Cray MPICH only). Then GRID_HASH,
+# BIN_PATH, one NUMA line per rank and CMD, as on Perlmutter, and one LAUNCH line with the lq
+# facts (host, OpenMPI, modules, GPUs, NUMA table, OMPI_MCA_/UCX_ variables, driver).
+#
+# Usage (inside a job; one line):
+#   CASE=traj|forces BIN=<binary> RUN=<name> bash gate16_puregrid.sh
+# Caller options, read before the scrub (everything else is fixed):
+#   MPI_GEOM            default 1.1.1.4; the Grid-MG route needs 1.1.2.2 (at 1.1.1.4 the
+#                       level-1 coarse T extent is 3, which the fp32 SIMD layout cannot split)
+#   HMC_SEED_OFFSET     default 200 (the reference seed)
+#   HASEN_GRID_*, GRID_MG_*   routes and tunables, passed through unscrubbed and recorded in
+#                       the ENV line's GRID_MG_ENV, as on Perlmutter
+#   CASE_MIN            timeout of the run in minutes, default 10
+#
+# Checks before anything runs: ldd (0 unresolved, no libquda) with machines/lq.sh loaded; the
+# binary's sha256 equals its release's PROVENANCE.txt exe line (when the binary sits in
+# <release>/bin/); 4 GPUs visible; every rank binds its GPU and that GPU's NUMA domain (a
+# probe step through the same wrapper; a failure stops the case before the driver starts).
+#
+# Output: runs/<YYYY_M_D>_<RUN>/ with hmc.log, select_gpu, numa_binding.txt (unpadded date,
+# the runs/ convention). Refuses to overwrite.
+# =============================================================================
+set -o pipefail
+
+ROOT=/lustre2/nplqcd/vayyar/grid_qcd
+WF=$ROOT/grid-lqcd-workflow
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+USAGE="usage: CASE=traj|forces BIN=<binary> RUN=<name> bash $0 (inside a Slurm job)"
+
+# ---- 1. Inputs ----------------------------------------------------------------------
+[ -n "${SLURM_JOB_ID:-}" ] || die "not inside a Slurm job (SLURM_JOB_ID unset). $USAGE"
+case "${CASE:-}" in traj|forces) ;; *) die "CASE must be traj or forces, got '${CASE:-}'. $USAGE" ;; esac
+[ -n "${BIN:-}" ] || die "BIN is not set. $USAGE"
+[ -n "${RUN:-}" ] || die "RUN is not set. $USAGE"
+[[ "$RUN" =~ ^[A-Za-z0-9._-]+$ ]] || die "RUN may contain only letters, digits, '.', '_' and '-', got '$RUN'"
+{ [ -f "$BIN" ] && [ -x "$BIN" ]; } || die "BIN is not an executable file: $BIN"
+BIN=$(readlink -f "$BIN")
+G_MODE=$CASE
+G_MPI=${MPI_GEOM:-1.1.1.4}
+G_SEED=${HMC_SEED_OFFSET:-200}
+G_MIN=${CASE_MIN:-10}
+[[ "$G_MPI" =~ ^[1-9]\.[1-9]\.[1-9]\.[1-9]$ ]] || die "MPI_GEOM must look like 1.1.1.4, got '$G_MPI'"
+[[ "$G_SEED" =~ ^[0-9]+$ ]] || die "HMC_SEED_OFFSET must be a non-negative integer, got '$G_SEED'"
+[[ "$G_MIN" =~ ^[1-9][0-9]*$ ]] || die "CASE_MIN must be a positive integer, got '$G_MIN'"
+NTASKS=4
+
+# ---- 2. Environment, loader and release checks ------------------------------------------
+# shellcheck source=/dev/null
+source "$WF/machines/lq.sh" || die "sourcing $WF/machines/lq.sh failed"
+set -u
+LDD_OUT=$(ldd "$BIN" 2>&1) || die "ldd failed on $BIN: $LDD_OUT"
+N_NOTFOUND=$(printf '%s\n' "$LDD_OUT" | grep -c 'not found' || true)
+N_QUDA=$(printf '%s\n' "$LDD_OUT" | grep -ci 'libquda' || true)
+if [ "$N_NOTFOUND" -ne 0 ]; then
+  printf '%s\n' "$LDD_OUT" | grep 'not found' >&2
+  die "ldd reports $N_NOTFOUND unresolved librar(y/ies) for $BIN on $(hostname)"
+fi
+[ "$N_QUDA" -eq 0 ] || die "ldd shows libquda in $BIN; this launcher is for pure-Grid builds only"
+BIN_SHA256=$(sha256sum "$BIN" | cut -d' ' -f1)
+PROV=$(dirname "$(dirname "$BIN")")/PROVENANCE.txt
+if [ -f "$PROV" ]; then
+  WANT=$(grep -m1 '^exe:' "$PROV" | grep -o 'sha256=[0-9a-f]*' | cut -d= -f2)
+  [ "$WANT" = "$BIN_SHA256" ] || die "sha256 of $BIN is $BIN_SHA256, its release record $PROV says '${WANT}'"
+fi
+command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found: not a GPU node ($(hostname))"
+
+# ---- 3. Clear every knob this run does not set (the Perlmutter families) ------------------
+# QUDA_*, HASEN_* (except HASEN_GRID_*), HMC_MG_*, USE_HMC_MG, FORCES_*, CKPT_*, TXQCD_*,
+# WCF_*, LAMBDA_MN2, INTEGRATOR_VERBOSE_MEM, NO_METROP, IMPORT_CFG; smoke16_puregrid.sh
+# section 3 explains each. HASEN_GRID_* and GRID_MG_* pass through.
+while read -r v; do
+  unset "$v"
+done < <(compgen -e | grep -E '^(QUDA_|HASEN_|HMC_MG_|USE_HMC_MG$|FORCES_|CKPT_|TXQCD_|WCF_|LAMBDA_MN2$|INTEGRATOR_VERBOSE_MEM$|NO_METROP$|IMPORT_CFG$)' | grep -v -E '^(HASEN_GRID_|GRID_MG_)')
+unset N_TRAJ
+N_QUDA_ENV=$(compgen -e | grep -c '^QUDA_' || true)
+[ "$N_QUDA_ENV" -eq 0 ] || die "QUDA_* variables still set after clearing"
+# Production speed-ups ON unless the caller sets VAR=0 (smoke16 section 3, 2026-10-02).
+for v in HASEN_GRID_FUSED_CLOVER_FORCE HASEN_GRID_DEVICE_CB HASEN_GRID_BATCH_SMEAR HASEN_GRID_IMPORT_SKIP HASEN_GRID_SHARE_FIELDSTRENGTH HASEN_GRID_GPU_CLOVER_INV HASEN_GRID_CLOVER_STENCIL; do
+  if [ -z "${!v:-}" ]; then
+    if [ "$(grep -c -a -F "$v" "$BIN" || true)" -gt 0 ]; then
+      export "$v=1"
+    else
+      echo "WARNING: $BIN predates $v: running without it" >&2
+    fi
+  fi
+done
+
+# ---- 4. Physics: the 16^3x48 cl3 recipe (smoke16_puregrid.sh section 4) -------------------
+export LATT=16.16.16.48
+export IMPORT_CFG=$ROOT/inputs/cl3_16_48_b6p1_m0p2450_a_cfg_11100.lime   # sha256 62c5c61e...
+[ -f "$IMPORT_CFG" ] || die "starting configuration not found: $IMPORT_CFG"
+export BETA=6.1
+export CSW=1.24930970916466
+export U0=0.832605301399891          # the driver's local default 1.0 is wrong (u0-48cube)
+export MASS_LIGHT=-0.245
+export MASS_STRANGE=-0.2050
+export STOUT_RHO=0.125 STOUT_NSMEAR=1
+export RAT_LO=1e-4 RAT_HI=100 RAT_DEGREE=20
+
+# ---- 5. Ladder and integrator (legacy knobs, no layout override) ---------------------------
+export HASEN_LADDER=-0.245,-0.20,-0.10
+export INTEGRATOR=ForceGradient
+export HASEN_TAIL_LEVEL=outer
+export GAUGE_INNER_MULT=2
+export TRAJL=0.35355339059327379
+export MDSTEPS=4
+[ "$G_MODE" = forces ] || export N_TRAJ=1
+
+# ---- 6. Seed and tolerances ---------------------------------------------------------------
+export HMC_SEED_OFFSET=$G_SEED
+export TUNE_CG_TOL_DERIV=1e-11
+export TUNE_CG_TOL_ACTION=1e-12
+export TUNE_CG_TOL_STRANGE=1e-9
+
+# ---- 7. FORCES_ONLY mode (forces16_puregrid.sh section 7, plain pass) ------------------------
+if [ "$G_MODE" = forces ]; then
+  export FORCES_ONLY=1
+  export FORCES_SAMPLES=1
+fi
+
+# ---- 8. Threads and Grid flags --------------------------------------------------------------
+export OMP_NUM_THREADS=8
+GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap)
+
+# ---- 9. Run directory (refuse to overwrite) ---------------------------------------------------
+DATE_TAG=$(date +%Y_%-m_%-d)
+RUN_DIR=$ROOT/runs/${DATE_TAG}_${RUN}
+[ -e "$RUN_DIR" ] && die "run directory already exists, refusing to overwrite: $RUN_DIR"
+mkdir -p "$RUN_DIR" || die "cannot create $RUN_DIR"
+LOG=$RUN_DIR/hmc.log
+
+# ---- 10. GPU and NUMA table, select_gpu wrapper ---------------------------------------------
+# One rank per GPU (the 4 GPUs Slurm gave the job), each rank bound to its GPU's NUMA domain
+# as read from sysfs (lq2: 2 sockets x 32 cores; the GPU-socket wiring is read, not assumed).
+# CUDA_DEVICE_ORDER=PCI_BUS_ID makes the CUDA index equal the nvidia-smi index used here.
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd,)
+fi
+IFS=, read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"
+[ "${#GPUS[@]}" -eq "$NTASKS" ] || die "need $NTASKS GPUs, CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES'"
+HAVE_NUMACTL=yes
+command -v numactl >/dev/null 2>&1 || HAVE_NUMACTL=no
+NUMAS=()
+BUSES=()
+for g in "${GPUS[@]}"; do
+  bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$g" | tr 'A-F' 'a-f')
+  sys=/sys/bus/pci/devices/${bus#0000}/numa_node
+  n=-1
+  [ -r "$sys" ] && n=$(cat "$sys")
+  [ "$HAVE_NUMACTL" = yes ] || n=-1
+  BUSES+=("$bus")
+  NUMAS+=("$n")
+done
+SELECT_GPU=$RUN_DIR/select_gpu
+printf '%s\n' \
+  '#!/bin/bash' \
+  '# 1:1 OpenMPI local rank -> GPU + the NUMA domain of that GPU (written by gate16_puregrid.sh)' \
+  "GPUS=(${GPUS[*]})" \
+  "NUMAS=(${NUMAS[*]})" \
+  'L=${OMPI_COMM_WORLD_LOCAL_RANK:?select_gpu: not started by OpenMPI mpirun}' \
+  'export CUDA_DEVICE_ORDER=PCI_BUS_ID' \
+  'export CUDA_VISIBLE_DEVICES=${GPUS[$L]}' \
+  'N=${NUMAS[$L]}' \
+  '[ "$N" -lt 0 ] || exec numactl -m "$N" -N "$N" "$@"' \
+  'exec "$@"' > "$SELECT_GPU"
+chmod +x "$SELECT_GPU"
+MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node" --bind-to none --wdir "$RUN_DIR")
+
+# Gate: every rank runs the wrapper and reports its GPU and binding; a failure stops here.
+if ! timeout -k 10s 3m "${MPIRUN[@]}" --tag-output "$SELECT_GPU" bash -c 'echo "gpu=$CUDA_VISIBLE_DEVICES $(numactl --show 2>/dev/null | grep -E "^(nodebind|membind)" | tr "\n" " ")"' > "$RUN_DIR/numa_binding.raw" 2>&1; then
+  cat "$RUN_DIR/numa_binding.raw" >&2
+  die "binding probe failed: mpirun could not start the wrapper on every rank. Nothing was run (rundir $RUN_DIR)."
+fi
+sed -n -E 's/^\[[0-9]+,([0-9]+)\]<stdout>:/\1: /p' "$RUN_DIR/numa_binding.raw" | sort -n > "$RUN_DIR/numa_binding.txt"
+[ "$(wc -l < "$RUN_DIR/numa_binding.txt")" -eq "$NTASKS" ] || die "binding probe returned $(wc -l < "$RUN_DIR/numa_binding.txt") of $NTASKS ranks (see $RUN_DIR/numa_binding.raw)"
+
+# ---- 11. Provenance: ENV line = line 1 of the log (Perlmutter format) -------------------------
+GRID_HASH_LINE=$(strings -a "$BIN" | grep -m1 -E '^[0-9a-f]{40}: ' || true)
+GRID_SHA=${GRID_HASH_LINE:0:40}
+GRID_SHA=${GRID_SHA:-unknown}
+case "$GRID_HASH_LINE" in *uncommit*) GRID_DIRTY=yes ;; *) GRID_DIRTY=no ;; esac
+MG_ENV=$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_|STRANGE_EVEN$)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
+if [ "$G_MODE" = traj ]; then
+  printf 'ENV SMOKE16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s N_TRAJ=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s METROP=on QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" GRID_FLAGS="%s" STRANGE_LEVEL=%s STRANGE_INNER_MULT=%s STRANGE_RUNGS=%s LEVEL_LIGHT=%s LEVEL_STRANGE=%s LEVEL_TAIL=%s LEVEL_GAUGE=%s LEVEL_MULT=%s\n' \
+    "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
+    "$LATT" "$G_MPI" "$NTASKS" "$(basename "$IMPORT_CFG")" "$HMC_SEED_OFFSET" "$N_TRAJ" \
+    "$MDSTEPS" "$TRAJL" "$INTEGRATOR" "$GAUGE_INNER_MULT" "$HASEN_LADDER" "$HASEN_TAIL_LEVEL" \
+    "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \
+    "$RAT_LO" "$RAT_HI" "$RAT_DEGREE" "$TUNE_CG_TOL_DERIV" "$TUNE_CG_TOL_ACTION" \
+    "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" na na \
+    "${HASEN_GRID_MG_RUNGS:-none}" "${HASEN_GRID_MG_HEATBATH_RUNGS:-none}" \
+    "${HASEN_GRID_MIXED_CG_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" \
+    "$MG_ENV" "${GRID_ARGS[*]}" default default none none none none none none > "$LOG"
+else
+  printf 'ENV FORCES16_PUREGRID RUN=%s JOBID=%s BIN=%s BIN_SHA256=%s GRID_SHA=%s GRID_DIRTY=%s MODE=FORCES_ONLY FORCES_SAMPLES=%s FORCES_STIFFNESS=%s STIFF=%s LATT=%s MPI=%s NTASKS=%s IMPORT_CFG=%s SEED=%s MDSTEPS=%s TRAJL=%s INTEGRATOR=%s GAUGE_INNER_MULT=%s LADDER=%s TAIL_LEVEL=%s MASS_LIGHT=%s MASS_STRANGE=%s CSW=%s BETA=%s U0=%s STOUT_RHO=%s STOUT_NSMEAR=%s RAT=%s/%s/%s TOL_DRV=%s TOL_ACT=%s TOL_STRANGE=%s QUDA_ENV=%s MPICH_IPC=%s MPICH_RDMA=%s GRID_MG_RUNGS=%s GRID_MG_HB=%s GRID_MIXED=%s GRID_MIXED_HB=%s GRID_MG_ENV="%s" GRID_FLAGS="%s"\n' \
+    "$RUN" "$SLURM_JOB_ID" "$(basename "$BIN")" "$BIN_SHA256" "$GRID_SHA" "$GRID_DIRTY" \
+    "$FORCES_SAMPLES" 0 none \
+    "$LATT" "$G_MPI" "$NTASKS" "$(basename "$IMPORT_CFG")" "$HMC_SEED_OFFSET" \
+    "$MDSTEPS" "$TRAJL" "$INTEGRATOR" "$GAUGE_INNER_MULT" "$HASEN_LADDER" "$HASEN_TAIL_LEVEL" \
+    "$MASS_LIGHT" "$MASS_STRANGE" "$CSW" "$BETA" "$U0" "$STOUT_RHO" "$STOUT_NSMEAR" \
+    "$RAT_LO" "$RAT_HI" "$RAT_DEGREE" "$TUNE_CG_TOL_DERIV" "$TUNE_CG_TOL_ACTION" \
+    "$TUNE_CG_TOL_STRANGE" "$N_QUDA_ENV" na na \
+    "${HASEN_GRID_MG_RUNGS:-none}" "${HASEN_GRID_MG_HEATBATH_RUNGS:-none}" \
+    "${HASEN_GRID_MIXED_CG_RUNGS:-none}" "${HASEN_GRID_MIXED_CG_HEATBATH_RUNGS:-none}" \
+    "$MG_ENV" "${GRID_ARGS[*]}" > "$LOG"
+fi
+{
+  printf 'GRID_HASH %s\n' "${GRID_HASH_LINE:-unknown}"
+  printf 'BIN_PATH %s\n' "$BIN"
+  sed 's/^/NUMA /' "$RUN_DIR/numa_binding.txt"
+  printf 'CMD '
+  printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}"
+  printf '\n'
+  printf 'LAUNCH host=%s ompi="%s" modules="%s" gpus=%s buses=%s numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
+    "$(hostname)" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
+    "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
+    "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")" \
+    "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
+    "$(compgen -e | grep '^UCX_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)"
+} >> "$LOG"
+
+# ---- 12. Launch -------------------------------------------------------------------------------
+echo "running $(basename "$BIN") CASE=$G_MODE MPI=$G_MPI -> $LOG"
+timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}" >> "$LOG" 2>&1
+rc=$?
+printf 'exit=%s\n' "$rc" >> "$LOG"
+
+# ---- 13. Summary ------------------------------------------------------------------------------
+echo "==== $RUN: exit=$rc  log: $LOG"
+grep -a -E '^(ENV|NUMA|LAUNCH) ' "$LOG"
+grep -a -E 'Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|Integrator: ' "$LOG"
+if [ "$G_MODE" = traj ]; then
+  grep -a -E '\[0\]\[[0-9]+\] Force average' "$LOG" | head -6
+  grep -a -E 'Total H before trajectory|Total H after trajectory|exp\(-dH\)|Metropolis_test|Total time for trajectory|Plaquette: \[|FORCES traj=' "$LOG"
+else
+  grep -a -E 'FORCES_ONLY (level|samples=)|\[FORCES_ONLY\]' "$LOG"
+fi
+echo "log: $LOG"
+exit "$rc"
