@@ -22,6 +22,10 @@
 #   f10  CASE=forces  FORCES_ONLY, one sample, same recipe         (ref runs/2026_10_14_gate16s_f10)
 #   mg   CASE=traj    Grid MG on rungs 0,1 and their heatbaths, --mpi 1.1.2.2, GRID_MG_BLOCK2=2.2.1.3
 #                     (optional; ref runs/2026_11_13_m8_gate16_mg, binary _stock_m8)
+# Layout tests, by CASES only (not in the default set): with 2 ranks per GPU, job 1363337 ran
+# 10x slower per CG iteration than Perlmutter even with the node communicator fixed.
+#   t10r2   t10 on 2 ranks, one per GPU, --mpi 1.1.1.2 (decomposition differs from the reference)
+#   t10mps  t10 on 4 ranks, 2 per GPU, with NVIDIA's MPS daemon running
 # QOS test: priority 500, 30 min, one job per user; the reference t10 took 43 s per
 # trajectory on Perlmutter. The comparison runs afterwards on the login node.
 # Optional: BIN=<binary> (default the m10_gpu release), TAG=<suffix for the run names>,
@@ -33,8 +37,9 @@ LAUNCH=$ROOT/grid-lqcd-workflow/5_studies/hasenbusch_tune/lq/gate16_puregrid.sh
 BIN=${BIN:-$ROOT/installs/dev/m10_gpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 TAG=${TAG:-}
 LQ_MPI_STACK=${LQ_MPI_STACK:-gompi}
+CASES=${CASES:-t10 f10 mg}
 
-echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date), LQ_MPI_STACK=${LQ_MPI_STACK} TAG=${TAG}"
+echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date), LQ_MPI_STACK=${LQ_MPI_STACK} TAG=${TAG} CASES=${CASES}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi -L
 nvidia-smi topo -m
@@ -45,7 +50,7 @@ numactl -H || echo "numactl -H failed"
 # MPI_GEOM and the seed from its caller).
 while read -r v; do
   unset "$v"
-done < <(compgen -e | grep -E '^(FORCES_|HASEN_|GRID_MG_|CUSTOM_|DIAG_|MPI_GEOM$|HMC_SEED_OFFSET$|CASE$|CASE_MIN$|RUN$)' || true)
+done < <(compgen -e | grep -E '^(FORCES_|HASEN_|GRID_MG_|CUSTOM_|DIAG_|MPI_GEOM$|HMC_SEED_OFFSET$|CASE$|CASE_MIN$|RUN$|NRANKS$|GPU_MPS$)' || true)
 
 # run_case <name> <traj|forces> <cap minutes> [VAR=value ...]
 run_case() {
@@ -59,8 +64,15 @@ run_case() {
   echo "case ${name}: exit=${rc}  $((SECONDS - t0)) s"
 }
 
-run_case t10 traj 8
-run_case f10 forces 5
-run_case mg traj 8 MPI_GEOM=1.1.2.2 HASEN_GRID_MG_RUNGS=0,1 HASEN_GRID_MG_HEATBATH_RUNGS=0,1 GRID_MG_BLOCK2=2.2.1.3
+for c in $CASES; do
+  case $c in
+    t10)    run_case t10 traj 8 ;;
+    f10)    run_case f10 forces 5 ;;
+    mg)     run_case mg traj 8 MPI_GEOM=1.1.2.2 HASEN_GRID_MG_RUNGS=0,1 HASEN_GRID_MG_HEATBATH_RUNGS=0,1 GRID_MG_BLOCK2=2.2.1.3 ;;
+    t10r2)  run_case t10r2 traj 8 NRANKS=2 MPI_GEOM=1.1.1.2 ;;
+    t10mps) run_case t10mps traj 8 GPU_MPS=1 ;;
+    *)      echo "unknown case '$c' (t10 f10 mg t10r2 t10mps)" ;;
+  esac
+done
 echo
 echo "=== done $(date)"

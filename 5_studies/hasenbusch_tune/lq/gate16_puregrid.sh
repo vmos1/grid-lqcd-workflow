@@ -31,6 +31,11 @@
 #                       every rank in a node communicator of size 1 (Grid's GPU-to-GPU halo
 #                       path off); HPC-X groups the node's ranks. The launcher checks that the
 #                       binary's libmpi and mpirun come from the chosen stack.
+#   NRANKS              MPI ranks, default 4; must equal the product of MPI_GEOM (layout tests:
+#                       NRANKS=2 MPI_GEOM=1.1.1.2 puts one rank on each of QOS test's 2 GPUs)
+#   GPU_MPS             1 = start NVIDIA's MPS daemon for this case (pipe and log dirs in node
+#                       /tmp, log copied to the rundir), so ranks sharing a GPU run concurrently
+#                       instead of in time slices; default 0
 #
 # Checks before anything runs: ldd (0 unresolved, no libquda) with machines/lq.sh loaded; the
 # binary's sha256 equals its release's PROVENANCE.txt exe line (when the binary sits in
@@ -60,10 +65,17 @@ G_MODE=$CASE
 G_MPI=${MPI_GEOM:-1.1.1.4}
 G_SEED=${HMC_SEED_OFFSET:-200}
 G_MIN=${CASE_MIN:-10}
+G_NRANKS=${NRANKS:-4}
+G_MPS=${GPU_MPS:-0}
 [[ "$G_MPI" =~ ^[1-9]\.[1-9]\.[1-9]\.[1-9]$ ]] || die "MPI_GEOM must look like 1.1.1.4, got '$G_MPI'"
 [[ "$G_SEED" =~ ^[0-9]+$ ]] || die "HMC_SEED_OFFSET must be a non-negative integer, got '$G_SEED'"
 [[ "$G_MIN" =~ ^[1-9][0-9]*$ ]] || die "CASE_MIN must be a positive integer, got '$G_MIN'"
-NTASKS=4
+[[ "$G_NRANKS" =~ ^[1-9][0-9]*$ ]] || die "NRANKS must be a positive integer, got '$G_NRANKS'"
+[[ "$G_MPS" =~ ^[01]$ ]] || die "GPU_MPS must be 0 or 1, got '$G_MPS'"
+IFS=. read -r M1 M2 M3 M4 <<< "$G_MPI"
+[ $((M1 * M2 * M3 * M4)) -eq "$G_NRANKS" ] || die "MPI_GEOM=$G_MPI needs $((M1 * M2 * M3 * M4)) ranks, NRANKS=$G_NRANKS"
+[ "$G_NRANKS" -le "${SLURM_NTASKS:-$G_NRANKS}" ] || die "NRANKS=$G_NRANKS exceeds the job's $SLURM_NTASKS tasks"
+NTASKS=$G_NRANKS
 
 # ---- 2. Environment, loader and release checks ------------------------------------------
 # shellcheck source=/dev/null
@@ -185,11 +197,13 @@ done
 # Rank L -> GPU number L*NGPU/NTASKS: one rank per GPU with 4 GPUs; with fewer (QOS test caps a
 # job at 2 GPUs), neighbouring ranks share a GPU. The decomposition (--mpi) is unchanged, so the
 # arithmetic is too; only the halo path between ranks on one GPU differs.
+# Under MPS the server renumbers the devices it was started with from 0, so a client names its
+# GPU by position in the job's list, not by the Slurm index.
 RANKS=()
 NUMAS=()
 for ((L = 0; L < NTASKS; L++)); do
   i=$((L * NGPU / NTASKS))
-  RANKS+=("${GPUS[$i]}")
+  if [ "$G_MPS" = 1 ]; then RANKS+=("$i"); else RANKS+=("${GPUS[$i]}"); fi
   NUMAS+=("${GNUMA[$i]}")
 done
 SELECT_GPU=$RUN_DIR/select_gpu
@@ -214,6 +228,25 @@ if ! timeout -k 10s 3m "${MPIRUN[@]}" --tag-output "$SELECT_GPU" bash -c 'echo "
 fi
 sed -n -E 's/^\[[0-9]+,([0-9]+)\]<stdout>:/\1: /p' "$RUN_DIR/numa_binding.raw" | sort -n > "$RUN_DIR/numa_binding.txt"
 [ "$(wc -l < "$RUN_DIR/numa_binding.txt")" -eq "$NTASKS" ] || die "binding probe returned $(wc -l < "$RUN_DIR/numa_binding.txt") of $NTASKS ranks (see $RUN_DIR/numa_binding.raw)"
+
+# Optional MPS daemon (GPU_MPS=1), started on the job's GPUs and stopped when this script exits.
+# Its pipe directory must be on a local filesystem (named pipes), hence node /tmp.
+COMPUTE_MODE=$(nvidia-smi --query-gpu=compute_mode --format=csv,noheader -i "${GPUS[0]}" 2>/dev/null || echo unknown)
+MPS_STATE=off
+stop_mps() {
+  echo quit | nvidia-cuda-mps-control
+  sleep 2
+  cp -r "$CUDA_MPS_LOG_DIRECTORY" "$RUN_DIR/mps_log" 2>/dev/null || true
+}
+if [ "$G_MPS" = 1 ]; then
+  command -v nvidia-cuda-mps-control >/dev/null 2>&1 || die "GPU_MPS=1 but nvidia-cuda-mps-control is not on PATH"
+  export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_${SLURM_JOB_ID}_${RUN}
+  export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_${SLURM_JOB_ID}_${RUN}
+  mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY" || die "cannot create the MPS directories in /tmp"
+  CUDA_DEVICE_ORDER=PCI_BUS_ID nvidia-cuda-mps-control -d || die "the MPS control daemon did not start (compute mode $COMPUTE_MODE)"
+  trap stop_mps EXIT
+  MPS_STATE="on(pipe=$CUDA_MPS_PIPE_DIRECTORY)"
+fi
 
 # ---- 11. Provenance: ENV line = line 1 of the log (Perlmutter format) -------------------------
 GRID_HASH_LINE=$(strings -a "$BIN" | grep -m1 -E '^[0-9a-f]{40}: ' || true)
@@ -252,8 +285,8 @@ fi
   printf 'CMD '
   printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}"
   printf '\n'
-  printf 'LAUNCH host=%s mpi_stack=%s libmpi=%s ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
-    "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
+  printf 'LAUNCH host=%s mpi_stack=%s libmpi=%s mps=%s compute_mode="%s" ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
+    "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$MPS_STATE" "$COMPUTE_MODE" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
     "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${GNUMA[*]}")" \
     "$(IFS=,; echo "${RANKS[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
     "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")" \
