@@ -9,10 +9,12 @@
 # This script IS the manifest. To benchmark a new candidate against the same data:
 #   1. its 20-trajectory Grid chain from cfg_2000 (seed offset 300, TRAJL 1.0, four 40 GB nodes):
 #      add a GRID_RUNS line (label=hmc.log[,hmc.log of the next segment]) and its ladder in LADDERS;
-#   2. its Chroma chain, if any: a CHROMA_RUNS line;
+#   2. its Chroma chain, if any: a --run "label=run dir" line in the chroma_runs_csv.py call and
+#      its label in CHROMA_ORDER;
 #   3. its 9 multistart runs (perlmutter/multistart_submit.sh): 9 lines in regen_multistart.sh;
 #   4. Wilson flow on the chain's 20 configurations (perlmutter/wflow48_batch.sh): its row in
-#      plot_wflow_scales.py ROWS, its flow logs in WFLOW_LOGS and its row label in WFLOW_ROWS;
+#      plot_wflow_scales.py ROWS, a glob line for its flow logs in WFLOW_LOGS and its row label in
+#      WFLOW_ROWS;
 #   5. its name in ORDER (and in plot_candidates_2x2.NAMED for a fixed colour).
 # The protocol, pass bars and reference numbers: __docs/2026_11_16_hmc_tuning_summary.md.
 #
@@ -20,7 +22,8 @@
 # steps, light and strange at 12, gauge at 48 (tune 1); D_10_40_80 = baseline ladder, light rungs,
 # log-dets and strange at 10, tail 40, gauge 80; D_8_16_32_64 = baseline ladder, light 8, strange 16,
 # tail 32, gauge 64 (tune 2). D_8_16_32_64's cfg_2000 chains and their flow ran with the gauge at
-# 128, equivalent (L204); its multistart arm ran at 64. D_10_40_80's Grid chain (two segments,
+# 128: the same ΔH as 64 on a paired draw (L204), about 110 s more smearing and gauge time per
+# trajectory; its multistart arm ran at 64. D_10_40_80's Grid chain (two segments,
 # jobs 61425065/61425176) and its flow are picked up automatically once their run dirs exist.
 #
 # Worked output: __docs/2026_11_16_hmc_candidates_benchmark.md
