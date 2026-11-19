@@ -1,8 +1,9 @@
 #!/bin/bash
 # =============================================================================
 # gate16_puregrid.sh -- one 16^3x48 case of the pure-Grid compact-Schur driver
-# (src/gen_qcd_hasenbusch_tune_compact_schur.cc) on one lq2 node, 4 x A100, run INSIDE a
-# Slurm job with OpenMPI mpirun. Never submits; the job script is gate16_m10_gpu_job.sh.
+# (src/gen_qcd_hasenbusch_tune_compact_schur.cc) on one lq2 node, 4 ranks on the job's 4 A100
+# (one per rank) or 2 (two ranks per GPU, the QOS test cap), run INSIDE a Slurm job with
+# OpenMPI mpirun. Never submits; the job script is gate16_m10_gpu_job.sh.
 #   CASE=traj    one HMC trajectory   = the recipe of ../perlmutter/smoke16_puregrid.sh
 #   CASE=forces  one FORCES_ONLY pass = the recipe of ../perlmutter/forces16_puregrid.sh
 #
@@ -29,7 +30,7 @@
 #
 # Checks before anything runs: ldd (0 unresolved, no libquda) with machines/lq.sh loaded; the
 # binary's sha256 equals its release's PROVENANCE.txt exe line (when the binary sits in
-# <release>/bin/); 4 GPUs visible; every rank binds its GPU and that GPU's NUMA domain (a
+# <release>/bin/); the GPU count divides 4; every rank binds its GPU and that GPU's NUMA domain (a
 # probe step through the same wrapper; a failure stops the case before the driver starts).
 #
 # Output: runs/<YYYY_M_D>_<RUN>/ with hmc.log, select_gpu, numa_binding.txt (unpadded date,
@@ -146,17 +147,18 @@ mkdir -p "$RUN_DIR" || die "cannot create $RUN_DIR"
 LOG=$RUN_DIR/hmc.log
 
 # ---- 10. GPU and NUMA table, select_gpu wrapper ---------------------------------------------
-# One rank per GPU (the 4 GPUs Slurm gave the job), each rank bound to its GPU's NUMA domain
-# as read from sysfs (lq2: 2 sockets x 32 cores; the GPU-socket wiring is read, not assumed).
+# The GPUs Slurm gave the job; each rank bound to its GPU's NUMA domain as read from sysfs
+# (lq2: 2 sockets x 32 cores; the GPU-socket wiring is read, not assumed).
 # CUDA_DEVICE_ORDER=PCI_BUS_ID makes the CUDA index equal the nvidia-smi index used here.
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
   CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd,)
 fi
 IFS=, read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"
-[ "${#GPUS[@]}" -eq "$NTASKS" ] || die "need $NTASKS GPUs, CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES'"
+NGPU=${#GPUS[@]}
+{ [ "$NGPU" -ge 1 ] && [ $((NTASKS % NGPU)) -eq 0 ]; } || die "the GPU count must divide $NTASKS, CUDA_VISIBLE_DEVICES='$CUDA_VISIBLE_DEVICES'"
 HAVE_NUMACTL=yes
 command -v numactl >/dev/null 2>&1 || HAVE_NUMACTL=no
-NUMAS=()
+GNUMA=()
 BUSES=()
 for g in "${GPUS[@]}"; do
   bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$g" | tr 'A-F' 'a-f')
@@ -165,18 +167,28 @@ for g in "${GPUS[@]}"; do
   [ -r "$sys" ] && n=$(cat "$sys")
   [ "$HAVE_NUMACTL" = yes ] || n=-1
   BUSES+=("$bus")
-  NUMAS+=("$n")
+  GNUMA+=("$n")
+done
+# Rank L -> GPU number L*NGPU/NTASKS: one rank per GPU with 4 GPUs; with fewer (QOS test caps a
+# job at 2 GPUs), neighbouring ranks share a GPU. The decomposition (--mpi) is unchanged, so the
+# arithmetic is too; only the halo path between ranks on one GPU differs.
+RANKS=()
+NUMAS=()
+for ((L = 0; L < NTASKS; L++)); do
+  i=$((L * NGPU / NTASKS))
+  RANKS+=("${GPUS[$i]}")
+  NUMAS+=("${GNUMA[$i]}")
 done
 SELECT_GPU=$RUN_DIR/select_gpu
 printf '%s\n' \
   '#!/bin/bash' \
-  '# 1:1 OpenMPI local rank -> GPU + the NUMA domain of that GPU (written by gate16_puregrid.sh)' \
-  "GPUS=(${GPUS[*]})" \
-  "NUMAS=(${NUMAS[*]})" \
+  '# OpenMPI local rank -> GPU + the NUMA domain of that GPU (written by gate16_puregrid.sh)' \
+  "RANK_GPU=(${RANKS[*]})" \
+  "RANK_NUMA=(${NUMAS[*]})" \
   'L=${OMPI_COMM_WORLD_LOCAL_RANK:?select_gpu: not started by OpenMPI mpirun}' \
   'export CUDA_DEVICE_ORDER=PCI_BUS_ID' \
-  'export CUDA_VISIBLE_DEVICES=${GPUS[$L]}' \
-  'N=${NUMAS[$L]}' \
+  'export CUDA_VISIBLE_DEVICES=${RANK_GPU[$L]}' \
+  'N=${RANK_NUMA[$L]}' \
   '[ "$N" -lt 0 ] || exec numactl -m "$N" -N "$N" "$@"' \
   'exec "$@"' > "$SELECT_GPU"
 chmod +x "$SELECT_GPU"
@@ -227,9 +239,10 @@ fi
   printf 'CMD '
   printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}"
   printf '\n'
-  printf 'LAUNCH host=%s ompi="%s" modules="%s" gpus=%s buses=%s numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
+  printf 'LAUNCH host=%s ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
     "$(hostname)" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
-    "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
+    "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${GNUMA[*]}")" \
+    "$(IFS=,; echo "${RANKS[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
     "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")" \
     "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
     "$(compgen -e | grep '^UCX_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)"

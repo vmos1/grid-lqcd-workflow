@@ -5,21 +5,25 @@
 #SBATCH --qos=test
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-node=4
-#SBATCH --exclusive
-#SBATCH --mem=0
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-node=2
+#SBATCH --mem=480G
 #SBATCH --time=00:30:00
 #SBATCH --output=/lustre2/nplqcd/vayyar/grid_qcd/logs/gate16_m10_gpu_%j.log
 #
-# The 16^3 gate of release m10_gpu on one lq2 node (4 x A100) against the Perlmutter reference
-# (__docs/2026_11_18_handoff_lq_port.md section 7c). Three cases, one after the other, each a
-# gate16_puregrid.sh run with its own cap:
+# The 16^3 gate of release m10_gpu on one lq2 node against the Perlmutter reference
+# (__docs/2026_11_18_handoff_lq_port.md section 7c). 4 ranks on 2 A100 (two per GPU): QOS test
+# caps a job at 2 GPUs and 500 GB (MaxTRES, checked 2026-11-19; a 4-GPU test job pends forever
+# on QOSMaxMemoryPerJob / the GPU cap). The decomposition is Perlmutter's, so the comparison
+# holds; one GPU per rank is first exercised by the 48^3 runs on QOS normal.
+# 16 cores per rank take all 64 cores of the node, so the binding probe never meets cores of
+# another job. Three cases, one after the other, each a gate16_puregrid.sh run with its own cap:
 #   t10  CASE=traj    one trajectory, CG routes, --mpi 1.1.1.4     (ref runs/2026_10_14_gate16s_t10)
 #   f10  CASE=forces  FORCES_ONLY, one sample, same recipe         (ref runs/2026_10_14_gate16s_f10)
 #   mg   CASE=traj    Grid MG on rungs 0,1 and their heatbaths, --mpi 1.1.2.2, GRID_MG_BLOCK2=2.2.1.3
 #                     (optional; ref runs/2026_11_13_m8_gate16_mg, binary _stock_m8)
-# QOS test: priority 500, 30 min, 4 GPUs and one job per user group-wide; the reference t10
-# took 43 s per trajectory on Perlmutter. The comparison runs afterwards on the login node.
+# QOS test: priority 500, 30 min, one job per user; the reference t10 took 43 s per
+# trajectory on Perlmutter. The comparison runs afterwards on the login node.
 # Optional: BIN=<binary> (default the m10_gpu release), TAG=<suffix for the run names>.
 set -uo pipefail
 ROOT=/lustre2/nplqcd/vayyar/grid_qcd
