@@ -24,14 +24,17 @@
 #                     (optional; ref runs/2026_11_13_m8_gate16_mg, binary _stock_m8)
 # QOS test: priority 500, 30 min, one job per user; the reference t10 took 43 s per
 # trajectory on Perlmutter. The comparison runs afterwards on the login node.
-# Optional: BIN=<binary> (default the m10_gpu release), TAG=<suffix for the run names>.
+# Optional: BIN=<binary> (default the m10_gpu release), TAG=<suffix for the run names>,
+# LQ_MPI_STACK=gompi|hpcx (default gompi; machines/lq.sh). Job 1363314 ran on gompi, whose
+# OpenMPI gives Grid a node communicator of size 1; HPC-X groups the 4 ranks (probe 1363336).
 set -uo pipefail
 ROOT=/lustre2/nplqcd/vayyar/grid_qcd
 LAUNCH=$ROOT/grid-lqcd-workflow/5_studies/hasenbusch_tune/lq/gate16_puregrid.sh
 BIN=${BIN:-$ROOT/installs/dev/m10_gpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 TAG=${TAG:-}
+LQ_MPI_STACK=${LQ_MPI_STACK:-gompi}
 
-echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date)"
+echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date), LQ_MPI_STACK=${LQ_MPI_STACK} TAG=${TAG}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi -L
 nvidia-smi topo -m
@@ -51,7 +54,7 @@ run_case() {
   echo
   echo "---- case ${name}: CASE=${mode} cap ${cap} min $* ($(date +%T))"
   local t0=$SECONDS
-  env CASE="$mode" CASE_MIN="$cap" BIN="$BIN" RUN="lq_gate16_${name}${TAG}" "$@" bash "$LAUNCH"
+  env CASE="$mode" CASE_MIN="$cap" BIN="$BIN" RUN="lq_gate16_${name}${TAG}" LQ_MPI_STACK="$LQ_MPI_STACK" "$@" bash "$LAUNCH"
   local rc=$?
   echo "case ${name}: exit=${rc}  $((SECONDS - t0)) s"
 }

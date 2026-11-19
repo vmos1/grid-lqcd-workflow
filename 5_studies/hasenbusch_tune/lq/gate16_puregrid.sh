@@ -10,7 +10,7 @@
 # Purpose: the 16^3 gate of an lq release against the Perlmutter reference
 # (__docs/2026_11_18_handoff_lq_port.md section 7c). Physics, seed, tolerances, Grid flags
 # and decomposition are the Perlmutter recipe's, value for value; the only lq changes are the
-# launcher (mpirun, not srun) and the GPU/NUMA wrapper.
+# launcher (mpirun, not srun), the GPU/NUMA wrapper and, with LQ_MPI_STACK=hpcx, the MPI library.
 #
 # Log format. Line 1 of hmc.log is the ENV line in the Perlmutter format: tag SMOKE16_PUREGRID
 # (traj) or FORCES16_PUREGRID (forces), the same fields in the same order, so the two logs
@@ -27,6 +27,10 @@
 #   HASEN_GRID_*, GRID_MG_*   routes and tunables, passed through unscrubbed and recorded in
 #                       the ENV line's GRID_MG_ENV, as on Perlmutter
 #   CASE_MIN            timeout of the run in minutes, default 10
+#   LQ_MPI_STACK        gompi (default) or hpcx, read by machines/lq.sh. gompi's OpenMPI puts
+#                       every rank in a node communicator of size 1 (Grid's GPU-to-GPU halo
+#                       path off); HPC-X groups the node's ranks. The launcher checks that the
+#                       binary's libmpi and mpirun come from the chosen stack.
 #
 # Checks before anything runs: ldd (0 unresolved, no libquda) with machines/lq.sh loaded; the
 # binary's sha256 equals its release's PROVENANCE.txt exe line (when the binary sits in
@@ -73,6 +77,15 @@ if [ "$N_NOTFOUND" -ne 0 ]; then
   die "ldd reports $N_NOTFOUND unresolved librar(y/ies) for $BIN on $(hostname)"
 fi
 [ "$N_QUDA" -eq 0 ] || die "ldd shows libquda in $BIN; this launcher is for pure-Grid builds only"
+LIBMPI=$(printf '%s\n' "$LDD_OUT" | grep -o -m1 '/[^ ]*libmpi\.so[^ ]*' || true)
+MPIRUN_BIN=$(command -v mpirun || true)
+case $LQ_MPI_STACK in
+  gompi) STACK_DIR=/srv/software/el8/x86_64/eb/OpenMPI/ ;;
+  hpcx)  STACK_DIR=${HPCX_DIR:?lq.sh set LQ_MPI_STACK=hpcx but HPCX_DIR is unset}/ ;;
+  *)     die "LQ_MPI_STACK must be gompi or hpcx, got '$LQ_MPI_STACK'" ;;
+esac
+[[ "$LIBMPI" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but $BIN loads libmpi from '$LIBMPI'"
+[[ "$MPIRUN_BIN" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but mpirun is '$MPIRUN_BIN'"
 BIN_SHA256=$(sha256sum "$BIN" | cut -d' ' -f1)
 PROV=$(dirname "$(dirname "$BIN")")/PROVENANCE.txt
 if [ -f "$PROV" ]; then
@@ -239,8 +252,8 @@ fi
   printf 'CMD '
   printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "$SELECT_GPU" "$BIN" "${GRID_ARGS[@]}"
   printf '\n'
-  printf 'LAUNCH host=%s ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
-    "$(hostname)" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
+  printf 'LAUNCH host=%s mpi_stack=%s libmpi=%s ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
+    "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
     "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${GNUMA[*]}")" \
     "$(IFS=,; echo "${RANKS[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
     "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")" \
@@ -257,7 +270,7 @@ printf 'exit=%s\n' "$rc" >> "$LOG"
 # ---- 13. Summary ------------------------------------------------------------------------------
 echo "==== $RUN: exit=$rc  log: $LOG"
 grep -a -E '^(ENV|NUMA|LAUNCH) ' "$LOG"
-grep -a -E 'Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|Integrator: ' "$LOG"
+grep -a -E 'communicator of size|Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|Integrator: ' "$LOG"
 if [ "$G_MODE" = traj ]; then
   grep -a -E '\[0\]\[[0-9]+\] Force average' "$LOG" | head -6
   grep -a -E 'Total H before trajectory|Total H after trajectory|exp\(-dH\)|Metropolis_test|Total time for trajectory|Plaquette: \[|FORCES traj=' "$LOG"
