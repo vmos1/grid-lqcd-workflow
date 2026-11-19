@@ -15,16 +15,26 @@
 #       (the shared physics patches); PROVENANCE.txt lists the lq fix with its sha256.
 #   - paths: the workspace layout (__docs/2026_11_18_handoff_lq_port.md section 2)
 #       source  builds/external/Grid            (stock clone, never edited)
-#       stage   builds/grid-stock-<sha8>-p08_gpu/{Grid,Grid/build,install,eigen-3.4.0}
+#       stage   builds/grid-stock-<sha8>-p08_<target>/{Grid,Grid/build,install,eigen-3.4.0}
 #       Eigen   builds/downloads/eigen-3.4.0.tar.bz2
+#
+# TARGET=gpu (default) or cpu, passed to machines/lq.sh as LQ_TARGET.
+#   gpu  lq2 A100: the flags above; every action may run on the EL8 login node or lq1.
+#   cpu  lq3 EPYC 9355 (Zen 5): AVX512, shm via shm_open, -march=znver5, gcc 15.3 and GMP/MPFR
+#        from the EL9 spack, Grid-CPU's OpenMPI 4.1.8 (lq.sh), the flags of the lq3 reference
+#        build (/lustre2/nplqcd/Grid-CPU/systems/LQ3/config-command). prepare and patch run on
+#        the login node (no toolchain needed); configure, build and install need the EL9
+#        toolchain, so they run on an lq3 node (build_grid_stock_hmc_cpu_job.sh). Same source
+#        tree as gpu: lq-01 sits inside #ifdef GRID_CUDA and is inert on CPU.
 #
 # Actions:
 #   prepare    clone GRID_SRC@GRID_SHA into the stage, vendor Eigen 3.4.0, filelist + autoreconf
 #   patch      apply patches/stock-grid-3d3eff86/*.patch (sorted, idempotent)
-#   configure  configure for lq A100
+#   configure  configure for the target (cpu: on an lq3 node)
 #   build      make libGrid     -- COMPUTE NODE ONLY (sbatch), JOBS default 32
 #   install    make install     -- COMPUTE NODE ONLY
-#   all        prepare + patch + configure   (login node; never builds)
+#   all        prepare + patch + configure   (login node; never builds; gpu only, since cpu
+#              configure needs lq3: there run prepare and patch here, the rest in the job)
 #   info       print paths only
 #
 # Like the Perlmutter script this does not run Grid/bootstrap.sh (it deletes the
@@ -37,7 +47,17 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKFLOW=$(cd "${HERE}/../.." && pwd)
 ROOT=$(cd "${WORKFLOW}/.." && pwd)
 
-source "${WORKFLOW}/machines/lq.sh"
+TARGET=${TARGET:-gpu}
+case "${TARGET}" in gpu|cpu) ;; *) printf 'ERROR: TARGET must be gpu or cpu, got %s\n' "${TARGET}" >&2; exit 2 ;; esac
+ENV_LOADED=0
+# The toolchain. gpu: loaded up front, as before. cpu: only by the actions that compile, since
+# the EL9 toolchain refuses to load on the EL8 login node where prepare and patch run.
+load_env() {
+  (( ENV_LOADED )) && return
+  LQ_TARGET=${TARGET} source "${WORKFLOW}/machines/lq.sh"
+  ENV_LOADED=1
+}
+[[ "${TARGET}" == gpu ]] && load_env
 
 ACTION=${1:-all}
 GRID_SRC=${GRID_SRC:-${ROOT}/builds/external/Grid}
@@ -47,7 +67,7 @@ JOBS=${JOBS:-32}
 PATCH_DIR=${PATCH_DIR:-${WORKFLOW}/1_build_grid/patches/stock-grid-3d3eff86}
 LQ_PATCH_DIR=${LQ_PATCH_DIR:-${HERE}/patches}
 
-STAGE_ROOT=${STAGE_ROOT:-${ROOT}/builds/grid-stock-${GRID_SHA:0:8}-p08_gpu}
+STAGE_ROOT=${STAGE_ROOT:-${ROOT}/builds/grid-stock-${GRID_SHA:0:8}-p08_${TARGET}}
 STAGE_SRC=${STAGE_SRC:-${STAGE_ROOT}/Grid}
 BUILD_DIR=${BUILD_DIR:-${STAGE_SRC}/build}
 INSTALL_PREFIX=${INSTALL_PREFIX:-${STAGE_ROOT}/install}
@@ -62,6 +82,7 @@ PROVENANCE=${STAGE_ROOT}/PROVENANCE.txt
 now() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 
 print_paths() {
+  printf 'TARGET=%s\n' "${TARGET}"
   printf 'GRID_SRC=%s\n' "${GRID_SRC}"
   printf 'GRID_SHA=%s\n' "${GRID_SHA}"
   printf 'PATCH_DIR=%s\n' "${PATCH_DIR}"
@@ -82,6 +103,7 @@ provenance_header() {
     printf 'workflow:   %s (%s%s)\n' "$(git -C "${WORKFLOW}" rev-parse --short HEAD)" \
       "$(git -C "${WORKFLOW}" rev-parse --abbrev-ref HEAD)" \
       "$([[ -n "$(git -C "${WORKFLOW}" status --porcelain --untracked-files=no)" ]] && echo ', dirty')"
+    printf 'TARGET:     %s\n' "${TARGET}"
     printf 'GRID_SHA:   %s\n' "${GRID_SHA}"
     printf 'GRID_SRC:   %s\n' "${GRID_SRC}"
     printf 'STAGE_SRC:  %s\n' "${STAGE_SRC}"
@@ -194,30 +216,60 @@ configure_grid() {
     exit 1
   }
 
-  # Perlmutter's flags (../build_grid_stock_hmc.sh) with the lq substitutions above.
-  local cmd=(
-    "${STAGE_SRC}/configure"
-    --prefix="${INSTALL_PREFIX}"
-    --enable-comms=mpi
-    --enable-simd=GPU
-    --enable-shm=nvlink
-    --enable-gen-simd-width=64
-    --enable-accelerator=cuda
-    --enable-setdevice
-    --disable-fermion-reps
-    --disable-unified
-    --disable-gparity
-    --with-lime="${CLIME_ROOT}"
-    CXX=nvcc
-    LDFLAGS="-cudart shared"
-    CXXFLAGS="-ccbin mpicxx -gencode arch=compute_80,code=${CUDA_ARCH} -std=c++17 -cudart shared"
-  )
+  load_env
+  local cmd
+  if [[ "${TARGET}" == gpu ]]; then
+    # Perlmutter's flags (../build_grid_stock_hmc.sh) with the lq substitutions above.
+    cmd=(
+      "${STAGE_SRC}/configure"
+      --prefix="${INSTALL_PREFIX}"
+      --enable-comms=mpi
+      --enable-simd=GPU
+      --enable-shm=nvlink
+      --enable-gen-simd-width=64
+      --enable-accelerator=cuda
+      --enable-setdevice
+      --disable-fermion-reps
+      --disable-unified
+      --disable-gparity
+      --with-lime="${CLIME_ROOT}"
+      CXX=nvcc
+      LDFLAGS="-cudart shared"
+      CXXFLAGS="-ccbin mpicxx -gencode arch=compute_80,code=${CUDA_ARCH} -std=c++17 -cudart shared"
+    )
+  else
+    # The lq3 reference build's flags (Grid-CPU systems/LQ3/config-command), with the GPU
+    # build's comms/fermion/gparity/lime choices; no FFTW (the driver does no FFT).
+    # GMP/MPFR are spack's (exported by lq.sh), rpath'd so the binary finds them without it.
+    cmd=(
+      "${STAGE_SRC}/configure"
+      --prefix="${INSTALL_PREFIX}"
+      --enable-comms=mpi
+      --enable-simd=AVX512
+      --enable-shm=shmopen
+      --enable-accelerator=none
+      --disable-fermion-reps
+      --disable-gparity
+      --with-lime="${CLIME_ROOT}"
+      --with-gmp="${GMP}"
+      --with-mpfr="${MPFR}"
+      CXX=mpicxx
+      LDFLAGS="-L${GMP}/lib -L${MPFR}/lib -Wl,-rpath,${GMP}/lib -Wl,-rpath,${MPFR}/lib"
+      CXXFLAGS="-std=c++17 -march=znver5 -fPIE"
+    )
+  fi
 
   provenance_header
   {
-    printf 'configure:  %s  (in %s)\n  %s\n' "$(now)" "${BUILD_DIR}" "${cmd[*]@Q}"
-    printf 'modules:    %s\n' "$(module -t list 2>&1 | tr '\n' ' ')"
-    printf 'nvcc:       %s\n' "$(nvcc --version | tail -1)"
+    printf 'configure:  %s  (in %s, on %s)\n  %s\n' "$(now)" "${BUILD_DIR}" "$(hostname)" "${cmd[*]@Q}"
+    if [[ "${TARGET}" == gpu ]]; then
+      printf 'modules:    %s\n' "$(module -t list 2>&1 | tr '\n' ' ')"
+      printf 'nvcc:       %s\n' "$(nvcc --version | tail -1)"
+    else
+      printf 'os:         %s\n' "$(. /etc/os-release && echo "${PRETTY_NAME}")"
+      printf 'spack:      gcc-15-toolset, GMP=%s MPFR=%s\n' "${GMP}" "${MPFR}"
+      printf 'mpi:        %s (%s)\n' "${LQ_CPU_MPI_ROOT}" "$(mpirun --version 2>&1 | head -1)"
+    fi
     printf 'mpicxx:     %s (%s)\n' "$(command -v mpicxx)" "$(mpicxx --version | head -1)"
   } >> "${PROVENANCE}"
   printf 'configure command:\n  %s\n' "${cmd[*]@Q}"
@@ -239,6 +291,7 @@ require_allocation() {
 
 build_grid() {
   require_allocation
+  load_env
   [[ -x "${BUILD_DIR}/grid-config" ]] || {
     printf 'ERROR: Grid is not configured; run %s configure first\n' "$0" >&2
     exit 1
@@ -250,6 +303,7 @@ build_grid() {
 
 install_grid() {
   require_allocation
+  load_env
   [[ -f "${BUILD_DIR}/Grid/libGrid.a" ]] || {
     printf 'ERROR: libGrid.a is absent; run %s build first\n' "$0" >&2
     exit 1
@@ -274,7 +328,11 @@ case "${ACTION}" in
   all)
     prepare
     apply_patches
-    configure_grid
+    if [[ "${TARGET}" == gpu ]]; then
+      configure_grid
+    else
+      printf 'TARGET=cpu: prepared and patched; configure, build and install run on lq3 (build_grid_stock_hmc_cpu_job.sh)\n'
+    fi
     ;;
   info) ;;
   *)
