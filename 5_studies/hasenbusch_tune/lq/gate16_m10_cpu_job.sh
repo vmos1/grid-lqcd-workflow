@@ -28,7 +28,7 @@ BIN=${BIN:-$ROOT/installs/dev/m10_cpu/bin/gen_qcd_hasenbusch_tune_compact_schur_
 TAG=${TAG:-_cpu}
 CASES=${CASES:-t10 f10}
 
-echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date), LQ_TARGET=cpu TAG=${TAG} CASES=${CASES}"
+echo "=== job ${SLURM_JOB_ID} on $(hostname), $(date), LQ_TARGET=cpu LQ_LAUNCHER=${LQ_LAUNCHER:-srun} TAG=${TAG} CASES=${CASES}"
 lscpu | grep -E "^(Model name|Socket|Core|Thread|NUMA node)"
 numactl -H | head -3 || echo "numactl -H failed"
 

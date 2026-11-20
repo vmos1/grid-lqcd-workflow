@@ -3,15 +3,17 @@
 # gate16_puregrid.sh -- one 16^3x48 case of the pure-Grid compact-Schur driver
 # (src/gen_qcd_hasenbusch_tune_compact_schur.cc) on one lq2 node, 4 ranks on the job's 4 A100
 # (one per rank) or 2 (two ranks per GPU, the QOS test cap), or with LQ_TARGET=cpu on one lq3
-# node (4 ranks x 16 cores), run INSIDE a Slurm job with OpenMPI mpirun. Never submits; the
-# job scripts are gate16_m10_gpu_job.sh and gate16_m10_cpu_job.sh.
+# node (4 ranks x 16 cores), run INSIDE a Slurm job, launched with srun --mpi=pmix (default) or
+# OpenMPI mpirun. Never submits; the job scripts are gate16_m10_gpu_job.sh and gate16_m10_cpu_job.sh.
 #   CASE=traj    one HMC trajectory   = the recipe of ../perlmutter/smoke16_puregrid.sh
 #   CASE=forces  one FORCES_ONLY pass = the recipe of ../perlmutter/forces16_puregrid.sh
 #
 # Purpose: the 16^3 gate of an lq release against the Perlmutter reference
 # (__docs/2026_11_18_handoff_lq_port.md section 7c). Physics, seed, tolerances, Grid flags
 # and decomposition are the Perlmutter recipe's, value for value; the only lq changes are the
-# launcher (mpirun, not srun), the GPU/NUMA wrapper and, with LQ_MPI_STACK=hpcx, the MPI library.
+# MPI library (OpenMPI, not Cray MPICH) and the GPU/NUMA wrapper. Launcher: srun --mpi=pmix, the
+# lq recipe that works on one node and across nodes (Grid-TXQCD production on lq2, measured 8x
+# faster than mpirun there; Grid-CPU on lq3). mpirun only reproduces the 11-19 runs (handoff 7d).
 #
 # Log format. Line 1 of hmc.log is the ENV line in the Perlmutter format: tag SMOKE16_PUREGRID
 # (traj) or FORCES16_PUREGRID (forces), the same fields in the same order, so the two logs
@@ -28,18 +30,20 @@
 #   HASEN_GRID_*, GRID_MG_*   routes and tunables, passed through unscrubbed and recorded in
 #                       the ENV line's GRID_MG_ENV, as on Perlmutter
 #   CASE_MIN            timeout of the run in minutes, default 10
+#   LQ_LAUNCHER         srun (default: srun --mpi=pmix) or mpirun (the 11-19 runs; needed by hpcx)
 #   LQ_MPI_STACK        gompi (default) or hpcx, read by machines/lq.sh. gompi's OpenMPI puts
-#                       every rank in a node communicator of size 1 (Grid's GPU-to-GPU halo
-#                       path off); HPC-X groups the node's ranks. The launcher checks that the
-#                       binary's libmpi and mpirun come from the chosen stack.
+#                       every rank in a node communicator of size 1 under both launchers;
+#                       HPC-X groups the node's ranks but cannot be launched by srun (its PMIx
+#                       has no munge plugin), so hpcx needs LQ_LAUNCHER=mpirun. The launcher
+#                       checks that the binary's libmpi (and mpirun, if used) come from the stack.
 #   NRANKS              MPI ranks, default 4; must equal the product of MPI_GEOM (layout tests:
 #                       NRANKS=2 MPI_GEOM=1.1.1.2 puts one rank on each of QOS test's 2 GPUs)
 #   GPU_MPS             1 = start NVIDIA's MPS daemon for this case (pipe and log dirs in node
 #                       /tmp, log copied to the rundir), so ranks sharing a GPU run concurrently
 #                       instead of in time slices; default 0
 #   LQ_TARGET           gpu (default, lq2) or cpu (lq3, read by machines/lq.sh too). cpu: no GPU
-#                       table and no select_gpu wrapper; mpirun binds each rank to
-#                       SLURM_CPUS_PER_TASK cores (ppr:N:node:PE=T --bind-to core) with
+#                       table and no select_gpu wrapper; each rank bound to SLURM_CPUS_PER_TASK
+#                       cores (srun --cpu-bind=cores; mpirun ppr:N:node:PE=T --bind-to core) with
 #                       OMP_NUM_THREADS=T; Grid flags --threads T --shm 2048 (the GPU-only
 #                       --accelerator-threads, --shm-mpi, --comms-overlap dropped; Grid-CPU
 #                       measured --comms-overlap 5-15% slower on one lq3 node). Same ENV line;
@@ -76,7 +80,10 @@ G_MIN=${CASE_MIN:-10}
 G_NRANKS=${NRANKS:-4}
 G_MPS=${GPU_MPS:-0}
 G_TARGET=${LQ_TARGET:-gpu}
+G_LAUNCHER=${LQ_LAUNCHER:-srun}
 case "$G_TARGET" in gpu|cpu) ;; *) die "LQ_TARGET must be gpu or cpu, got '$G_TARGET'" ;; esac
+case "$G_LAUNCHER" in srun|mpirun) ;; *) die "LQ_LAUNCHER must be srun or mpirun, got '$G_LAUNCHER'" ;; esac
+{ [ "$G_LAUNCHER" = mpirun ] || [ "${LQ_MPI_STACK:-gompi}" != hpcx ]; } || die "LQ_MPI_STACK=hpcx needs LQ_LAUNCHER=mpirun (srun cannot start HPC-X)"
 { [ "$G_TARGET" = gpu ] || [ "$G_MPS" = 0 ]; } || die "GPU_MPS=1 needs LQ_TARGET=gpu"
 export LQ_TARGET=$G_TARGET
 [[ "$G_MPI" =~ ^[1-9]\.[1-9]\.[1-9]\.[1-9]$ ]] || die "MPI_GEOM must look like 1.1.1.4, got '$G_MPI'"
@@ -110,7 +117,9 @@ case $G_TARGET/$LQ_MPI_STACK in
   *)               die "LQ_TARGET=$G_TARGET with LQ_MPI_STACK=$LQ_MPI_STACK is not a known stack" ;;
 esac
 [[ "$LIBMPI" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but $BIN loads libmpi from '$LIBMPI'"
-[[ "$MPIRUN_BIN" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but mpirun is '$MPIRUN_BIN'"
+if [ "$G_LAUNCHER" = mpirun ]; then
+  [[ "$MPIRUN_BIN" == "$STACK_DIR"* ]] || die "LQ_MPI_STACK=$LQ_MPI_STACK but mpirun is '$MPIRUN_BIN'"
+fi
 BIN_SHA256=$(sha256sum "$BIN" | cut -d' ' -f1)
 PROV=$(dirname "$(dirname "$BIN")")/PROVENANCE.txt
 if [ -f "$PROV" ]; then
@@ -235,7 +244,8 @@ printf '%s\n' \
   '# OpenMPI local rank -> GPU + the NUMA domain of that GPU (written by gate16_puregrid.sh)' \
   "RANK_GPU=(${RANKS[*]})" \
   "RANK_NUMA=(${NUMAS[*]})" \
-  'L=${OMPI_COMM_WORLD_LOCAL_RANK:?select_gpu: not started by OpenMPI mpirun}' \
+  '# mpirun sets OMPI_COMM_WORLD_LOCAL_RANK (the batch step SLURM_LOCALID=0 it inherits is wrong); srun sets SLURM_LOCALID' \
+  'L=${OMPI_COMM_WORLD_LOCAL_RANK:-${SLURM_LOCALID:?select_gpu: not started by srun or mpirun}}' \
   'export CUDA_DEVICE_ORDER=PCI_BUS_ID' \
   'export CUDA_VISIBLE_DEVICES=${RANK_GPU[$L]}' \
   'N=${RANK_NUMA[$L]}' \
@@ -243,22 +253,39 @@ printf '%s\n' \
   'exec "$@"' > "$SELECT_GPU"
 chmod +x "$SELECT_GPU"
 WRAP=("$SELECT_GPU")
-MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node" --bind-to none --wdir "$RUN_DIR")
+# srun: the Grid-TXQCD lq2 form (--cpu-bind=none; select_gpu does the NUMA binding). srun does not
+# inherit the job's --cpus-per-task (Slurm >= 22.05), so it is passed again.
+if [ "$G_LAUNCHER" = srun ]; then
+  MPIRUN=(srun --mpi=pmix --nodes=1 --ntasks="$NTASKS" --cpus-per-task="${SLURM_CPUS_PER_TASK:-16}" --cpu-bind=none --chdir="$RUN_DIR")
+else
+  MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node" --bind-to none --wdir "$RUN_DIR")
+fi
 PROBE='echo "gpu=$CUDA_VISIBLE_DEVICES $(numactl --show 2>/dev/null | grep -E "^(nodebind|membind)" | tr "\n" " ")"'
 else
 # cpu: mpirun places the ranks in order over the node and binds each to CPU_T cores (on lq3,
 # ranks 0-1 on socket 0 and 2-3 on socket 1 with 4 x 16 cores); memory is first-touch local.
 WRAP=()
-MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node:PE=${CPU_T}" --bind-to core --wdir "$RUN_DIR")
+if [ "$G_LAUNCHER" = srun ]; then
+  MPIRUN=(srun --mpi=pmix --nodes=1 --ntasks="$NTASKS" --cpus-per-task="$CPU_T" --cpu-bind=cores --chdir="$RUN_DIR")
+else
+  MPIRUN=(mpirun -np "$NTASKS" --map-by "ppr:${NTASKS}:node:PE=${CPU_T}" --bind-to core --wdir "$RUN_DIR")
+fi
 PROBE='echo "cpus=$(taskset -cp $$ | cut -d: -f2 | tr -d " ") $(numactl --show 2>/dev/null | grep -E "^(nodebind|membind)" | tr "\n" " ")"'
 fi
 
 # Gate: every rank reports its GPU or cores and its NUMA binding; a failure stops here.
-if ! timeout -k 10s 3m "${MPIRUN[@]}" --tag-output "${WRAP[@]}" bash -c "$PROBE" > "$RUN_DIR/numa_binding.raw" 2>&1; then
-  cat "$RUN_DIR/numa_binding.raw" >&2
-  die "binding probe failed: mpirun could not start every rank. Nothing was run (rundir $RUN_DIR)."
+if [ "$G_LAUNCHER" = srun ]; then
+  PROBE_TAG=(--label)
+  PROBE_SED='s/^ *([0-9]+): /\1: /p'
+else
+  PROBE_TAG=(--tag-output)
+  PROBE_SED='s/^\[[0-9]+,([0-9]+)\]<stdout>:/\1: /p'
 fi
-sed -n -E 's/^\[[0-9]+,([0-9]+)\]<stdout>:/\1: /p' "$RUN_DIR/numa_binding.raw" | sort -n > "$RUN_DIR/numa_binding.txt"
+if ! timeout -k 10s 3m "${MPIRUN[@]}" "${PROBE_TAG[@]}" "${WRAP[@]}" bash -c "$PROBE" > "$RUN_DIR/numa_binding.raw" 2>&1; then
+  cat "$RUN_DIR/numa_binding.raw" >&2
+  die "binding probe failed: $G_LAUNCHER could not start every rank. Nothing was run (rundir $RUN_DIR)."
+fi
+sed -n -E "$PROBE_SED" "$RUN_DIR/numa_binding.raw" | sort -n > "$RUN_DIR/numa_binding.txt"
 [ "$(wc -l < "$RUN_DIR/numa_binding.txt")" -eq "$NTASKS" ] || die "binding probe returned $(wc -l < "$RUN_DIR/numa_binding.txt") of $NTASKS ranks (see $RUN_DIR/numa_binding.raw)"
 
 # Optional MPS daemon (GPU_MPS=1), started on the job's GPUs and stopped when this script exits.
@@ -321,16 +348,16 @@ fi
   printf '%q ' timeout -k 60s "${G_MIN}m" "${MPIRUN[@]}" "${WRAP[@]}" "$BIN" "${GRID_ARGS[@]}"
   printf '\n'
   if [ "$G_TARGET" = gpu ]; then
-  printf 'LAUNCH host=%s target=gpu mpi_stack=%s libmpi=%s mps=%s compute_mode="%s" ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
-    "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$MPS_STATE" "$COMPUTE_MODE" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
+  printf 'LAUNCH host=%s target=gpu launcher=%s mpi_stack=%s libmpi=%s mps=%s compute_mode="%s" ompi="%s" modules="%s" gpus=%s buses=%s gpu_numa=%s rank_gpu=%s rank_numa=%s numactl=%s gpu="%s" mca="%s" ucx="%s"\n' \
+    "$(hostname)" "$G_LAUNCHER" "$LQ_MPI_STACK" "$LIBMPI" "$MPS_STATE" "$COMPUTE_MODE" "$(mpirun --version 2>&1 | head -1)" "$(module -t list 2>&1 | tr '\n' ' ')" \
     "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" "$(IFS=,; echo "${GNUMA[*]}")" \
     "$(IFS=,; echo "${RANKS[*]}")" "$(IFS=,; echo "${NUMAS[*]}")" "$HAVE_NUMACTL" \
     "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")" \
     "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
     "$(compgen -e | grep '^UCX_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)"
   else
-  printf 'LAUNCH host=%s target=cpu mpi_stack=%s libmpi=%s ompi="%s" cxx="%s" cpu="%s" cores=%s numa_nodes=%s threads_per_rank=%s omp="%s" numactl=%s mca="%s" ucx="%s"\n' \
-    "$(hostname)" "$LQ_MPI_STACK" "$LIBMPI" "$(mpirun --version 2>&1 | head -1)" "$(mpicxx --version 2>&1 | head -1)" \
+  printf 'LAUNCH host=%s target=cpu launcher=%s mpi_stack=%s libmpi=%s ompi="%s" cxx="%s" cpu="%s" cores=%s numa_nodes=%s threads_per_rank=%s omp="%s" numactl=%s mca="%s" ucx="%s"\n' \
+    "$(hostname)" "$G_LAUNCHER" "$LQ_MPI_STACK" "$LIBMPI" "$(mpirun --version 2>&1 | head -1)" "$(mpicxx --version 2>&1 | head -1)" \
     "$(lscpu | sed -n 's/^Model name: *//p' | head -1)" "$(nproc)" "$(lscpu | sed -n 's/^NUMA node(s): *//p')" "$CPU_T" \
     "OMP_NUM_THREADS=$OMP_NUM_THREADS OMP_PLACES=$OMP_PLACES OMP_PROC_BIND=$OMP_PROC_BIND" "$HAVE_NUMACTL" \
     "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
@@ -347,7 +374,7 @@ printf 'exit=%s\n' "$rc" >> "$LOG"
 # ---- 13. Summary ------------------------------------------------------------------------------
 echo "==== $RUN: exit=$rc  log: $LOG"
 grep -a -E '^(ENV|NUMA|LAUNCH) ' "$LOG"
-grep -a -E 'communicator of size|Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|Integrator: ' "$LOG"
+grep -a -E 'communicator of size|bus id|Current Grid git commit hash|Initial plaquette|CG tol:|Hasenbusch chain|\[Ladder\]|\[Levels\]|Integrator: ' "$LOG"
 if [ "$G_MODE" = traj ]; then
   grep -a -E '\[0\]\[[0-9]+\] Force average' "$LOG" | head -6
   grep -a -E 'Total H before trajectory|Total H after trajectory|exp\(-dH\)|Metropolis_test|Total time for trajectory|Plaquette: \[|FORCES traj=' "$LOG"
