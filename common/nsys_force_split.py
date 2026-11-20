@@ -16,7 +16,8 @@ The .sqlite comes from `nsys export --type sqlite --output X.sqlite X.nsys-rep` 
 
 Categories (Grid), each instant assigned once, in this priority:
   mg_build  -- "[GridMG ...] build #k ... total T s"
-  solve     -- MG, CG, mixed-precision CG and multishift solves (log intervals, unioned)
+  solve     -- MG, CG, mixed-precision CG (also the fork's "[GridMixedCG ...] solve" lines,
+               reliable-update CG) and multishift solves (log intervals, unioned)
   pullback  -- "[i] batched smeared P update" (HASEN_GRID_BATCH_SMEAR)
   smearing  -- "Smearing in T ms" (update_U)
   force:<[i][j] action>  -- the rest of each force call
@@ -47,6 +48,9 @@ STAMP = re.compile(r"Grid : \w+ : (\d+\.\d+) s : ")
 SOLVERISH = re.compile(r"ConjugateGradient|ConjugageGradient|MixedPrecision|MultiShift|Solver Elapsed|rsd norm")
 RX = {
     "mg_solve": re.compile(r"\[GridMG ([^\]]+)\] solve .*?seconds " + NUM),
+    # 2026-11-20: the fork's mixed-precision CG wrapper (HASEN_GRID_RELIABLE_CG=1, reliable-update
+    # CG) prints no "MixedPrecisionConjugateGradient: Total time"; its solve ends on this line.
+    "mixcg": re.compile(r"\[GridMixedCG ([^\]]+)\] solve .*?seconds " + NUM),
     "mg_build": re.compile(r"\[GridMG ([^\]]+)\] build #(\d+).*total " + NUM + " s"),
     "cg": re.compile(r"Solver Elapsed\s+" + NUM + " s"),
     "mpcg": re.compile(r"MixedPrecisionConjugateGradient: Total time " + NUM + " s"),
@@ -160,6 +164,10 @@ def grid_windows(segs):
         m = RX["mg_solve"].search(txt)
         if m:
             W["solve"].append((t - float(m.group(2)), t, "MG " + m.group(1)))
+            continue
+        m = RX["mixcg"].search(txt)
+        if m:
+            W["solve"].append((t - float(m.group(2)), t, "MixedCG " + m.group(1)))
             continue
         m = RX["mg_build"].search(txt)
         if m:
