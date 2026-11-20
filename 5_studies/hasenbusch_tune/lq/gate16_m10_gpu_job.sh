@@ -17,7 +17,7 @@
 # one per A100, launched with srun --mpi=pmix on gompi (the Grid-TXQCD lq2 recipe), QOS normal.
 # The 11-19 runs (handoff 7d) used QOS test instead, which caps a job at 2 GPUs and 500 GB: 4 ranks
 # on 2 GPUs time-slice them unless MPS runs. That test-queue header is this file at commit
-# addad74; its runs also need LQ_LAUNCHER=mpirun.
+# 19e9d49; its runs also need LQ_LAUNCHER=mpirun.
 # 16 cores per rank take all 64 cores of the node, so the binding probe never meets cores of
 # another job. Three cases, one after the other, each a gate16_puregrid.sh run with its own cap:
 #   t10  CASE=traj    one trajectory, CG routes, --mpi 1.1.1.4     (ref runs/2026_10_14_gate16s_t10)
