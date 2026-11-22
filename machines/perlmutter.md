@@ -82,6 +82,8 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
 
 ## Python environment
 
+Updated on 2026-11-22 07:23 CST · perlmutter
+
 - The system `python3` is 3.6 (no `math.prod`, no 3.8+ syntax). Use the repo's
   own uv environment: `pyproject.toml`, `.python-version` (3.12) and `uv.lock`
   at the root of `grid-lqcd-workflow`. Run scripts from that root as
@@ -96,6 +98,13 @@ do not print: `srun ... numactl -m 0 -N 0 true || exit 1`.
   a local symlink to the same environment (gitignored), so `uv run` without
   `perlmutter.sh` still uses scratch instead of creating ~8k files on CFS.
   Never delete that symlink while the repo is on CFS.
+- `uv run` in a shell that has not sourced `perlmutter.sh` keeps its cache in
+  `~/.cache/uv` on `$HOME`. In a batch job uv fails to lock it with
+  `os error 524` (operation not supported); on a login node the same command
+  works. A batch script that runs `uv` itself must source `perlmutter.sh` in
+  its own shell, or set `UV_CACHE_DIR` and `UV_PYTHON_INSTALL_DIR` to
+  `$PSCRATCH/uv/cache` and `$PSCRATCH/uv/python`. Passing it to a launcher as
+  `ENV_SCRIPT` covers only the `srun` steps. Seen 2026-11-21, job 61712612.
 - After a scratch purge (~8 weeks idle), `uv sync` in the repo root rebuilds
   everything from `uv.lock` in about a minute.
 
