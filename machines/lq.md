@@ -186,6 +186,20 @@ Updated on 2026-11-20 09:22 CST · fnal_lq
   - `codex` is installed.
   - No `gh`: PRs are made through the GitHub web UI.
 
+## Git branch on lq
+
+Updated on 2026-11-22 12:11 CST · fnal_lq
+
+- **lq commits go on `lq-port`** (since 2026-11-22); Perlmutter keeps
+  `hasenbusch-tune-compact`. On 11-20 both machines pushed to the same branch: the lq push
+  was rejected, `pull --rebase` rewrote the lq hashes, and a commit had to re-cite one.
+- **Pick up Perlmutter's work by merge, never rebase:** `git fetch origin`, then
+  `git merge origin/hasenbusch-tune-compact` on `lq-port`, so hashes cited in docs stay valid.
+- **Hand back at milestones** (e.g. a promotion) by merging `lq-port` into
+  `hasenbusch-tune-compact` or by a PR in the web UI, only with the user's approval.
+- **The checkout is shared by every lq session:** never `git switch` it to another branch
+  without telling the user, since the switch moves them all.
+
 ## Older notes (Grid-TXQCD era, 2026-05 to 09, not rechecked on stock Grid)
 
 Updated on 2026-11-20 09:22 CST · fnal_lq
