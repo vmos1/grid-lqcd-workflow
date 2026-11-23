@@ -28,6 +28,7 @@
 #   DEVICE_MEM_MB    gpu only, default 8000 (Perlmutter's default; dH is bit-exact across caps,
 #                    traj48_puregrid.sh section 9)
 #   GPU_MON_MS       gpu only, default 2000: nvidia-smi memory sampler on local rank 0 of each node
+#   GRID_EXTRA_ARGS  appended verbatim to the Grid flags (e.g. --dslash-asm), recorded in GRID_FLAGS
 #   HASEN_GRID_*, GRID_MG_*  pass through (recorded in the ENV line), as on Perlmutter
 #
 # Output: runs/<YYYY_M_D>_<RUN>/hmc.log, ckpt/ (checkpoints, 7.2 GB per trajectory, on Lustre),
@@ -210,12 +211,13 @@ done < <(compgen -e | grep '^HASEN_GRID_' | grep -v -x -E 'HASEN_GRID_(MG_RUNGS|
 GRID_MG_ENV=$(compgen -e | grep -E '^(GRID_MG_|HASEN_GRID_FUSED)' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)
 
 # ---- 8. Threads and Grid flags ------------------------------------------------------------------
+read -r -a EXTRA <<< "${GRID_EXTRA_ARGS:-}"
 if [ "$G_TARGET" = gpu ]; then
   export OMP_NUM_THREADS=8           # Perlmutter's
-  GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB")
+  GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --accelerator-threads 8 --shm 2048 --shm-mpi 0 --comms-overlap --device-mem "$DEVICE_MEM_MB" "${EXTRA[@]}")
 else
   export OMP_NUM_THREADS=$CPT OMP_PLACES=cores OMP_PROC_BIND=close
-  GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --threads "$CPT" --shm 2048)
+  GRID_ARGS=(--grid "$LATT" --mpi "$G_MPI" --threads "$CPT" --shm 2048 "${EXTRA[@]}")
 fi
 
 # ---- 9. Start: fresh from cfg_2000, or resume (traj48_puregrid.sh section 11, shortened) --------
