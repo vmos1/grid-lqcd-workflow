@@ -20,7 +20,7 @@
 # RESUME_FROM, TIMEOUT_MIN (default 225).
 set -uo pipefail
 ROOT=/lustre2/nplqcd/vayyar/grid_qcd
-export BIN=${BIN:-$ROOT/installs/dev/m10_gpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
+export BIN=${BIN:-$ROOT/installs/prod/m10_gpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 export RUN=${RUN:-traj48_base_gpu}
 export N_TRAJ=${N_TRAJ:-2}
 export TIMEOUT_MIN=${TIMEOUT_MIN:-225}

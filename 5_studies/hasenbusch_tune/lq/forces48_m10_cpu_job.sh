@@ -20,7 +20,7 @@
 # 3.2.2.4), GRID_EXTRA_ARGS, FO_ROUTES (traj|production), HMC_SEED_OFFSET, TIMEOUT_MIN (default 80).
 set -uo pipefail
 ROOT=/lustre2/nplqcd/vayyar/grid_qcd
-export BIN=${BIN:-$ROOT/installs/dev/m10_cpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
+export BIN=${BIN:-$ROOT/installs/prod/m10_cpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 export RUN=${RUN:-forces48_cpu}
 export MPI_GEOM=${MPI_GEOM:-3.2.2.4}
 export TIMEOUT_MIN=${TIMEOUT_MIN:-80}

@@ -20,7 +20,7 @@
 # RESUME_FROM, MPI_GEOM (default 1.2.2.4), TIMEOUT_MIN (default 1420).
 set -uo pipefail
 ROOT=/lustre2/nplqcd/vayyar/grid_qcd
-export BIN=${BIN:-$ROOT/installs/dev/m10_cpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
+export BIN=${BIN:-$ROOT/installs/prod/m10_cpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 export RUN=${RUN:-traj48_base_cpu}
 export N_TRAJ=${N_TRAJ:-2}
 export TIMEOUT_MIN=${TIMEOUT_MIN:-1420}

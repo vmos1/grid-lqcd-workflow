@@ -36,7 +36,7 @@
 set -uo pipefail
 ROOT=/lustre2/nplqcd/vayyar/grid_qcd
 LAUNCH=$ROOT/grid-lqcd-workflow/5_studies/hasenbusch_tune/lq/gate16_puregrid.sh
-BIN=${BIN:-$ROOT/installs/dev/m10_gpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
+BIN=${BIN:-$ROOT/installs/prod/m10_gpu/bin/gen_qcd_hasenbusch_tune_compact_schur_stock}
 TAG=${TAG:-}
 LQ_MPI_STACK=${LQ_MPI_STACK:-gompi}
 CASES=${CASES:-t10 f10 mg}
