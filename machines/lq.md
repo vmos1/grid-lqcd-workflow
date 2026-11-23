@@ -1,12 +1,12 @@
 # grid_qcd on lq (Fermilab): account, queues, paths, traps
 
-Updated on 2026-11-20 09:22 CST · fnal_lq
+Updated on 2026-11-23 10:07 CST · fnal_lq
 
 Read by agents on every session run on lq, per rule 7 of the workspace
 `AGENTS.md`. Shell environment is `lq.sh` beside this file. General lq rules
 live in the user's global instruction file; this file holds only what this
 project needs on this machine. Campaign facts and numbers belong in `__docs/`
-(campaign `lq-port`, handoff `2026_11_18_handoff_lq_port.md` §7c–7d), not here.
+(campaign `lq-port`, handoff `2026_11_18_handoff_lq_port.md` §7c–7e), not here.
 
 ## Targets and accounts
 
@@ -43,70 +43,68 @@ Updated on 2026-11-20 09:22 CST · fnal_lq
   runs `salloc`. Submit, report the job id, hand back. Watch a job only when asked, with
   one `common/watch_job.sh JOBID LOG STALL_MIN POLL_S MAX_H` in the background.
 
+## Launching (both machines)
+
+Updated on 2026-11-23 10:07 CST · fnal_lq
+
+- **Always `srun --mpi=pmix`, one step over all nodes, inside `sbatch`.** It is the recipe of
+  both reference projects on lq (Grid-TXQCD on lq2,
+  `/lustre2/nplqcd/Grid-TXQCD/production/MULTI_GPU_SRUN_NOTES.md`; Grid-CPU on lq3) and works
+  on one node and across nodes.
+  - `mpirun` cannot start ranks on other nodes ("An ORTE daemon has unexpectedly failed
+    after launch") and Grid-TXQCD measured it 8× slower than `srun` on one node.
+  - srun does not inherit the job's `--cpus-per-task` (Slurm ≥ 22.05): pass it again.
+  - The launchers (`5_studies/hasenbusch_tune/lq/gate16_puregrid.sh`, `traj48_lq.sh`,
+    `forces48_lq.sh`) run a binding probe through the same srun line first, and write a
+    `LAUNCH` line beside the Perlmutter-format `ENV` line (stack, `libmpi`, layout, MCA and
+    UCX settings). `gate16_puregrid.sh` keeps `LQ_LAUNCHER=mpirun` only to reproduce the
+    11-19 runs.
+- **Watch the run's own log.** The launchers send Grid's output to `runs/<run>/hmc.log`;
+  the Slurm log falls silent once the run starts, so a watcher on it raises a false stall.
+  A multigrid build prints nothing for many minutes (about 40 min on one lq3 node).
+
 ## Launching on lq2 (GPU)
 
-Updated on 2026-11-20 09:22 CST · fnal_lq
+Updated on 2026-11-23 10:07 CST · fnal_lq
 
-- **Use HPC-X, not gompi (`LQ_MPI_STACK=hpcx`).**
-  - **The fault:** gompi/2023a's OpenMPI 4.1.5 (external PMIx 4.2.6) does not see ranks on
-    one node as node-local. `MPI_COMM_TYPE_SHARED` gives groups of 1 under every `mpirun`
-    and `srun --mpi=pmix*` form, and its shared-memory BTL (vader) refuses to start. Grid
-    prints `Node communicator of size 1` and sends every halo through MPI (probe job
-    1363335, `runs/2026_11_19_mpi_locality_probe/`). Grid-TXQCD's production logs show the
-    same.
-  - **The fix:** HPC-X 2.15 from the NVHPC 23.7 tree groups ranks correctly (probe
-    1363336). It lives at
-    `/srv/software/el8/x86_64/hpc/nvhpc/Linux_x86_64/2023/comm_libs/12.2/hpcx/hpcx-2.15`
-    and is OpenMPI 4.1.5rc2 with internal PMIx 3, UCX 1.15, CUDA-aware.
-  - **How `lq.sh` loads it:** the gompi modules first, then `source hpcx-init.sh` and
-    `hpcx_load` (HPC-X's module file is broken). It also turns hcoll and ucc collectives off.
-  - The gompi-built binary runs on HPC-X's `libmpi.so.40` unchanged: same ABI, and
-    `LD_LIBRARY_PATH` wins over its RUNPATH.
-  - **Check:** Grid's `Node communicator of size N` must equal the ranks per node.
-- **More ranks than GPUs needs MPS (`GPU_MPS=1`).**
-  - Without MPS, two processes on one GPU time-slice it: 7.9 ms per CG iteration against
-    0.91 ms with NVIDIA's MPS daemon (handoff §7d, 333 s against 52.5 s per 16³ trajectory).
-  - The gate launcher starts and stops the daemon inside the job, with per-run pipe and
-    log directories under `/tmp`.
-  - Under MPS a rank's GPU is its position in `CUDA_VISIBLE_DEVICES`.
-  - This matters on QOS test (2 GPUs). On a full node use one rank per GPU and no MPS.
-- **Single node:** `mpirun -np N --map-by ppr:N:node --bind-to none` inside `sbatch`, with
-  a wrapper that sets each rank's GPU and binds it to that GPU's NUMA node
-  (`5_studies/hasenbusch_tune/lq/gate16_puregrid.sh`, §10).
-- **Multi-node: unsolved, and not yet run by this project.**
-  - `mpirun` cannot start its daemons on other nodes ("An ORTE daemon has unexpectedly
-    failed after launch"; no keyless ssh, no route back). Grid-TXQCD therefore launches
-    with `srun --mpi=pmix`
-    (`/lustre2/nplqcd/Grid-TXQCD/production/MULTI_GPU_SRUN_NOTES.md`).
-  - But gompi under `srun` has the grouping fault above, and HPC-X cannot be launched by
-    `srun` (its PMIx has no munge plugin).
-  - Solve this before the first multi-node lq2 run.
-- **Check before every run:** the gate launcher writes a `LAUNCH` line beside the
-  Perlmutter-style `ENV` line. It records stack, `libmpi`, MPS, the GPU-to-NUMA map, MCA and
-  UCX settings. It refuses to run when the binary's `libmpi` and `mpirun` are not both
-  under the stack named by `LQ_MPI_STACK`.
+- **gompi, one rank per GPU, whole nodes, QOS normal.** Each rank's GPU and that GPU's NUMA
+  node are set by the launcher's `select_gpu` wrapper (`--cpu-bind=none`). 48³: 4 nodes ×
+  4 ranks, `--mpi 1.2.2.4`, Perlmutter's layout, and Perlmutter's speed (+1.0%, §7e).
+- **Grid's `Node communicator of size 1` under gompi is harmless.** gompi's OpenMPI 4.1.5
+  (external PMIx 4.2.6) does not group a node's ranks (`MPI_COMM_TYPE_SHARED` gives groups
+  of 1 under every launcher; probe 1363335), but the speed is unaffected (L222).
+- **Only for 4 ranks on QOS test's 2 GPUs:** two ranks on one GPU time-slice it (6× slower)
+  unless NVIDIA's MPS daemon runs (`GPU_MPS=1`, started and stopped by `gate16_puregrid.sh`).
+  HPC-X 2.15 (`LQ_MPI_STACK=hpcx`, from
+  `/srv/software/el8/x86_64/hpc/nvhpc/Linux_x86_64/2023/comm_libs/12.2/hpcx/hpcx-2.15`,
+  loaded by `lq.sh` with `hpcx-init.sh` and `hpcx_load`) groups the ranks but cannot be
+  started by `srun` (no munge plugin in its PMIx), so it needs `LQ_LAUNCHER=mpirun` and one
+  node. Neither is needed on whole nodes.
+- **Memory:** 48³ peaks at ~30.5 of 80 GB per GPU at `--device-mem 8000`; a larger cap is
+  open (Perlmutter measured −8% at 16000).
 
 ## Launching on lq3 (CPU)
 
-Updated on 2026-11-20 09:22 CST · fnal_lq
+Updated on 2026-11-23 10:07 CST · fnal_lq
 
 - **MPI:** Grid-CPU's OpenMPI 4.1.8 at `/lustre2/nplqcd/install/openmpi-4.1.8-ucx-gcc15`,
   built against the system UCX 1.21, the only UCX on lq3 with the mlx5 transports
-  (`LQ_MPI_STACK=lq3-ompi418`, the only cpu stack).
-  - It groups ranks correctly: 16 ranks gave groups of 16 (build job 1363360), and the gate
-    printed node communicator 4 of 4.
-  - `lq.sh` sets `OMPI_MCA_pml=ucx`, `OMPI_MCA_osc=ucx` and `UCX_NET_DEVICES=mlx5_0:1`.
-- **Gate layout:** 4 ranks × 16 cores,
-  `mpirun --map-by ppr:4:node:PE=16 --bind-to core`,
-  `OMP_NUM_THREADS=16 OMP_PLACES=cores OMP_PROC_BIND=close`, Grid `--threads 16 --shm 2048`.
-- **Not tried with our driver:** Grid-CPU's benchmarks favour 16 ranks × 4 threads per
-  node and `--dslash-asm` for solvers and HMC
-  (`/lustre2/nplqcd/Grid-CPU/AGENT_REFERENCE.md`). Worth testing at 48³.
-- **Multi-node:** `mpirun` cannot start remote daemons here either.
-  - Grid-CPU uses `srun --mpi=pmix`, or its shim `bench_lq3/mpirun_srun_shim/mpirun`.
-  - Forward the three settings above, plus the `OMP_*` variables, `PATH` and
-    `LD_LIBRARY_PATH`.
-  - Not yet run by this project.
+  (`LQ_MPI_STACK=lq3-ompi418`). It groups a node's ranks correctly. `lq.sh` sets
+  `OMPI_MCA_pml=ucx`, `OMPI_MCA_osc=ucx` and `UCX_NET_DEVICES=mlx5_0:1`; srun passes them to
+  every node. Multi-node logs fill with harmless UCX warnings
+  (`ibv_query_port_speed ... Protocol not supported`).
+- **Binding:** `srun --cpus-per-task=T --cpu-bind=cores`,
+  `OMP_NUM_THREADS=T OMP_PLACES=cores OMP_PROC_BIND=close`, Grid `--threads T --shm 2048`.
+- **48³ rank counts:** with the default multigrid blocks (4.4.4.4, then 2.3.3.3) the
+  decomposition must have x ∈ {1, 3}, y, z ∈ {1, 2}, t ∈ {1, 2, 4}: 16, 24 or 48 ranks, never
+  32 or 64 (job 1364148 died after 12 min in `Cartesian_red_black.h`). `forces48_lq.sh` checks
+  this before launching; `traj48_lq.sh` does not yet.
+- **Layouts that ran (48³, §7e):** 1 node × 16 ranks × 4 cores `1.2.2.4` (~11 h per
+  trajectory); 4 nodes × 12 × 5 `3.2.2.4` (~2.7 h); **6 nodes × 8 × 8 `3.2.2.4` (~1.75 h),
+  the production layout** (user, 11-23). Scaling is linear to 6 nodes.
+- **Not yet tried:** `--dslash-asm` (Grid-CPU: +20–30% on the Wilson hopping term), other
+  routes for rung PF3, multigrid rebuild cadence. A/B them with `forces48_m10_cpu_job.sh`
+  (`GRID_EXTRA_ARGS`, `HASEN_GRID_*`); baseline job 1364292.
 
 ## Building
 
