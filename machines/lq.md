@@ -85,7 +85,7 @@ Updated on 2026-11-23 10:07 CST · fnal_lq
 
 ## Launching on lq3 (CPU)
 
-Updated on 2026-11-23 10:07 CST · fnal_lq
+Updated on 2026-11-24 09:14 CST · fnal_lq
 
 - **MPI:** Grid-CPU's OpenMPI 4.1.8 at `/lustre2/nplqcd/install/openmpi-4.1.8-ucx-gcc15`,
   built against the system UCX 1.21, the only UCX on lq3 with the mlx5 transports
@@ -101,10 +101,15 @@ Updated on 2026-11-23 10:07 CST · fnal_lq
   this before launching; `traj48_lq.sh` does not yet.
 - **Layouts that ran (48³, §7e):** 1 node × 16 ranks × 4 cores `1.2.2.4` (~11 h per
   trajectory); 4 nodes × 12 × 5 `3.2.2.4` (~2.7 h); **6 nodes × 8 × 8 `3.2.2.4` (~1.75 h),
-  the production layout** (user, 11-23). Scaling is linear to 6 nodes.
-- **Not yet tried:** `--dslash-asm` (Grid-CPU: +20–30% on the Wilson hopping term), other
-  routes for rung PF3, multigrid rebuild cadence. A/B them with `forces48_m10_cpu_job.sh`
-  (`GRID_EXTRA_ARGS`, `HASEN_GRID_*`); baseline job 1364292.
+  the production layout** (user, 11-23), the default of `traj48_m10_cpu_job.sh`. Scaling is
+  linear to 6 nodes.
+- **CPU speed settings, default in `traj48_m10_cpu_job.sh` since 11-24:** `--dslash-asm`
+  (Grid's AVX-512 assembly kernel) and rung PF3 on the shared multigrid
+  (`HASEN_GRID_MG_RUNGS=0,1,2,3`, `HASEN_GRID_MIXED_CG_RUNGS` empty). Forces-only A/B (job
+  1364668): forces −4% and −13%, forces identical; PF3 on fp64 CG is +9% (worse). On
+  trajectories 2011–2012 (job 1364701, 6 nodes) MD fell from 1.77× to ~1.57× Perlmutter's,
+  ~1.6 h per trajectory. Set a variable empty to switch its setting off. Not yet tried:
+  multigrid rebuild cadence (only visible in trajectories).
 
 ## Building
 
