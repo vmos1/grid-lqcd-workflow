@@ -1,9 +1,26 @@
 #!/bin/bash
-# env_chroma_lq.sh -- run-time environment of the group's Chroma GPU build on lq2 (Fermilab), the
-# lq twin of ../perlmutter/env_chroma_pm.sh. Sourced by chroma_baseg_mds.sh beside it, at the top
-# of the job; source it in a login shell to inspect the binary (ldd "$CHROMA_HMC").
+# env_chroma_lq.sh -- run-time environment of the Chroma GPU builds on lq2 (Fermilab), the lq twin
+# of ../perlmutter/env_chroma_pm.sh. Sourced by chroma_baseg_mds.sh beside it, at the top of the
+# job; source it in a login shell to inspect the binary (ldd "$CHROMA_HMC").
 #
-# The binary. /lustre2/nplqcd/chroma/install_oct_2025 (group space, read only), reached in our
+# CHROMA_STACK selects the build and the MPI stack it runs on:
+#   group (default)  the group's install_oct_2025, described below: NVHPC 23.11's Open MPI 3.1.5,
+#                    whose inter-node messages go over TCP on lq (2.9 GB/s, job 1365190).
+#   gpu-lq2          ours, installs/external/chroma-gpu-lq2 (1_build_chroma/lq/build_chroma_gpu.sh;
+#                    its PROVENANCE.txt): Perlmutter's source commits, built with gompi's mpicc/mpicxx
+#                    and cuda/12.2.1. Run-time environment = machines/lq.sh's gpu stack, the one our
+#                    Grid runs on lq2 (LQ_TARGET=gpu LQ_MPI_STACK=gompi: gompi/2023a = Open MPI 4.1.5
+#                    with external PMIx 4.2.6 + UCX 1.14.1, ucx_cuda/1.14.1_cuda_12.2.1 which loads
+#                    cuda/12.2.1, ucc_cuda) plus the openblas module the build linked (also reached
+#                    through the binary's RUNPATH). libmpi.so.40 must be gompi's (RUNPATH set by
+#                    mpicxx). Inter-node messages go through UCX on the mlx5 HCAs; there is no openib,
+#                    so CHROMA_IBV does not apply (na). QDP-JIT carries CUDA 12.2's libdevice inside
+#                    the binary (chromaform packs it at build time); $CHROMA_INSTALL/llvm/lib comes
+#                    first on LD_LIBRARY_PATH as for the group build.
+#   Keep group the default until gpu-lq2 has passed the 48^3 validation (same deltaH as Perlmutter's
+#   2001 to solver tolerance, seconds_for_trajectory within 5% of 1,652 s).
+#
+# The group binary. /lustre2/nplqcd/chroma/install_oct_2025 (group space, read only), reached in our
 # layout through the link installs/external/chroma. Built 2025-10-07 by the group with
 # /lustre2/nplqcd/chroma/build_scripts/lq2.sh: chromaform --mg --cuda --zen3 --std=c++20
 # --blas=mkl, flavour chroma-quda-qdp-jit-double-nd4-cmake (QDP-JIT with LLVM 17, double, Nd 4;
@@ -49,19 +66,44 @@ if ! command -v module >/dev/null 2>&1; then
     source /etc/profile.d/modules.sh
     source /etc/profile.d/zz_lmod.sh
 fi
-module purge
-module load gcc/12.3.0 cuda/12.2.1 nvhpc-openmpi3/23.11 || _cl_err="module load gcc/12.3.0 cuda/12.2.1 nvhpc-openmpi3/23.11 failed"
 
-export CHROMA_INSTALL=${CHROMA_INSTALL:-$CHROMA_LQ_ROOT/installs/external/chroma}
+# The stack (see the header). CHROMA_LIBMPI_WANT is the libmpi.so.40 the launcher requires in ldd.
+export CHROMA_STACK=${CHROMA_STACK:-group}
+case $CHROMA_STACK in
+group)
+    module purge
+    module load gcc/12.3.0 cuda/12.2.1 nvhpc-openmpi3/23.11 || _cl_err="module load gcc/12.3.0 cuda/12.2.1 nvhpc-openmpi3/23.11 failed"
+    export CHROMA_INSTALL=${CHROMA_INSTALL:-$CHROMA_LQ_ROOT/installs/external/chroma}
+    export CHROMA_LIBMPI_WANT=/srv/software/el8/x86_64/hpc/nvhpc/Linux_x86_64/23.11/comm_libs/openmpi/openmpi-3.1.5/lib/libmpi.so.40
+    _cl_ld=$CHROMA_INSTALL/llvm/lib:/srv/software/el8/x86_64/eb/GCCcore/12.3.0/lib64
+    _cl_missing="the layout link is made with: ln -s /lustre2/nplqcd/chroma/install_oct_2025 $CHROMA_LQ_ROOT/installs/external/chroma"
+    ;;
+gpu-lq2)
+    # machines/lq.sh purges and loads gompi/2023a ucx_cuda/1.14.1_cuda_12.2.1 ucc_cuda/1.2.0_cuda_12.2.1.
+    LQ_TARGET=gpu LQ_MPI_STACK=gompi source "$CHROMA_LQ_ROOT/grid-lqcd-workflow/machines/lq.sh" ||
+        _cl_err="machines/lq.sh (LQ_TARGET=gpu LQ_MPI_STACK=gompi) failed"
+    set +u
+    module load openblas/0.3.24_gcc_12.3.0 || _cl_err="module load openblas/0.3.24_gcc_12.3.0 failed"
+    export CHROMA_INSTALL=${CHROMA_INSTALL:-$CHROMA_LQ_ROOT/installs/external/chroma-gpu-lq2}
+    export CHROMA_LIBMPI_WANT=/srv/software/el8/x86_64/eb/OpenMPI/4.1.5-GCC-12.3.0/lib/libmpi.so.40
+    _cl_ld=$CHROMA_INSTALL/llvm/lib
+    _cl_missing="build it with grid-lqcd-workflow/1_build_chroma/lq/build_chroma_gpu_job.sh"
+    ;;
+*)
+    _cl_err="CHROMA_STACK=$CHROMA_STACK: group or gpu-lq2"
+    ;;
+esac
+
 export CHROMA_FLAVOUR=chroma-quda-qdp-jit-double-nd4-cmake
 export CHROMA_BINDIR=$CHROMA_INSTALL/$CHROMA_FLAVOUR/bin
 export CHROMA_HMC=$CHROMA_BINDIR/hmc       # gauge generation (our <MCControl>/<HMCTrj> inputs)
 export CHROMA_BIN=$CHROMA_BINDIR/chroma    # measurement driver, other input schema
 export CHROMA_INPUTS=$CHROMA_LQ_ROOT/grid-lqcd-workflow/5_studies/chroma_inputs/candidates
-if [ ! -x "$CHROMA_HMC" ]; then
-    _cl_err="no executable hmc at $CHROMA_HMC; the layout link is made with: ln -s /lustre2/nplqcd/chroma/install_oct_2025 $CHROMA_LQ_ROOT/installs/external/chroma"
+if [ -z "${_cl_err}" ] && [ ! -x "$CHROMA_HMC" ]; then
+    _cl_err="no executable hmc at $CHROMA_HMC (CHROMA_STACK=$CHROMA_STACK); ${_cl_missing}"
 fi
-export LD_LIBRARY_PATH=$CHROMA_INSTALL/llvm/lib:/srv/software/el8/x86_64/eb/GCCcore/12.3.0/lib64:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${_cl_ld}:$LD_LIBRARY_PATH
+unset _cl_ld _cl_missing
 export PATH=$CHROMA_BINDIR:$PATH
 
 # Run-time knobs as env_chroma_pm.sh (they came from the lq2 Grid-TXQCD environment).
@@ -72,13 +114,18 @@ export QUDA_ENABLE_MANAGED_MEMORY=1
 # launcher (runs/<run>/quda_resource).
 export CUDA_CACHE_PATH=$CHROMA_LQ_ROOT/builds/.cuda_cache
 
-# Inter-node transport (see the header).
-export CHROMA_IBV=${CHROMA_IBV:-system}
-case $CHROMA_IBV in
-    system)  export RDMAV_DRIVERS=/usr/lib64/libibverbs/libmlx5 ;;
-    bundled) unset RDMAV_DRIVERS ;;
-    *)       _cl_err="CHROMA_IBV=$CHROMA_IBV: system or bundled" ;;
-esac
+# Inter-node transport (see the header). gpu-lq2: UCX, no openib, nothing to set.
+if [ "$CHROMA_STACK" = gpu-lq2 ]; then
+    export CHROMA_IBV=na
+    unset RDMAV_DRIVERS
+else
+    export CHROMA_IBV=${CHROMA_IBV:-system}
+    case $CHROMA_IBV in
+        system)  export RDMAV_DRIVERS=/usr/lib64/libibverbs/libmlx5 ;;
+        bundled) unset RDMAV_DRIVERS ;;
+        *)       _cl_err="CHROMA_IBV=$CHROMA_IBV: system or bundled" ;;
+    esac
+fi
 
 if [ "${_cl_nounset}" = 1 ]; then set -u; fi
 unset _cl_nounset
@@ -91,5 +138,5 @@ unset _cl_err
 
 if [ -t 1 ]; then
     module list 2>&1
-    echo "CHROMA_HMC=$CHROMA_HMC  CHROMA_IBV=$CHROMA_IBV  CUDA_PATH=$CUDA_PATH"
+    echo "CHROMA_STACK=$CHROMA_STACK  CHROMA_HMC=$CHROMA_HMC  CHROMA_IBV=$CHROMA_IBV  CUDA_PATH=$CUDA_PATH"
 fi

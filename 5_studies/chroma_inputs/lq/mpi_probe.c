@@ -1,14 +1,18 @@
 /* mpi_probe.c -- the MPI gate of chroma_baseg_mds.sh on lq2. The launcher compiles it inside the
- * job with the Chroma environment (Open MPI 3.1.5 of NVHPC 23.11, the MPI the hmc binary loads)
- * and starts it with hmc's own srun line and wrapper, before the trajectory. It answers three
- * questions in seconds:
- *   1. Can srun --mpi=pmix start this Open MPI (its PMIx 2.2.3) across all nodes?
+ * job with the Chroma environment of CHROMA_STACK (group: Open MPI 3.1.5 of NVHPC 23.11; gpu-lq2:
+ * gompi's Open MPI 4.1.5 + UCX; in each case the MPI the hmc binary loads) and starts it with hmc's
+ * own srun line and wrapper, before the trajectory. It answers three questions in seconds:
+ *   1. Can srun --mpi=pmix start this Open MPI (group: its PMIx 2.2.3; gpu-lq2: PMIx 4.2.6) across
+ *      all nodes?
  *   2. Is every rank where QDP-JIT will put it? One line per rank: host, the local-rank variables
  *      QDP-JIT reads in order (PMI_RANK, OMPI_COMM_WORLD_LOCAL_RANK, SLURM_LOCALID; its device is
  *      that value mod the visible GPU count), the node communicator size, the cores it may use.
+ *      The variables are read before MPI_Init, as QDP-JIT reads them (qdp-jit 5279034f
+ *      QDP_initialize: QDP_setGPU, then QDP_initialize_QMP; MPI_Init may add variables of its own).
  *   3. Which transport carries inter-node messages? Rank 0 ping-pongs 8 B and 4 MiB (about one
  *      48^3 halo face) with the next rank on its node and with the first rank on another node.
- *      openib on lq2's mlx5 HCAs gives several GB/s; the TCP fallback far less.
+ *      openib or UCX on lq2's mlx5 HCAs gives several GB/s; the TCP fallback far less (2.9 GB/s,
+ *      job 1365190).
  * Rank 0 ends with one PROBE_SUMMARY line, which the launcher parses. */
 #define _GNU_SOURCE
 #include <mpi.h>
@@ -52,6 +56,12 @@ static double pingpong(int me, int a, int b, char *buf, int n, int iters)
 
 int main(int argc, char **argv)
 {
+    /* QDP-JIT's view: the launch environment, before MPI_Init (copied: MPI_Init may setenv). */
+    char *pre_pmi = strdup(env_or("PMI_RANK"));
+    char *pre_ompi = strdup(env_or("OMPI_COMM_WORLD_LOCAL_RANK"));
+    char *pre_lid = strdup(env_or("SLURM_LOCALID"));
+    char *pre_cvd = strdup(env_or("CUDA_VISIBLE_DEVICES"));
+
     MPI_Init(&argc, &argv);
     int me, np;
     MPI_Comm_rank(MPI_COMM_WORLD, &me);
@@ -80,8 +90,7 @@ int main(int argc, char **argv)
 
     printf("PROBE rank %d/%d host %s PMI_RANK %s OMPI_COMM_WORLD_LOCAL_RANK %s SLURM_LOCALID %s "
            "CUDA_VISIBLE_DEVICES %s node_comm %d cpus %d-%d (%d)\n",
-           me, np, host, env_or("PMI_RANK"), env_or("OMPI_COMM_WORLD_LOCAL_RANK"),
-           env_or("SLURM_LOCALID"), env_or("CUDA_VISIBLE_DEVICES"), shm_size, first, last,
+           me, np, host, pre_pmi, pre_ompi, pre_lid, pre_cvd, shm_size, first, last,
            CPU_COUNT(&set));
     fflush(stdout);
 
@@ -121,6 +130,10 @@ int main(int argc, char **argv)
 
     free(buf);
     free(hosts);
+    free(pre_pmi);
+    free(pre_ompi);
+    free(pre_lid);
+    free(pre_cvd);
     MPI_Comm_free(&shm);
     MPI_Finalize();
     return 0;

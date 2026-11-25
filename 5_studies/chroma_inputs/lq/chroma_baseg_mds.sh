@@ -34,7 +34,12 @@
 #   SRC_TUNE           directory holding a QUDA tunecache.tsv of an earlier lq run of this binary,
 #                      copied into this run's QUDA_RESOURCE_PATH; default none (cold). Perlmutter
 #                      seeded every timed run: time only with a seeded cache (L083, L084).
-#   CHROMA_IBV         system (default) or bundled: inter-node transport, env_chroma_lq.sh
+#   CHROMA_STACK       group (default): the group's install on NVHPC 23.11's Open MPI 3.1.5 (TCP between
+#                      nodes); gpu-lq2: ours, installs/external/chroma-gpu-lq2 on machines/lq.sh's gompi
+#                      stack (Open MPI 4.1.5 + UCX, as our Grid). env_chroma_lq.sh; the ldd gate below
+#                      requires each stack's own libmpi.so.40 and, for gpu-lq2, nothing from NVHPC
+#   CHROMA_IBV         system (default) or bundled: inter-node transport of the group stack, env_chroma_lq.sh
+#                      (gpu-lq2: na)
 #   PMIX_PSEC          auto (default): start ranks as Slurm sets them up and, only if the probe
 #                      then fails on PMIx security, again with PMIX_SECURITY_MODE=native;
 #                      default: never override; native: always override
@@ -47,8 +52,10 @@
 #
 # What the job does; any failure before step 5 stops it with nothing run:
 #   1. settings and job shape: one rank per GPU, GEOM's product = ranks;
-#   2. environment (env_chroma_lq.sh), ldd of hmc on the compute node (no unresolved library,
-#      libmpi = NVHPC 23.11's Open MPI 3.1.5), libdevice for QDP-JIT;
+#   2. environment (env_chroma_lq.sh, CHROMA_STACK), ldd of hmc on the compute node (no unresolved
+#      library; libmpi = the stack's: NVHPC 23.11's Open MPI 3.1.5 for group, gompi's Open MPI 4.1.5
+#      for gpu-lq2, which may load nothing from NVHPC's comm_libs; libcuda.so.1 = the driver, never a
+#      toolkit stub), libdevice for QDP-JIT;
 #   3. run dir and a run-local copy of the input in which only <cfg_file> (-> CFG_DIR), an
 #      absolute <SavePrefix> (-> the run dir) and, with N_TRAJ, <NUpdatesThisRun> may differ:
 #      the diff is checked and logged;
@@ -57,7 +64,9 @@
 #      peers visible), and numactl holds it to its GPU's NUMA domain (srun --cpu-bind=none, as
 #      machines/lq.md). mpi_probe.c, compiled here with the MPI hmc loads and started by hmc's
 #      srun line, checks: every rank starts (PMIx), block placement, each rank's QDP-JIT device
-#      = its local id, all GPUs visible, and measures the inter-node bandwidth (openib or TCP);
+#      = its local id, all GPUs visible, and measures the inter-node bandwidth (group: openib or
+#      TCP; gpu-lq2: UCX, which should give InfiniBand-class bandwidth; MIN_NET_GBS=6 makes a
+#      TCP fallback (2.9 GB/s, job 1365190) stop the job before hmc);
 #   5. hmc. Its output is appended to <stem>.log, whose first lines are Perlmutter's (ENV, INPUT=,
 #      BIN=, outer/inner n_steps), then lq's INPUT_DIFF, LAUNCH, PROBE, NET and CMD lines;
 #   6. summary: per trajectory update_no, deltaH, AccProb, AcceptP, seconds_for_trajectory (the
@@ -146,9 +155,16 @@ if grep -q 'not found' <<< "$LDD_OUT"; then
   die "ldd reports unresolved libraries or versions for $CHROMA_HMC on $(hostname)"
 fi
 LIBMPI=$(grep -o -m1 '/[^ ]*libmpi\.so[^ ]*' <<< "$LDD_OUT" || true)
-case $LIBMPI in
-  /srv/software/el8/x86_64/hpc/nvhpc/Linux_x86_64/23.11/comm_libs/openmpi/openmpi-3.1.5/lib/*) ;;
-  *) die "hmc loads libmpi from '$LIBMPI'; expected NVHPC 23.11's Open MPI 3.1.5" ;;
+[ "$LIBMPI" = "$CHROMA_LIBMPI_WANT" ] ||
+  die "hmc loads libmpi from '$LIBMPI'; CHROMA_STACK=$CHROMA_STACK expects $CHROMA_LIBMPI_WANT"
+if [ "$CHROMA_STACK" = gpu-lq2 ] && grep -E 'nvhpc|comm_libs|openmpi-3\.1\.5' <<< "$LDD_OUT" >&2; then
+  die "CHROMA_STACK=gpu-lq2: hmc loads the libraries above from NVHPC / Open MPI 3.1.5"
+fi
+LIBCUDA=$(awk '$1 == "libcuda.so.1" { print $3 }' <<< "$LDD_OUT")
+case $LIBCUDA in
+  */stubs/*|"${CUDA_PATH:-/nonexistent}"/*) die "hmc loads libcuda.so.1 from $LIBCUDA, a CUDA toolkit stub, not the driver" ;;
+  /*) ;;
+  *) die "hmc: libcuda.so.1 does not resolve on $(hostname) ('$LIBCUDA')" ;;
 esac
 [ -f "$CUDA_PATH/nvvm/libdevice/libdevice.10.bc" ] || die "QDP-JIT needs $CUDA_PATH/nvvm/libdevice/libdevice.10.bc"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found: not a GPU node ($(hostname))"
@@ -277,7 +293,7 @@ SUMMARY=$(grep -a -m1 -o 'PROBE_SUMMARY.*' "$PROBE_OUT")
 [ -n "$SUMMARY" ] || die "no PROBE_SUMMARY line in $PROBE_OUT"
 INTER_GBS=$(awk '{ for (i = 1; i <= NF; i++) if ($i == "inter_GBs") print $(i + 1) }' <<< "$SUMMARY")
 OPENIB_OFF=$(grep -a -c 'unable to find any relevant network interfaces' "$PROBE_OUT" || true)
-NET_LINE="NET probe=${PROBE_OUT##*/} pmix_psec=$PSEC_USED chroma_ibv=$CHROMA_IBV rdmav_drivers=${RDMAV_DRIVERS:-unset} openib_no_device_warnings=$OPENIB_OFF ${SUMMARY#PROBE_SUMMARY }"
+NET_LINE="NET probe=${PROBE_OUT##*/} chroma_stack=$CHROMA_STACK pmix_psec=$PSEC_USED chroma_ibv=$CHROMA_IBV rdmav_drivers=${RDMAV_DRIVERS:-unset} openib_no_device_warnings=$OPENIB_OFF ${SUMMARY#PROBE_SUMMARY }"
 if awk -v a="$INTER_GBS" -v m="$MIN_NET_GBS" 'BEGIN { exit !(m > 0 && (a == "na" || a + 0 < m)) }'; then
   die "inter-node bandwidth ${INTER_GBS} GB/s is below MIN_NET_GBS=$MIN_NET_GBS. hmc was not run. $NET_LINE"
 fi
@@ -301,8 +317,12 @@ HMC_ARGS=(-i "$INPUT" -o "$OUT_XML" -l "$XMLDAT" -geom "${GEOM_A[@]}" "${EXTRA_W
   sed 's/^/INPUT_DIFF /' "$RUN_DIR/input.diff"
   printf 'LAUNCH host=%s jobid=%s launcher=srun nodes=%s ranks_per_node=%s cpus_per_task=%s nodelist=%s' \
     "$(hostname)" "$SLURM_JOB_ID" "$NODES" "$PER_NODE" "$CPT" "${SLURM_JOB_NODELIST:-?}"
-  printf ' bin_sha256=%s libmpi=%s ompi="%s" pmix_psec=%s chroma_ibv=%s rdmav_drivers=%s' \
-    "$BIN_SHA256" "$LIBMPI" "$(mpirun --version 2>&1 | head -1)" "$PSEC_USED" "$CHROMA_IBV" "${RDMAV_DRIVERS:-unset}"
+  printf ' chroma_stack=%s bin_sha256=%s libmpi=%s libcuda=%s ompi="%s" pmix_psec=%s chroma_ibv=%s rdmav_drivers=%s' \
+    "$CHROMA_STACK" "$BIN_SHA256" "$LIBMPI" "$LIBCUDA" "$(mpirun --version 2>&1 | head -1)" "$PSEC_USED" "$CHROMA_IBV" \
+    "${RDMAV_DRIVERS:-unset}"
+  printf ' mca="%s" ucx="%s"' \
+    "$(compgen -e | grep '^OMPI_MCA_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)" \
+    "$(compgen -e | grep '^UCX_' | while read -r v; do printf '%s=%s ' "$v" "${!v}"; done)"
   printf ' modules="%s" cuda_path=%s gpus=%s buses=%s gpu_numa=%s gpu="%s"' \
     "$(module -t list 2>&1 | tr '\n' ' ')" "$CUDA_PATH" "$(IFS=,; echo "${GPUS[*]}")" "$(IFS=,; echo "${BUSES[*]}")" \
     "$(IFS=,; echo "${NUMAS[*]}")" "$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader -i "${GPUS[0]}")"
@@ -364,4 +384,4 @@ ls -l "$RUN_DIR" | grep -E 'lime|restart|\.ini\.xml' || echo "(none)"
 echo "---- failure lines (QUDA teardown aborts after the last trajectory are cosmetic) ----"
 grep -a -E 'QUDA_ERROR|ERROR|Error|[Aa]bort|out of memory|cudaMalloc|[Ss]egmentation|SIGSEGV|[Bb]us error|FAILED|srun: error' "$LOG" | head -40
 echo "---- warm-cache rerun (time it; seeded from this run's QUDA tune cache) ----"
-echo "SRC_TUNE=$QUDA_RESOURCE_PATH MDS=$MDS SUFFIX=$SUFFIX N_TRAJ=${N_TRAJ:-$NUPD} RUN=${RUN}_warm sbatch --time=<t> --export=ALL $SELF"
+echo "CHROMA_STACK=$CHROMA_STACK SRC_TUNE=$QUDA_RESOURCE_PATH MDS=$MDS SUFFIX=$SUFFIX N_TRAJ=${N_TRAJ:-$NUPD} RUN=${RUN}_warm sbatch --time=<t> --export=ALL $SELF"
