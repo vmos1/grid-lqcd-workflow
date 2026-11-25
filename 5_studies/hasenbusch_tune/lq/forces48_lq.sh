@@ -27,7 +27,7 @@
 #   GRID_EXTRA_ARGS  appended verbatim to the Grid flags (e.g. --dslash-asm), recorded in GRID_FLAGS
 #   DIAG_START_CFG   another ILDG configuration of the ensemble (default cfg_2000)
 #   TIMEOUT_MIN      default 90
-#   DEVICE_MEM_MB, GPU_MON_MS  gpu only, as in traj48_lq.sh
+#   DEVICE_MEM_MB, GPU_MON_MS  gpu only, as in traj48_lq.sh (cap default 32000, job 1365355)
 #
 # MG geometry check (before anything is launched; job 1364148 died after 12 min on 4 lq3 nodes
 # with --mpi 2.2.2.4). The multigrid's levels are the lattice / GRID_MG_BLOCK (default 4.4.4.4)
@@ -62,7 +62,7 @@ G_TARGET=${LQ_TARGET:-gpu}
 G_MPI=${MPI_GEOM:-1.2.2.4}
 G_EXTRA=${GRID_EXTRA_ARGS:-}
 TIMEOUT_MIN=${TIMEOUT_MIN:-90}
-DEVICE_MEM_MB=${DEVICE_MEM_MB:-8000}
+DEVICE_MEM_MB=${DEVICE_MEM_MB:-32000}
 GPU_MON_MS=${GPU_MON_MS:-2000}
 START_CFG=${DIAG_START_CFG:-$ROOT/inputs/cl21_48_96_b6p3_m0p2416_m0p2050-djm-3_cfg_2000.lime}
 case "$G_TARGET" in gpu|cpu) ;; *) die "LQ_TARGET must be gpu or cpu, got '$G_TARGET'" ;; esac

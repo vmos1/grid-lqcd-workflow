@@ -8,7 +8,7 @@
 # RESUME_FROM continues the chain of an earlier run of THIS launcher.
 #
 #   gpu (LQ_TARGET=gpu, default)  lq2: 4 nodes x 4 A100, one rank per GPU, --mpi 1.2.2.4 =
-#                                 Perlmutter's split (local 48.24.24.24), --device-mem 8000.
+#                                 Perlmutter's split (local 48.24.24.24), --device-mem 32000.
 #   cpu (LQ_TARGET=cpu)           lq3: 16 ranks x 4 cores per node (Grid-CPU's best layout,
 #                                 /lustre2/nplqcd/Grid-CPU/AGENT_REFERENCE.md), default 1 node,
 #                                 --mpi 1.2.2.4 (the same split).
@@ -25,8 +25,11 @@
 #   LQ_TARGET        gpu (default) or cpu
 #   MPI_GEOM         default 1.2.2.4; the product must equal the job's ranks
 #   TIMEOUT_MIN      default 210
-#   DEVICE_MEM_MB    gpu only, default 8000 (Perlmutter's default; dH is bit-exact across caps,
-#                    traj48_puregrid.sh section 9)
+#   DEVICE_MEM_MB    gpu only, default 32000 (lq2's A100s have 80 GB; Perlmutter's 40 GB use 8000).
+#                    Job 1365355, baseline 2001-2002 from cfg_2000 seed 300: MD 3,512/3,603 s at
+#                    8000 (job 1363820), 3,030/3,117 at 16000, 2,952/3,040 at 32000 (-15.8%); dH,
+#                    plaquettes and force lines bit-identical; GPU peak 30 / 37 / 54 GB of 80. Pass
+#                    DEVICE_MEM_MB=8000 for a run timed like for like against Perlmutter.
 #   GPU_MON_MS       gpu only, default 2000: nvidia-smi memory sampler on local rank 0 of each node
 #   GRID_EXTRA_ARGS  appended verbatim to the Grid flags (e.g. --dslash-asm), recorded in GRID_FLAGS
 #   HASEN_GRID_*, GRID_MG_*  pass through (recorded in the ENV line), as on Perlmutter
@@ -97,7 +100,7 @@ RESUME_FROM=${RESUME_FROM:-}
 G_TARGET=${LQ_TARGET:-gpu}
 G_MPI=${MPI_GEOM:-1.2.2.4}
 TIMEOUT_MIN=${TIMEOUT_MIN:-210}
-DEVICE_MEM_MB=${DEVICE_MEM_MB:-8000}
+DEVICE_MEM_MB=${DEVICE_MEM_MB:-32000}
 GPU_MON_MS=${GPU_MON_MS:-2000}
 case "$G_TARGET" in gpu|cpu) ;; *) die "LQ_TARGET must be gpu or cpu, got '$G_TARGET'" ;; esac
 export LQ_TARGET=$G_TARGET
