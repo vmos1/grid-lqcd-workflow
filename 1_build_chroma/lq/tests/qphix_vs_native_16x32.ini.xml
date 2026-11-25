@@ -1,0 +1,169 @@
+<?xml version="1.0"?>
+<chroma>
+<annotation>
+lq3 CPU Chroma smoke test (1_build_chroma/lq/build_chroma_cpu.sh test): reference without mg_proto.
+After chroma's tests/chroma/hadron/propagator/prec_clover-qphix-solver-xeon-setup.ini.xml, the same
+even-odd clover propagator solved twice:
+  1. chroma's native BICGSTAB_INVERTER (QDP++ operator and solver only): prints "Relative Rsd";
+  2. chroma's own QPhiX solver (QPHIX_CLOVER_INVERTER, AVX-512 kernels, built without compression),
+     which checks || r || / || b || with chroma's operator and aborts ("SOLVE FAILED") above
+     RsdTarget x RsdToleranceFactor.
+Action: isotropic, production-like (clovCoeff 1.20536588031793, stout rho 0.125 x 1, antiperiodic t),
+weak field, Mass 0.01. 16^3 x 32 on 2 ranks (-geom 1 1 1 2), local 16^4.
+</annotation>
+<Param>
+  <InlineMeasurements>
+
+    <elem>
+      <Name>MAKE_SOURCE</Name>
+      <Frequency>1</Frequency>
+      <Param>
+        <version>6</version>
+        <Source>
+          <version>2</version>
+          <SourceType>SHELL_SOURCE</SourceType>
+          <j_decay>3</j_decay>
+          <t_srce>0 0 0 0</t_srce>
+
+          <SmearingParam>
+            <wvf_kind>GAUGE_INV_GAUSSIAN</wvf_kind>
+            <wvf_param>2.0</wvf_param>
+            <wvfIntPar>5</wvfIntPar>
+            <no_smear_dir>3</no_smear_dir>
+          </SmearingParam>
+
+          <Displacement>
+            <version>1</version>
+            <DisplacementType>NONE</DisplacementType>
+          </Displacement>
+
+          <noLinkSmearing>
+            <LinkSmearingType>APE_SMEAR</LinkSmearingType>
+            <link_smear_fact>2.5</link_smear_fact>
+            <link_smear_num>1</link_smear_num>
+            <no_smear_dir>3</no_smear_dir>
+          </noLinkSmearing>
+        </Source>
+      </Param>
+      <NamedObject>
+        <gauge_id>default_gauge_field</gauge_id>
+        <source_id>sh_source_0</source_id>
+      </NamedObject>
+    </elem>
+
+    <!-- 1. Native chroma solver -->
+    <elem>
+      <Name>PROPAGATOR</Name>
+      <Frequency>1</Frequency>
+      <Param>
+        <version>10</version>
+        <quarkSpinType>FULL</quarkSpinType>
+        <obsvP>false</obsvP>
+        <numRetries>1</numRetries>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>0.01</Mass>
+          <clovCoeff>1.20536588031793</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>BICGSTAB_INVERTER</invType>
+          <RsdBiCGStab>1.0e-7</RsdBiCGStab>
+          <MaxBiCGStab>3000</MaxBiCGStab>
+        </InvertParam>
+      </Param>
+      <NamedObject>
+        <gauge_id>default_gauge_field</gauge_id>
+        <source_id>sh_source_0</source_id>
+        <prop_id>sh_prop_0</prop_id>
+      </NamedObject>
+    </elem>
+
+    <elem>
+      <Name>ERASE_NAMED_OBJECT</Name>
+      <NamedObject>
+        <object_id>sh_prop_0</object_id>
+      </NamedObject>
+    </elem>
+
+    <!-- 2. Chroma's QPhiX solver, same action -->
+    <elem>
+      <Name>PROPAGATOR</Name>
+      <Frequency>1</Frequency>
+      <Param>
+        <version>10</version>
+        <quarkSpinType>FULL</quarkSpinType>
+        <obsvP>false</obsvP>
+        <numRetries>1</numRetries>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>0.01</Mass>
+          <clovCoeff>1.20536588031793</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>QPHIX_CLOVER_INVERTER</invType>
+          <SolverType>BICGSTAB</SolverType>
+          <MaxIter>3000</MaxIter>
+          <RsdTarget>1.0e-7</RsdTarget>
+          <CloverParams>
+            <Mass>0.01</Mass>
+            <clovCoeff>1.20536588031793</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+            </AnisoParam>
+          </CloverParams>
+          <AntiPeriodicT>true</AntiPeriodicT>
+          <Verbose>false</Verbose>
+          <RsdToleranceFactor>5.0</RsdToleranceFactor>
+        </InvertParam>
+      </Param>
+      <NamedObject>
+        <gauge_id>default_gauge_field</gauge_id>
+        <source_id>sh_source_0</source_id>
+        <prop_id>sh_prop_0</prop_id>
+      </NamedObject>
+    </elem>
+
+  </InlineMeasurements>
+  <nrow>16 16 16 32</nrow>
+</Param>
+
+<RNG>
+  <Seed>
+    <elem>11</elem>
+    <elem>11</elem>
+    <elem>11</elem>
+    <elem>0</elem>
+  </Seed>
+</RNG>
+
+<Cfg>
+  <cfg_type>WEAK_FIELD</cfg_type>
+  <cfg_file>dummy</cfg_file>
+</Cfg>
+</chroma>

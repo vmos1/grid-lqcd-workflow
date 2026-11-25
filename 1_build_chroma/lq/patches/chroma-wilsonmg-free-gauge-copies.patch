@@ -1,0 +1,45 @@
+lq3 QOP-MG build: free the gauge-field copies chroma's QOP-MG bridge leaks on every solver construction.
+
+Applied by build_qopmg.sh (fetch) to builds/chroma-cpu-lq3-qopmg/src/chroma only (patch -p1 in the chroma
+tree), never to the base build's source.
+
+MGP(initialize) runs once per QOP_CLOVER_MULTIGRID_INVERTER object, i.e. once per HMC solve. It makes four
+QDP/C ColorMatrix fields (and their pointer array) from chroma's links, then a QOP gauge field from them, and
+frees neither; finalize frees only the two Wilson operators. Measured in the source (QOPQDP 4aef533):
+  - QOP_create_G_from_qdp copies the links into new fields (lib/common_p.c), so the QDP/C fields are dead
+    once it returns; the original authors already wrote the free below but left it commented out;
+  - QOP_wilson_create_L_from_G copies the links into the operator's own fields and keeps only a pointer to
+    the QOP gauge field (lib/wilson_dslash_p.c), read nowhere outside a commented-out chain-rule branch of
+    the force (lib/wilson_force_p.c); QOP_FD_wilson_create_L_from_L copies the double operator's links, not
+    the gauge field; QOP_wilson_destroy_L does not touch it. So the QOP gauge field can go once both
+    operators exist.
+Leak without this patch: 4 QDP/C + 4 QOP ColorMatrix fields per rank per solver object (input agent's
+estimate: about 255 MB per rank per solve on the 48^3 production layout, about 330 MdagM solves per
+trajectory). Not patched: QOP_wilsonMgNew is declared (void) (include/qop_mg.h, qop_d3.h -> QOP_3_wilsonMgNew) and the
+bridge calls it with no arguments (wilsonmg_p.c:43).
+
+--- a/other_libs/wilsonmg/lib/wilsonmg_p.c
++++ b/other_libs/wilsonmg/lib/wilsonmg_p.c
+@@ -258,8 +258,10 @@
+   wil = QOP(wilson_create_L_from_G)(&info, &coeffs, qopgauge);
+ 
+   // After the gauge fields are safely inside the ops, we can delete them
+-  //for (int d=0; d<ndim; d++) QDP_destroy_M(gauge[d]);
+-  //free(gauge);
++  // (lq3 patch: QOP_create_G_from_qdp copied them, so these four QDP/C fields
++  // and their array leaked on every solver construction)
++  for (int d=0; d<ndim; d++) QDP_destroy_M(gauge[d]);
++  free(gauge);
+ 
+   // Initialize the single-precision version of the operator  
+ #if QDP_Precision == 1 || QDP_Precision == 'F'
+@@ -268,6 +270,9 @@
+   printf0("QDP:   Creating single-precision operator\n");
+   wilf = QOP_FD3_wilson_create_L_from_L(wil);
+ #endif
++  // lq3 patch: both operators hold their own copies of the links, so the QOP
++  // gauge field (which leaked on every solver construction) can go now
++  QOP(destroy_G)(qopgauge);
+   timer += QDP_time(); QMP_max_double(&timer);
+   printf0("QDP: Dirac-op creation time = %g secs\n", timer);
+  

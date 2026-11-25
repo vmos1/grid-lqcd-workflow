@@ -1,0 +1,528 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+16^3 x 48 check of the QOP-MG HMC path against the validated QPhiX CG path, on a real configuration near
+its critical mass (cl3_16_48_b6p1_m0p2450 cfg_11100: beta 6.1, LW tree gauge, u0 0.832605301399891,
+c_sw 1.24930970916466, stout rho 0.125 x 1, antiperiodic t). Two flavours: clover log-det, one Hasenbusch
+ratio -0.2450 / -0.2300 sharing one subspace, a tail at -0.2300 with its own, the production integrator
+(force gradient 4 outer, 2 inner) at tau 0.5, two trajectories, seeds 11 1011 2011 3011.
+qopmg_validate_hmc16_gpuform.ini.xml holds the GPU solver blocks and is not run on lq3. make_cpu_input.py
+turns it into qopmg_validate_hmc16_qphixcg.ini.xml, make_cpu_input_qopmg.py into
+qopmg_validate_hmc16_qopmg.ini.xml; both scripts prove the rest byte-identical, so the pair differs only in
+solver blocks and every deltaH, force record and plaquette must agree to solver tolerance. The force solve
+of MD::ratio at -0.2450 has threshold 10 so that the QOP subspace erase and rebuild path runs.
+Run on one lq3 node, 4 ranks x 16 threads, -geom 1 1 1 4 (local 16 16 16 12).
+-->
+<Params>
+  <MCControl>
+<Cfg>
+  <cfg_type>SZINQIO</cfg_type>
+  <cfg_file>/lustre2/nplqcd/vayyar/grid_qcd/inputs/cl3_16_48_b6p1_m0p2450_a_cfg_11100.lime</cfg_file>
+  <parallel_io>true</parallel_io>
+  <reunit>false</reunit>
+</Cfg>
+    <RNG>
+      <Seed>
+        <elem>11</elem>
+        <elem>1011</elem>
+        <elem>2011</elem>
+        <elem>3011</elem>
+      </Seed>
+    </RNG>
+    <StartUpdateNum>11100</StartUpdateNum>
+    <NWarmUpUpdates>0</NWarmUpUpdates>
+    <NProductionUpdates>100000</NProductionUpdates>
+    <NUpdatesThisRun>2</NUpdatesThisRun>
+    <SaveInterval>1000000</SaveInterval>
+    <SavePrefix>./qopmg_validate_hmc16</SavePrefix>
+    <SaveVolfmt>SINGLEFILE</SaveVolfmt>
+    <ParallelIO>true</ParallelIO>
+    <ReproCheckP>false</ReproCheckP>
+    <ReverseCheckP>false</ReverseCheckP>
+    <MonitorForces>true</MonitorForces><InlineMeasurements>
+      <elem>
+        <Name>PLAQUETTE</Name>
+        <Frequency>1</Frequency>
+        <Param>
+          <version>2</version>
+          <GaugeState>
+            <Name>SIMPLE_GAUGE_STATE</Name>
+            <GaugeBC>
+              <Name>PERIODIC_GAUGEBC</Name>
+            </GaugeBC>
+          </GaugeState>
+        </Param>
+        <NamedObject>
+          <gauge_id>default_gauge_field</gauge_id>
+        </NamedObject>
+        <xml_file>./plaquette/thin_plaquette_dat.xml</xml_file>
+      </elem>
+      <elem>
+        <Name>ERASE_QUDA_MULTIGRID_SUBSPACE</Name>
+        <Frequency>1</Frequency>
+        <NamedObject>
+          <object_id>mg_subspace</object_id>
+        </NamedObject>
+      </elem>
+    </InlineMeasurements>
+</MCControl>
+  <HMCTrj>
+    <nrow>16 16 16 48</nrow><Monomials>
+      <elem>
+        <Name>N_FLAVOR_LOGDET_EVEN_EVEN_FERM_MONOMIAL</Name>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>-0.2450</Mass>
+          <clovCoeff>1.24930970916466</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+            <t_dir>3</t_dir>
+            <xi_0>1</xi_0>
+            <nu>1</nu>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <num_flavors>2</num_flavors>
+        <NamedObject>
+          <monomial_id>HMC::logdet_2flav</monomial_id>
+        </NamedObject>
+      </elem>
+      <elem>
+        <Name>TWO_FLAVOR_EOPREC_CONSTDET_RATIO_CONV_CONV_FERM_MONOMIAL</Name>
+        <Action>
+          <FermionAction>
+            <FermAct>CLOVER</FermAct>
+            <Mass>-0.2450</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+              <t_dir>3</t_dir>
+              <xi_0>1</xi_0>
+              <nu>1</nu>
+            </AnisoParam>
+            <FermState>
+              <Name>STOUT_FERM_STATE</Name>
+              <rho>0.125</rho>
+              <n_smear>1</n_smear>
+              <orthog_dir>-1</orthog_dir>
+              <FermionBC>
+                <FermBC>SIMPLE_FERMBC</FermBC>
+                <boundary>1 1 1 -1</boundary>
+              </FermionBC>
+            </FermState>
+          </FermionAction>
+          <InvertParam>
+            <invType>QUDA_MULTIGRID_CLOVER_INVERTER</invType>
+            <CloverParams>
+              <Mass>-0.2450</Mass>
+              <clovCoeff>1.24930970916466</clovCoeff>
+              <AnisoParam>
+                <anisoP>false</anisoP>
+                <t_dir>3</t_dir>
+                <xi_0>1</xi_0>
+                <nu>1</nu>
+              </AnisoParam>
+            </CloverParams>
+            <RsdTarget>1e-12</RsdTarget>
+            <MaxIter>500</MaxIter>
+            <RsdToleranceFactor>8.0</RsdToleranceFactor>
+            <AntiPeriodicT>true</AntiPeriodicT>
+            <SolverType>GCR</SolverType>
+            <MULTIGRIDParams>
+              <Blocking>
+                <elem>4 4 4 3</elem>
+                <elem>2 2 2 2</elem>
+              </Blocking>
+              <CoarseResidual>0.1 0.1 0.1</CoarseResidual>
+              <MaxCoarseIterations>12 12 8</MaxCoarseIterations>
+              <RelaxationOmegaMG>1.0 1.0 1.0</RelaxationOmegaMG>
+              <NullVectors>24 32</NullVectors>
+              <Pre-SmootherApplications>0 0</Pre-SmootherApplications>
+              <Post-SmootherApplications>8 8</Post-SmootherApplications>
+              <MaxIterSubspaceCreate>500 500</MaxIterSubspaceCreate>
+              <OuterGCRNKrylov>20</OuterGCRNKrylov>
+              <PrecondGCRNKrylov>10</PrecondGCRNKrylov>
+            </MULTIGRIDParams>
+            <SubspaceID>mg_subspace</SubspaceID>
+            <ThresholdCount>500</ThresholdCount>
+          </InvertParam>
+        </Action>
+        <PrecAction>
+          <FermionAction>
+            <FermAct>CLOVER</FermAct>
+            <Mass>-0.2300</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+              <t_dir>3</t_dir>
+              <xi_0>1</xi_0>
+              <nu>1</nu>
+            </AnisoParam>
+            <FermState>
+              <Name>STOUT_FERM_STATE</Name>
+              <rho>0.125</rho>
+              <n_smear>1</n_smear>
+              <orthog_dir>-1</orthog_dir>
+              <FermionBC>
+                <FermBC>SIMPLE_FERMBC</FermBC>
+                <boundary>1 1 1 -1</boundary>
+              </FermionBC>
+            </FermState>
+          </FermionAction>
+          <InvertParam>
+            <invType>QUDA_MULTIGRID_CLOVER_INVERTER</invType>
+            <CloverParams>
+              <Mass>-0.2300</Mass>
+              <clovCoeff>1.24930970916466</clovCoeff>
+              <AnisoParam>
+                <anisoP>false</anisoP>
+                <t_dir>3</t_dir>
+                <xi_0>1</xi_0>
+                <nu>1</nu>
+              </AnisoParam>
+            </CloverParams>
+            <RsdTarget>1e-12</RsdTarget>
+            <MaxIter>500</MaxIter>
+            <RsdToleranceFactor>8.0</RsdToleranceFactor>
+            <AntiPeriodicT>true</AntiPeriodicT>
+            <SolverType>GCR</SolverType>
+            <MULTIGRIDParams>
+              <Blocking>
+                <elem>4 4 4 3</elem>
+                <elem>2 2 2 2</elem>
+              </Blocking>
+              <CoarseResidual>0.1 0.1 0.1</CoarseResidual>
+              <MaxCoarseIterations>12 12 8</MaxCoarseIterations>
+              <RelaxationOmegaMG>1.0 1.0 1.0</RelaxationOmegaMG>
+              <NullVectors>24 32</NullVectors>
+              <Pre-SmootherApplications>0 0</Pre-SmootherApplications>
+              <Post-SmootherApplications>8 8</Post-SmootherApplications>
+              <MaxIterSubspaceCreate>500 500</MaxIterSubspaceCreate>
+              <OuterGCRNKrylov>20</OuterGCRNKrylov>
+              <PrecondGCRNKrylov>10</PrecondGCRNKrylov>
+            </MULTIGRIDParams>
+            <SubspaceID>mg_subspace</SubspaceID>
+            <ThresholdCount>500</ThresholdCount>
+          </InvertParam>
+        </PrecAction>
+        <NamedObject>
+          <monomial_id>HMC::ratio</monomial_id>
+        </NamedObject>
+      </elem>
+      <elem>
+        <Name>TWO_FLAVOR_EOPREC_CONSTDET_RATIO_CONV_CONV_FERM_MONOMIAL</Name>
+        <Action>
+          <FermionAction>
+            <FermAct>CLOVER</FermAct>
+            <Mass>-0.2450</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+              <t_dir>3</t_dir>
+              <xi_0>1</xi_0>
+              <nu>1</nu>
+            </AnisoParam>
+            <FermState>
+              <Name>STOUT_FERM_STATE</Name>
+              <rho>0.125</rho>
+              <n_smear>1</n_smear>
+              <orthog_dir>-1</orthog_dir>
+              <FermionBC>
+                <FermBC>SIMPLE_FERMBC</FermBC>
+                <boundary>1 1 1 -1</boundary>
+              </FermionBC>
+            </FermState>
+          </FermionAction>
+          <InvertParam>
+            <invType>QUDA_MULTIGRID_CLOVER_INVERTER</invType>
+            <CloverParams>
+              <Mass>-0.2450</Mass>
+              <clovCoeff>1.24930970916466</clovCoeff>
+              <AnisoParam>
+                <anisoP>false</anisoP>
+                <t_dir>3</t_dir>
+                <xi_0>1</xi_0>
+                <nu>1</nu>
+              </AnisoParam>
+            </CloverParams>
+            <RsdTarget>1e-11</RsdTarget>
+            <MaxIter>500</MaxIter>
+            <RsdToleranceFactor>8.0</RsdToleranceFactor>
+            <AntiPeriodicT>true</AntiPeriodicT>
+            <SolverType>GCR</SolverType>
+            <MULTIGRIDParams>
+              <Blocking>
+                <elem>4 4 4 3</elem>
+                <elem>2 2 2 2</elem>
+              </Blocking>
+              <CoarseResidual>0.1 0.1 0.1</CoarseResidual>
+              <MaxCoarseIterations>12 12 8</MaxCoarseIterations>
+              <RelaxationOmegaMG>1.0 1.0 1.0</RelaxationOmegaMG>
+              <NullVectors>24 32</NullVectors>
+              <Pre-SmootherApplications>0 0</Pre-SmootherApplications>
+              <Post-SmootherApplications>8 8</Post-SmootherApplications>
+              <MaxIterSubspaceCreate>500 500</MaxIterSubspaceCreate>
+              <OuterGCRNKrylov>20</OuterGCRNKrylov>
+              <PrecondGCRNKrylov>10</PrecondGCRNKrylov>
+            </MULTIGRIDParams>
+            <SubspaceID>mg_subspace</SubspaceID>
+            <ThresholdCount>10</ThresholdCount>
+          </InvertParam>
+        </Action>
+        <PrecAction>
+          <FermionAction>
+            <FermAct>CLOVER</FermAct>
+            <Mass>-0.2300</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+              <t_dir>3</t_dir>
+              <xi_0>1</xi_0>
+              <nu>1</nu>
+            </AnisoParam>
+            <FermState>
+              <Name>STOUT_FERM_STATE</Name>
+              <rho>0.125</rho>
+              <n_smear>1</n_smear>
+              <orthog_dir>-1</orthog_dir>
+              <FermionBC>
+                <FermBC>SIMPLE_FERMBC</FermBC>
+                <boundary>1 1 1 -1</boundary>
+              </FermionBC>
+            </FermState>
+          </FermionAction>
+          <InvertParam>
+            <invType>QUDA_MULTIGRID_CLOVER_INVERTER</invType>
+            <CloverParams>
+              <Mass>-0.2300</Mass>
+              <clovCoeff>1.24930970916466</clovCoeff>
+              <AnisoParam>
+                <anisoP>false</anisoP>
+                <t_dir>3</t_dir>
+                <xi_0>1</xi_0>
+                <nu>1</nu>
+              </AnisoParam>
+            </CloverParams>
+            <RsdTarget>1e-11</RsdTarget>
+            <MaxIter>500</MaxIter>
+            <RsdToleranceFactor>8.0</RsdToleranceFactor>
+            <AntiPeriodicT>true</AntiPeriodicT>
+            <SolverType>GCR</SolverType>
+            <MULTIGRIDParams>
+              <Blocking>
+                <elem>4 4 4 3</elem>
+                <elem>2 2 2 2</elem>
+              </Blocking>
+              <CoarseResidual>0.1 0.1 0.1</CoarseResidual>
+              <MaxCoarseIterations>12 12 8</MaxCoarseIterations>
+              <RelaxationOmegaMG>1.0 1.0 1.0</RelaxationOmegaMG>
+              <NullVectors>24 32</NullVectors>
+              <Pre-SmootherApplications>0 0</Pre-SmootherApplications>
+              <Post-SmootherApplications>8 8</Post-SmootherApplications>
+              <MaxIterSubspaceCreate>500 500</MaxIterSubspaceCreate>
+              <OuterGCRNKrylov>20</OuterGCRNKrylov>
+              <PrecondGCRNKrylov>10</PrecondGCRNKrylov>
+            </MULTIGRIDParams>
+            <SubspaceID>mg_subspace</SubspaceID>
+            <ThresholdCount>500</ThresholdCount>
+          </InvertParam>
+        </PrecAction>
+        <ChronologicalPredictor>
+          <Name>QUDA_4D_PREDICTOR</Name>
+          <MaxChrono>5</MaxChrono>
+        </ChronologicalPredictor>
+        <NamedObject>
+          <monomial_id>MD::ratio</monomial_id>
+        </NamedObject>
+      </elem>
+      <elem>
+        <Name>TWO_FLAVOR_EOPREC_CONSTDET_FERM_MONOMIAL</Name>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>-0.2300</Mass>
+          <clovCoeff>1.24930970916466</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+            <t_dir>3</t_dir>
+            <xi_0>1</xi_0>
+            <nu>1</nu>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>QUDA_MULTIGRID_CLOVER_INVERTER</invType>
+          <CloverParams>
+            <Mass>-0.2300</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+              <t_dir>3</t_dir>
+              <xi_0>1</xi_0>
+              <nu>1</nu>
+            </AnisoParam>
+          </CloverParams>
+          <RsdTarget>1e-12</RsdTarget>
+          <MaxIter>500</MaxIter>
+          <RsdToleranceFactor>8.0</RsdToleranceFactor>
+          <AntiPeriodicT>true</AntiPeriodicT>
+          <SolverType>GCR</SolverType>
+          <MULTIGRIDParams>
+            <Blocking>
+              <elem>4 4 4 3</elem>
+              <elem>2 2 2 2</elem>
+            </Blocking>
+            <CoarseResidual>0.1 0.1 0.1</CoarseResidual>
+            <MaxCoarseIterations>12 12 8</MaxCoarseIterations>
+            <RelaxationOmegaMG>1.0 1.0 1.0</RelaxationOmegaMG>
+            <NullVectors>24 32</NullVectors>
+            <Pre-SmootherApplications>0 0</Pre-SmootherApplications>
+            <Post-SmootherApplications>8 8</Post-SmootherApplications>
+            <MaxIterSubspaceCreate>500 500</MaxIterSubspaceCreate>
+            <OuterGCRNKrylov>20</OuterGCRNKrylov>
+            <PrecondGCRNKrylov>10</PrecondGCRNKrylov>
+          </MULTIGRIDParams>
+          <SubspaceID>subspace_mg</SubspaceID>
+          <ThresholdCount>500</ThresholdCount>
+        </InvertParam>
+        <NamedObject>
+          <monomial_id>HMC::tail</monomial_id>
+        </NamedObject>
+      </elem>
+      <elem>
+        <Name>TWO_FLAVOR_EOPREC_CONSTDET_FERM_MONOMIAL</Name>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>-0.2300</Mass>
+          <clovCoeff>1.24930970916466</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+            <t_dir>3</t_dir>
+            <xi_0>1</xi_0>
+            <nu>1</nu>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>QUDA_MULTIGRID_CLOVER_INVERTER</invType>
+          <CloverParams>
+            <Mass>-0.2300</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+              <t_dir>3</t_dir>
+              <xi_0>1</xi_0>
+              <nu>1</nu>
+            </AnisoParam>
+          </CloverParams>
+          <RsdTarget>1e-11</RsdTarget>
+          <MaxIter>500</MaxIter>
+          <RsdToleranceFactor>8.0</RsdToleranceFactor>
+          <AntiPeriodicT>true</AntiPeriodicT>
+          <SolverType>GCR</SolverType>
+          <MULTIGRIDParams>
+            <Blocking>
+              <elem>4 4 4 3</elem>
+              <elem>2 2 2 2</elem>
+            </Blocking>
+            <CoarseResidual>0.1 0.1 0.1</CoarseResidual>
+            <MaxCoarseIterations>12 12 8</MaxCoarseIterations>
+            <RelaxationOmegaMG>1.0 1.0 1.0</RelaxationOmegaMG>
+            <NullVectors>24 32</NullVectors>
+            <Pre-SmootherApplications>0 0</Pre-SmootherApplications>
+            <Post-SmootherApplications>8 8</Post-SmootherApplications>
+            <MaxIterSubspaceCreate>500 500</MaxIterSubspaceCreate>
+            <OuterGCRNKrylov>20</OuterGCRNKrylov>
+            <PrecondGCRNKrylov>10</PrecondGCRNKrylov>
+          </MULTIGRIDParams>
+          <SubspaceID>subspace_mg</SubspaceID>
+          <ThresholdCount>500</ThresholdCount>
+        </InvertParam>
+        <ChronologicalPredictor>
+          <Name>QUDA_4D_PREDICTOR</Name>
+          <MaxChrono>6</MaxChrono>
+          <Precision>SINGLE</Precision>
+        </ChronologicalPredictor>
+        <NamedObject>
+          <monomial_id>MD::tail</monomial_id>
+        </NamedObject>
+      </elem>
+      <elem>
+        <Name>GAUGE_MONOMIAL</Name>
+        <GaugeAction>
+          <Name>LW_TREE_GAUGEACT</Name>
+          <beta>6.1</beta>
+          <u0>0.832605301399891</u0>
+          <GaugeBC>
+            <Name>PERIODIC_GAUGEBC</Name>
+          </GaugeBC>
+        </GaugeAction>
+        <NamedObject>
+          <monomial_id>HMC::lw_tree_gauge</monomial_id>
+        </NamedObject>
+      </elem>
+    </Monomials>
+<Hamiltonian>
+      <monomial_ids>
+        <elem>HMC::logdet_2flav</elem>
+        <elem>HMC::ratio</elem>
+        <elem>HMC::tail</elem>
+        <elem>HMC::lw_tree_gauge</elem>
+      </monomial_ids>
+    </Hamiltonian>
+<MDIntegrator>
+      <tau0>0.5</tau0>
+      <copyList>
+        <elem>
+          <copyFrom>HMC::ratio</copyFrom>
+          <copyTo>MD::ratio</copyTo>
+        </elem>
+        <elem>
+          <copyFrom>HMC::tail</copyFrom>
+          <copyTo>MD::tail</copyTo>
+        </elem>
+      </copyList>
+      <Integrator>
+        <Name>LCM_STS_FORCE_GRAD</Name>
+        <n_steps>4</n_steps>
+        <monomial_ids>
+          <elem>HMC::logdet_2flav</elem>
+          <elem>MD::ratio</elem>
+        </monomial_ids>
+        <SubIntegrator>
+          <Name>LCM_STS_FORCE_GRAD</Name>
+          <n_steps>2</n_steps>
+          <monomial_ids>
+            <elem>MD::tail</elem>
+            <elem>HMC::lw_tree_gauge</elem>
+          </monomial_ids>
+        </SubIntegrator>
+      </Integrator>
+    </MDIntegrator>
+</HMCTrj>
+</Params>

@@ -1,0 +1,34 @@
+lq3 QOP-MG build: release the file-scope gauge field of chroma's QOP-MG LinOp solver after use.
+
+Applied by build_qopmg.sh (fetch) to builds/chroma-cpu-lq3-qopmg/src/chroma only (patch -p1 in the chroma
+tree), never to the base build's source.
+
+lib/actions/ferm/invert/qop_mg/syssolver_linop_qop_mg_w.cc keeps `static multi1d<LatticeColorMatrix> u`
+at file scope so that its peekpoke0..3 callbacks can read the links while MGP(initialize) builds the QDP/C
+gauge field (QDP_M_eq_func, other_libs/wilsonmg/lib/wilsonmg_p.c:196, the only use; MGP(solve) and the
+rest of the bridge never call them). The copy then stays alive until program exit, where its destructor
+runs after QDP++ has torn down its allocator's pointer map: QDP::Allocator::delete_aligned ->
+std::map::erase on the destroyed map. Job 1365333: every run that constructed a QOP-MG solver (chroma
+propagator on 2 and 4 ranks, hmc with the MdagM solver, which builds LinOp solvers inside) finished its
+work, printed its results, and then died at exit with "free(): invalid next size" (SIGABRT) or SIGSEGV
+in ~multi1d<LatticeColorMatrix> (addr2line on both binaries). Results were right (hmc vs QPhiX CG:
+deltaH and all 32 force records agree); only the exit failed, which fails the job and the test.
+
+Fix: u.resize(0) right after MGP(initialize). The four lattice fields are freed while QDP++ is alive and
+the static is left as an empty array, whose destructor touches no lattice memory. It also drops one gauge
+field per rank that otherwise lived for the whole run.
+
+--- a/lib/actions/ferm/invert/qop_mg/syssolver_linop_qop_mg_w.cc
++++ b/lib/actions/ferm/invert/qop_mg/syssolver_linop_qop_mg_w.cc
+@@ -132,6 +132,11 @@
+       void (*peekpoke[4])(QLA(ColorMatrix) *dest, int coords[]) =
+         {peekpoke0,peekpoke1,peekpoke2,peekpoke3};
+       MGP(initialize)(machsize, latsize, peekpoke);
++      // lq3 patch: the peekpoke functions read u only inside MGP(initialize)
++      // (QDP_M_eq_func, wilsonmg_p.c), so release it now. Kept, this file-scope
++      // static is destroyed at exit after QDP++ has shut down its allocator and
++      // every chroma/hmc run that used QOP-MG crashed there (job 1365333).
++      u.resize(0);
+ 	
+ 	//MGP(teststuff)();
+     }

@@ -1,0 +1,135 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!--
+lq3 QOP-MG Chroma HMC check (1_build_chroma/lq/build_qopmg.sh test, case hmc_check).
+One short trajectory from a weak-field start: LW tree gauge action (beta 6.3, u0 of the production input)
+and one even-odd clover two-flavour monomial (production c_sw, stout rho 0.125 x 1, antiperiodic t), Mass
+0.05, leapfrog 4 steps, tau 0.2, seeds 300 1300 2300 3300. Two files: qopmg_hmc_check_16x32.ini.xml
+(QOP_CLOVER_MULTIGRID_INVERTER, MdagM) and qphixcg_hmc_check_16x32.ini.xml (QPhiX CG, validated), identical
+except <InvertParam>: same seeds, so deltaH and every force record must agree to solver tolerance (both
+1e-12). ZERO_GUESS_4D_PREDICTOR in both: the QOP-MG MdagM solver needs a two-step predictor (it aborts on
+any other). 16^2 x 32^2 on -geom 1 1 2 2: local 16^4.
+-->
+<Params>
+  <MCControl>
+    <Cfg>
+      <cfg_type>WEAK_FIELD</cfg_type>
+      <cfg_file>dummy</cfg_file>
+    </Cfg>
+    <RNG>
+      <Seed>
+        <elem>300</elem>
+        <elem>1300</elem>
+        <elem>2300</elem>
+        <elem>3300</elem>
+      </Seed>
+    </RNG>
+    <StartUpdateNum>0</StartUpdateNum>
+    <NWarmUpUpdates>0</NWarmUpUpdates>
+    <NProductionUpdates>1</NProductionUpdates>
+    <NUpdatesThisRun>1</NUpdatesThisRun>
+    <SaveInterval>1000000</SaveInterval>
+    <SavePrefix>./hmc_check</SavePrefix>
+    <SaveVolfmt>SINGLEFILE</SaveVolfmt>
+    <ParallelIO>true</ParallelIO>
+    <ReproCheckP>false</ReproCheckP>
+    <ReverseCheckP>false</ReverseCheckP>
+    <MonitorForces>true</MonitorForces>
+    <InlineMeasurements>
+    </InlineMeasurements>
+  </MCControl>
+  <HMCTrj>
+    <nrow>16 16 32 32</nrow>
+    <Monomials>
+      <elem>
+        <Name>TWO_FLAVOR_EOPREC_CONSTDET_FERM_MONOMIAL</Name>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>0.05</Mass>
+          <clovCoeff>1.20536588031793</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+            <t_dir>3</t_dir>
+            <xi_0>1</xi_0>
+            <nu>1</nu>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>QOP_CLOVER_MULTIGRID_INVERTER</invType>
+          <Mass>0.05</Mass>
+          <Clover>1.20536588031793</Clover>
+          <Residual>1e-12</Residual>
+          <MaxIter>400</MaxIter>
+          <RefreshThreshold>150</RefreshThreshold>
+          <RsdToleranceFactor>2.0</RsdToleranceFactor>
+          <NumGCRVecs>8</NumGCRVecs>
+          <Verbose>1</Verbose>
+          <ExternalSubspace>true</ExternalSubspace>
+          <SubspaceId>qopmg_hmc_check</SubspaceId>
+          <Levels>2</Levels>
+          <Blocking>
+            <elem>4 4 4 4</elem>
+            <elem>2 2 2 2</elem>
+          </Blocking>
+          <NumNullVecs>24 24</NumNullVecs>
+          <NullMaxIter>100 100</NullMaxIter>
+          <NullResidual>0.4 0.4</NullResidual>
+          <NullConvergence>0.5 0.5</NullConvergence>
+          <NumExtraVecs>0 0</NumExtraVecs>
+          <Underrelax>1.0 1.0</Underrelax>
+          <NumPreHits>0 0</NumPreHits>
+          <NumPostHits>4 4</NumPostHits>
+          <CoarseNumGCRVecs>8 8</CoarseNumGCRVecs>
+          <CoarseMaxIter>12 12</CoarseMaxIter>
+          <CoarseResidual>0.2 0.2</CoarseResidual>
+        </InvertParam>
+        <ChronologicalPredictor>
+          <Name>ZERO_GUESS_4D_PREDICTOR</Name>
+        </ChronologicalPredictor>
+        <NamedObject>
+          <monomial_id>two_flav</monomial_id>
+        </NamedObject>
+      </elem>
+      <elem>
+        <Name>GAUGE_MONOMIAL</Name>
+        <GaugeAction>
+          <Name>LW_TREE_GAUGEACT</Name>
+          <beta>6.3</beta>
+          <u0>0.84570646270714</u0>
+          <GaugeBC>
+            <Name>PERIODIC_GAUGEBC</Name>
+          </GaugeBC>
+        </GaugeAction>
+        <NamedObject>
+          <monomial_id>gauge</monomial_id>
+        </NamedObject>
+      </elem>
+    </Monomials>
+    <Hamiltonian>
+      <monomial_ids>
+        <elem>two_flav</elem>
+        <elem>gauge</elem>
+      </monomial_ids>
+    </Hamiltonian>
+    <MDIntegrator>
+      <tau0>0.2</tau0>
+      <Integrator>
+        <Name>LCM_STS_LEAPFROG</Name>
+        <n_steps>4</n_steps>
+        <monomial_ids>
+          <elem>two_flav</elem>
+          <elem>gauge</elem>
+        </monomial_ids>
+      </Integrator>
+    </MDIntegrator>
+  </HMCTrj>
+</Params>

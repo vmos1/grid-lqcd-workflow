@@ -1,0 +1,176 @@
+<?xml version="1.0"?>
+<chroma>
+<annotation>
+lq3 QOP-MG convention check (chroma binary): one point-source propagator on the 16^3 x 48 configuration
+cl3_16_48_b6p1_m0p2450 cfg_11100 at its own light mass (-0.2450, c_sw 1.24930970916466, stout rho 0.125 x 1,
+antiperiodic t), solved twice:
+  1. reference: chroma's QPhiX BiCGStab on the even-odd clover action (validated against chroma's native
+     solver, job 1365191), RsdTarget 1e-10;
+  2. QOP_CLOVER_MULTIGRID_INVERTER on the unpreconditioned clover action (the LinOp solver takes the full
+     source; on the even-odd action chroma hands it a source whose even sites are not set), Residual 1e-10,
+     the 16^3 blocking of qopmg_validate_hmc16_qopmg.ini.xml, its own subspace.
+Pass: every "QOPMG_LINOP_SOLVER: ... Relative Rsd" below 1e-10 x 5 (the residual is computed with chroma's
+operator, so this checks QOP's kappa, clover and boundary conventions and the gauge import); the QOP
+"QDP: Average plaquette" equals chroma's w_plaq printed just before it; the two prop_corr arrays in the
+output XML agree to about 1e-9 relative on every timeslice.
+Run on one lq3 node, 4 ranks x 16 threads, -geom 1 1 1 4 (local 16 16 16 12).
+</annotation>
+<Param>
+  <InlineMeasurements>
+
+    <elem>
+      <Name>MAKE_SOURCE</Name>
+      <Frequency>1</Frequency>
+      <Param>
+        <version>6</version>
+        <Source>
+          <version>2</version>
+          <SourceType>POINT_SOURCE</SourceType>
+          <j_decay>3</j_decay>
+          <t_srce>0 0 0 0</t_srce>
+          <Displacement>
+            <version>1</version>
+            <DisplacementType>NONE</DisplacementType>
+          </Displacement>
+        </Source>
+      </Param>
+      <NamedObject>
+        <gauge_id>default_gauge_field</gauge_id>
+        <source_id>pt_source_0</source_id>
+      </NamedObject>
+    </elem>
+
+    <!-- 1. Reference: QPhiX BiCGStab, even-odd clover action -->
+    <elem>
+      <Name>PROPAGATOR</Name>
+      <Frequency>1</Frequency>
+      <Param>
+        <version>10</version>
+        <quarkSpinType>FULL</quarkSpinType>
+        <obsvP>false</obsvP>
+        <numRetries>1</numRetries>
+        <FermionAction>
+          <FermAct>CLOVER</FermAct>
+          <Mass>-0.2450</Mass>
+          <clovCoeff>1.24930970916466</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>QPHIX_CLOVER_INVERTER</invType>
+          <SolverType>BICGSTAB</SolverType>
+          <MaxIter>20000</MaxIter>
+          <RsdTarget>1.0e-10</RsdTarget>
+          <CloverParams>
+            <Mass>-0.2450</Mass>
+            <clovCoeff>1.24930970916466</clovCoeff>
+            <AnisoParam>
+              <anisoP>false</anisoP>
+            </AnisoParam>
+          </CloverParams>
+          <AntiPeriodicT>true</AntiPeriodicT>
+          <Verbose>false</Verbose>
+          <RsdToleranceFactor>5.0</RsdToleranceFactor>
+        </InvertParam>
+      </Param>
+      <NamedObject>
+        <gauge_id>default_gauge_field</gauge_id>
+        <source_id>pt_source_0</source_id>
+        <prop_id>prop_ref</prop_id>
+      </NamedObject>
+    </elem>
+
+    <!-- 2. QOP-MG, unpreconditioned clover action, same physics -->
+    <elem>
+      <Name>PROPAGATOR</Name>
+      <Frequency>1</Frequency>
+      <Param>
+        <version>10</version>
+        <quarkSpinType>FULL</quarkSpinType>
+        <obsvP>false</obsvP>
+        <numRetries>1</numRetries>
+        <FermionAction>
+          <FermAct>UNPRECONDITIONED_CLOVER</FermAct>
+          <Mass>-0.2450</Mass>
+          <clovCoeff>1.24930970916466</clovCoeff>
+          <AnisoParam>
+            <anisoP>false</anisoP>
+          </AnisoParam>
+          <FermState>
+            <Name>STOUT_FERM_STATE</Name>
+            <rho>0.125</rho>
+            <n_smear>1</n_smear>
+            <orthog_dir>-1</orthog_dir>
+            <FermionBC>
+              <FermBC>SIMPLE_FERMBC</FermBC>
+              <boundary>1 1 1 -1</boundary>
+            </FermionBC>
+          </FermState>
+        </FermionAction>
+        <InvertParam>
+          <invType>QOP_CLOVER_MULTIGRID_INVERTER</invType>
+          <Mass>-0.2450</Mass>
+          <Clover>1.24930970916466</Clover>
+          <AnisoXi>1.0</AnisoXi>
+          <AnisoNu>1.0</AnisoNu>
+          <Residual>1e-10</Residual>
+          <MaxIter>500</MaxIter>
+          <RsdToleranceFactor>5.0</RsdToleranceFactor>
+          <TerminateOnFail>true</TerminateOnFail>
+          <NumGCRVecs>20</NumGCRVecs>
+          <Verbose>1</Verbose>
+          <Levels>2</Levels>
+          <Blocking>
+            <elem>4 4 4 3</elem>
+            <elem>2 2 2 2</elem>
+          </Blocking>
+          <NumNullVecs>24 32</NumNullVecs>
+          <NullMaxIter>500 500</NullMaxIter>
+          <NullResidual>0.4 0.4</NullResidual>
+          <NullConvergence>0.5 0.5</NullConvergence>
+          <NumExtraVecs>0 0</NumExtraVecs>
+          <Underrelax>1.0 1.0</Underrelax>
+          <NumPreHits>0 0</NumPreHits>
+          <NumPostHits>8 8</NumPostHits>
+          <CoarseNumGCRVecs>10 8</CoarseNumGCRVecs>
+          <CoarseMaxIter>12 8</CoarseMaxIter>
+          <CoarseResidual>0.1 0.1</CoarseResidual>
+          <ExternalSubspace>false</ExternalSubspace>
+        </InvertParam>
+      </Param>
+      <NamedObject>
+        <gauge_id>default_gauge_field</gauge_id>
+        <source_id>pt_source_0</source_id>
+        <prop_id>prop_qopmg</prop_id>
+      </NamedObject>
+    </elem>
+
+  </InlineMeasurements>
+  <nrow>16 16 16 48</nrow>
+</Param>
+
+<RNG>
+  <Seed>
+    <elem>11</elem>
+    <elem>11</elem>
+    <elem>11</elem>
+    <elem>0</elem>
+  </Seed>
+</RNG>
+
+<Cfg>
+  <cfg_type>SZINQIO</cfg_type>
+  <cfg_file>/lustre2/nplqcd/vayyar/grid_qcd/inputs/cl3_16_48_b6p1_m0p2450_a_cfg_11100.lime</cfg_file>
+</Cfg>
+</chroma>
