@@ -45,6 +45,10 @@ set -uo pipefail
 
 BASE=/global/cfs/cdirs/m4599/Users/vayyar/grid_qcd
 source "$BASE/chroma/env_chroma_pm.sh"
+# CHROMA_HMC_BIN (2026-11-25, autotune 2): another hmc build, e.g. chroma/install_chrono24/bin/hmc
+# (QUDA with 24 predictor channels, ladders up to 12 masses; chroma/build_chrono24_pm.sh).
+# Default: the hmc env_chroma_pm.sh finds (the old command line). Printed in the ENV line.
+[ -n "${CHROMA_HMC_BIN:-}" ] && CHROMA_HMC=$CHROMA_HMC_BIN
 
 MDS=${MDS:?set MDS=12, 10 or 8}
 RUNDATE=${RUNDATE:-$(date +%Y_%-m_%-d)}
@@ -90,8 +94,37 @@ fi
 # so QMP_get_logical_dimensions() (which reads the *default* comm) returns NULL
 # and Chroma::initialize dereferences it -> SIGSEGV before any input is read.
 # Verified 2026-08-18 on the smoke test.
-GEOM="1 2 2 4"
-NTASKS=16
+#
+# Node count, layout and node list (2026-11-24, autotune 2): the defaults give the old command line
+# (4 nodes, 1 2 2 4, srun without -N or -w). A run at another node count or layout is timed against
+# a baseline run at that same count and layout, never against the 4-node reference above.
+#   CHROMA_NODES     default 4; 4 ranks per node
+#   CHROMA_GEOM      default "1 2 2 4"; its product must be 4 x CHROMA_NODES, and every local extent
+#                    must take the baseg inputs' MG blocking (3 3 3 4, then 2 2 2 2): for 8 nodes
+#                    "2 2 2 4" or "1 2 4 4" pass, "1 2 2 8" fails (local t 12 -> 3 -> no 2)
+#   CHROMA_NODELIST  pin the run to these nodes (srun -N <nodes> -w <list>): two runs side by side
+#                    in one job, each on its own nodes
+# The tune cache seeded below comes from a 4-node run; another layout autotunes its kernels afresh
+# in its first trajectory (~24 min cold at stage 4) unless SRC_TUNE names a run of that layout.
+NODES=${CHROMA_NODES:-4}
+GEOM=${CHROMA_GEOM:-1 2 2 4}
+[[ "$NODES" =~ ^[1-9][0-9]*$ ]] || { echo "CHROMA_NODES must be a whole number, got '$NODES'" >&2; exit 1; }
+NTASKS=$(( 4 * NODES ))
+GEOM_CHECK=$(awk -v g="$GEOM" -v n="$NTASKS" 'BEGIN {
+  split("48 48 48 96", L, " "); split("3 3 3 4", B, " ")
+  if (split(g, G, " ") != 4) { print "CHROMA_GEOM needs 4 numbers, got \"" g "\""; exit }
+  p = 1; for (i = 1; i <= 4; i++) p *= G[i]
+  if (p != n) { print "CHROMA_GEOM \"" g "\" makes " p " ranks, the run has " n; exit }
+  for (i = 1; i <= 4; i++) {
+    loc = L[i] / G[i]
+    if (loc != int(loc) || (loc / B[i]) % 2 != 0) {
+      print "CHROMA_GEOM \"" g "\": local extent " loc " in direction " i " does not take the MG blocking " B[i] " then 2"; exit }
+  }
+  print "ok" }')
+[ "$GEOM_CHECK" = ok ] || { echo "$GEOM_CHECK" >&2; exit 1; }
+NODE_WORDS=()
+if [ -n "${CHROMA_NODELIST:-}" ] || [ "$NODES" != 4 ]; then NODE_WORDS=(-N "$NODES"); fi
+[ -n "${CHROMA_NODELIST:-}" ] && NODE_WORDS+=(-w "$CHROMA_NODELIST")
 
 # Extra arguments for hmc, appended after -geom; empty by default (= the old command line).
 # Added 2026-10-07 for QDP-JIT's -poolsize: by default QDP-JIT reserves 92% of free GPU
@@ -106,7 +139,7 @@ read -r -a LAUNCH_PREFIX_WORDS <<< "$LAUNCH_PREFIX"
 
 LOG=$OUT/chroma_baseg_mds${MDS}${SUFFIX}.log
 {
-  echo "ENV MDSTEPS=$MDS QMP_GEOM='$GEOM' NTASKS=$NTASKS NODES=4 CHROMA_EXTRA_ARGS='$CHROMA_EXTRA_ARGS'"
+  echo "ENV MDSTEPS=$MDS QMP_GEOM='$GEOM' NTASKS=$NTASKS NODES=$NODES CHROMA_EXTRA_ARGS='$CHROMA_EXTRA_ARGS'${CHROMA_NODELIST:+ NODELIST=$CHROMA_NODELIST} HMC_BIN=$CHROMA_HMC"
   [ -n "$LAUNCH_PREFIX" ] && echo "ENV LAUNCH_PREFIX='$LAUNCH_PREFIX' NSYS='ranks=${NSYS_RANKS:-0} trace=${NSYS_TRACE:-cuda,nvtx} delay=${NSYS_DELAY:-0} duration=${NSYS_DURATION:-all} out=${NSYS_OUT:-unset}' QUDA_RESOURCE_PATH=$QUDA_RESOURCE_PATH SRC_TUNE=$SRC_TUNE"
   echo "INPUT=$INPUT"
   echo "BIN=$CHROMA_HMC"
@@ -124,7 +157,7 @@ SRUN=(srun)
 
 # CHROMA_TIMEOUT_MIN (2026-11-12): shorter guard for smoke tests; default the old 700.
 timeout -k 60s "${CHROMA_TIMEOUT_MIN:-700}m" \
-  "${SRUN[@]}" --chdir="$OUT" --ntasks-per-node=4 --gpus-per-node=4 --cpus-per-task=32 --cpu-bind=cores \
+  "${SRUN[@]}" "${NODE_WORDS[@]}" --chdir="$OUT" --ntasks-per-node=4 --gpus-per-node=4 --cpus-per-task=32 --cpu-bind=cores \
   -n"$NTASKS" "${LAUNCH_PREFIX_WORDS[@]}" "$CHROMA_HMC" \
     -i "$INPUT" \
     -o "$OUT/chroma_baseg_mds${MDS}${SUFFIX}.out.xml" \
